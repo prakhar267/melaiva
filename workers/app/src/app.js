@@ -170,6 +170,7 @@ const auctionSchema = z
     categories: z.array(z.string().trim().min(2).max(50)).min(1).max(12),
     requirements: z.string().trim().min(20).max(5_000),
     biddingEndsAt: z.string().datetime({ offset: true }),
+    preferredVendorId: z.string().trim().min(1).max(100).optional(),
   })
   .strict()
   .refine((value) => value.budgetMax >= value.budgetMin, {
@@ -709,29 +710,51 @@ async function verifyTurnstile(c, expectedAction) {
   }
 }
 
-function idempotencyKey(c) {
+function idempotencyKey(c, { required = false } = {}) {
   const key = c.req.header("idempotency-key");
-  if (!key) return null;
+  if (!key) {
+    if (required) throw new ApiError(400, "idempotency_key_required", "Idempotency-Key is required for this request");
+    return null;
+  }
   if (!/^[A-Za-z0-9._:-]{8,128}$/.test(key)) {
     throw new ApiError(400, "invalid_idempotency_key", "Idempotency-Key must be 8-128 safe characters");
   }
   return key;
 }
 
+function canonicalJson(value) {
+  if (Array.isArray(value)) return `[${value.map((item) => canonicalJson(item)).join(",")}]`;
+  if (value && typeof value === "object") {
+    return `{${Object.keys(value)
+      .sort()
+      .filter((key) => value[key] !== undefined)
+      .map((key) => `${JSON.stringify(key)}:${canonicalJson(value[key])}`)
+      .join(",")}}`;
+  }
+  return JSON.stringify(value);
+}
+
+async function canonicalRequestHash(value) {
+  return sha256(canonicalJson(value));
+}
+
 async function idempotencyHash(scope, key, userId) {
   return sha256(`${scope}:${userId}:${key}`);
 }
 
-async function findIdempotentResult(db, scope, key, userId) {
+async function findIdempotentResult(db, scope, key, userId, requestHash) {
   if (!key) return null;
   const row = await db
     .prepare(
-      `SELECT response_status, response_json FROM idempotency_keys
+      `SELECT request_hash, response_status, response_json FROM idempotency_keys
        WHERE scope = ? AND key_hash = ? AND user_id = ? AND expires_at > ? LIMIT 1`,
     )
     .bind(scope, await idempotencyHash(scope, key, userId), userId, new Date().toISOString())
     .first();
   if (!row) return null;
+  if (!requestHash || row.request_hash !== requestHash) {
+    throw new ApiError(409, "idempotency_conflict", "This Idempotency-Key was already used with a different request");
+  }
   try {
     return { status: Number(row.response_status), value: JSON.parse(row.response_json) };
   } catch {
@@ -739,34 +762,18 @@ async function findIdempotentResult(db, scope, key, userId) {
   }
 }
 
-async function idempotencyStatement(db, scope, key, userId, status, value) {
+async function conditionalIdempotencyStatement(db, scope, key, userId, requestHash, status, value) {
   if (!key) return null;
   return db
     .prepare(
-      `INSERT INTO idempotency_keys (scope, key_hash, user_id, response_status, response_json, expires_at)
-       VALUES (?, ?, ?, ?, ?, ?)`,
+      `INSERT INTO idempotency_keys (scope, key_hash, user_id, request_hash, response_status, response_json, expires_at)
+       SELECT ?, ?, ?, ?, ?, ?, ? WHERE changes() = 1`,
     )
     .bind(
       scope,
       await idempotencyHash(scope, key, userId),
       userId,
-      status,
-      JSON.stringify(value),
-      new Date(Date.now() + 24 * 60 * 60 * 1000).toISOString(),
-    );
-}
-
-async function conditionalIdempotencyStatement(db, scope, key, userId, status, value) {
-  if (!key) return null;
-  return db
-    .prepare(
-      `INSERT INTO idempotency_keys (scope, key_hash, user_id, response_status, response_json, expires_at)
-       SELECT ?, ?, ?, ?, ?, ? WHERE changes() = 1`,
-    )
-    .bind(
-      scope,
-      await idempotencyHash(scope, key, userId),
-      userId,
+      requestHash,
       status,
       JSON.stringify(value),
       new Date(Date.now() + 24 * 60 * 60 * 1000).toISOString(),
@@ -831,6 +838,24 @@ const VENDOR_AUCTION_MATCH_SQL = `EXISTS (
         )
     )
 )`;
+
+const PREFERRED_VENDOR_ELIGIBILITY_SQL = `preferred_vendor.status = 'approved'
+  AND (
+    LOWER(TRIM(preferred_vendor.city)) = LOWER(TRIM(?))
+    OR EXISTS (
+      SELECT 1 FROM json_each(preferred_vendor.service_areas_json) service_area
+      WHERE LOWER(TRIM(CAST(service_area.value AS TEXT))) = LOWER(TRIM(?))
+    )
+  )
+  AND EXISTS (
+    SELECT 1 FROM json_each(?) requested_category
+    WHERE LOWER(TRIM(CAST(requested_category.value AS TEXT))) = LOWER(TRIM(preferred_vendor.category))
+      OR EXISTS (
+        SELECT 1 FROM json_each(preferred_vendor.categories_json) vendor_category
+        WHERE LOWER(TRIM(CAST(vendor_category.value AS TEXT))) =
+              LOWER(TRIM(CAST(requested_category.value AS TEXT)))
+      )
+  )`;
 
 function mapVendor(row) {
   return {
@@ -897,8 +922,34 @@ function slugify(value) {
     .slice(0, 60);
 }
 
-function mapAuction(row) {
+function mapPreferredVendor(row) {
+  if (!row?.preferred_vendor_id) return null;
   return {
+    id: row.preferred_vendor_id,
+    slug: row.preferred_vendor_slug,
+    businessName: row.preferred_vendor_business_name,
+    category: row.preferred_vendor_category,
+    city: row.preferred_vendor_city,
+    verified: Boolean(row.preferred_vendor_verified),
+    inviteStatus: row.preferred_invite_status,
+  };
+}
+
+function preferredVendorContext(row, inviteStatus = "invited") {
+  if (!row?.id) return null;
+  return {
+    id: row.id,
+    slug: row.slug,
+    businessName: row.business_name,
+    category: row.category,
+    city: row.city,
+    verified: Boolean(row.verified),
+    inviteStatus,
+  };
+}
+
+function mapAuction(row, { ownerView = false, vendorView = false } = {}) {
+  const auction = {
     id: row.id,
     title: row.title,
     eventType: row.event_type,
@@ -915,6 +966,12 @@ function mapAuction(row) {
     bidCount: Number(row.bid_count || 0),
     createdAt: row.created_at,
   };
+  if (ownerView) auction.preferredVendor = mapPreferredVendor(row);
+  if (vendorView) {
+    auction.directInvite = Boolean(row.direct_invite);
+    auction.directInviteStatus = row.direct_invite_status || null;
+  }
+  return auction;
 }
 
 function mapBid(row) {
@@ -1389,22 +1446,47 @@ function buildApp() {
     if (user.role !== "couple" && user.role !== "admin") {
       throw new ApiError(403, "role_not_allowed", "Only couple accounts can create requests");
     }
-    await enforceRateLimit(c, `auction-create:${user.id}`, 12, 60 * 60);
+    const requestKey = idempotencyKey(c, { required: true });
     const input = await parseJson(c, auctionSchema);
+    const normalizedBiddingEndsAt = new Date(input.biddingEndsAt).toISOString();
+    const canonicalCategories = input.categories.map(canonicalCategory);
+    const requestHash = await canonicalRequestHash({
+      ...input,
+      categories: canonicalCategories,
+      biddingEndsAt: normalizedBiddingEndsAt,
+      preferredVendorId: input.preferredVendorId || null,
+    });
+    const db = requireDatabase(c.env);
+    const scope = "auction-create";
+    const replay = await findIdempotentResult(db, scope, requestKey, user.id, requestHash);
+    if (replay) return c.json({ data: replay.value, meta: { replayed: true } }, replay.status);
+    await enforceRateLimit(c, `auction-create:${user.id}`, 12, 60 * 60);
     const eventTime = new Date(`${input.eventDate}T23:59:59Z`).getTime();
-    const biddingTime = new Date(input.biddingEndsAt).getTime();
+    const biddingTime = new Date(normalizedBiddingEndsAt).getTime();
     if (eventTime <= Date.now() || biddingTime <= Date.now() || biddingTime >= eventTime) {
       throw new ApiError(422, "invalid_timeline", "Bidding must end in the future and before the event date");
     }
-    const db = requireDatabase(c.env);
-    const requestKey = idempotencyKey(c);
-    const scope = "auction-create";
-    const replay = await findIdempotentResult(db, scope, requestKey, user.id);
-    if (replay) return c.json({ data: replay.value, meta: { replayed: true } }, replay.status);
+    let preferredVendor = null;
+    if (input.preferredVendorId) {
+      const vendor = await db
+        .prepare(
+          `SELECT id, slug, business_name, status, category, categories_json, city,
+                  service_areas_json, verified
+           FROM vendors WHERE id = ? LIMIT 1`,
+        )
+        .bind(input.preferredVendorId)
+        .first();
+      if (!vendorMatchesAuction(vendor, { categories_json: JSON.stringify(canonicalCategories), city: input.city })) {
+        throw new ApiError(
+          422,
+          "preferred_vendor_unavailable",
+          "The preferred vendor is unavailable for this request's category or city",
+        );
+      }
+      preferredVendor = preferredVendorContext(vendor);
+    }
     const id = crypto.randomUUID();
     const createdAt = new Date().toISOString();
-    const normalizedBiddingEndsAt = new Date(input.biddingEndsAt).toISOString();
-    const canonicalCategories = input.categories.map(canonicalCategory);
     const auctionData = {
       id,
       title: input.title,
@@ -1421,40 +1503,109 @@ function buildApp() {
       biddingEndsAt: normalizedBiddingEndsAt,
       bidCount: 0,
       createdAt,
+      preferredVendor,
     };
-    const statements = [
-      db.prepare(
+    const auctionInsert = input.preferredVendorId
+      ? db
+        .prepare(
+          `INSERT INTO auctions
+           (id, couple_user_id, title, event_type, event_date, city, guest_count, budget_min, budget_max,
+            currency, categories_json, requirements, status, bidding_ends_at, created_at, updated_at)
+           SELECT ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'open', ?, ?, ?
+           FROM vendors preferred_vendor
+           WHERE preferred_vendor.id = ? AND ${PREFERRED_VENDOR_ELIGIBILITY_SQL}`,
+        )
+        .bind(
+          id,
+          user.id,
+          input.title,
+          input.eventType,
+          input.eventDate,
+          input.city,
+          input.guestCount,
+          input.budgetMin,
+          input.budgetMax,
+          input.currency,
+          JSON.stringify(canonicalCategories),
+          input.requirements,
+          normalizedBiddingEndsAt,
+          createdAt,
+          createdAt,
+          input.preferredVendorId,
+          input.city,
+          input.city,
+          JSON.stringify(canonicalCategories),
+        )
+      : db
+        .prepare(
         `INSERT INTO auctions
          (id, couple_user_id, title, event_type, event_date, city, guest_count, budget_min, budget_max,
           currency, categories_json, requirements, status, bidding_ends_at, created_at, updated_at)
          VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'open', ?, ?, ?)`,
-      )
-      .bind(
-        id,
-        user.id,
-        input.title,
-        input.eventType,
-        input.eventDate,
-        input.city,
-        input.guestCount,
-        input.budgetMin,
-        input.budgetMax,
-        input.currency,
-        JSON.stringify(canonicalCategories),
-        input.requirements,
-        normalizedBiddingEndsAt,
-        createdAt,
-        createdAt,
-      ),
-    ];
-    const idemStatement = await idempotencyStatement(db, scope, requestKey, user.id, 201, auctionData);
-    if (idemStatement) statements.push(idemStatement);
+        )
+        .bind(
+          id,
+          user.id,
+          input.title,
+          input.eventType,
+          input.eventDate,
+          input.city,
+          input.guestCount,
+          input.budgetMin,
+          input.budgetMax,
+          input.currency,
+          JSON.stringify(canonicalCategories),
+          input.requirements,
+          normalizedBiddingEndsAt,
+          createdAt,
+          createdAt,
+        );
+    const statements = [auctionInsert];
+    const idemStatement = await conditionalIdempotencyStatement(
+      db,
+      scope,
+      requestKey,
+      user.id,
+      requestHash,
+      201,
+      auctionData,
+    );
+    statements.push(idemStatement);
+    if (input.preferredVendorId) {
+      statements.push(
+        db
+          .prepare(
+            `INSERT INTO auction_vendor_invites
+             (auction_id, vendor_id, invited_by_user_id, status, created_at, updated_at)
+             SELECT ?, ?, ?, 'invited', ?, ?
+             WHERE EXISTS (SELECT 1 FROM auctions WHERE id = ?)`,
+          )
+          .bind(id, input.preferredVendorId, user.id, createdAt, createdAt, id),
+      );
+    }
+    statements.push(
+      db
+        .prepare(
+          `INSERT INTO audit_events (actor_user_id, action, entity_type, entity_id, metadata_json)
+           SELECT ?, 'auction.created', 'auction', ?, ?
+           WHERE EXISTS (SELECT 1 FROM auctions WHERE id = ?)`,
+        )
+        .bind(user.id, id, JSON.stringify({ preferredVendorId: input.preferredVendorId || null }), id),
+    );
+    let results;
     try {
-      await db.batch(statements);
+      results = await db.batch(statements);
     } catch (error) {
-      const concurrentReplay = await findIdempotentResult(db, scope, requestKey, user.id);
+      const concurrentReplay = await findIdempotentResult(db, scope, requestKey, user.id, requestHash);
       if (concurrentReplay) return c.json({ data: concurrentReplay.value, meta: { replayed: true } }, concurrentReplay.status);
       throw error;
+    }
+    if (Number(results?.[0]?.meta?.changes || 0) !== 1) {
+      throw new ApiError(
+        422,
+        "preferred_vendor_unavailable",
+        "The preferred vendor is unavailable for this request's category or city",
+      );
     }
     return c.json({ data: auctionData, meta: { moneyUnit: "whole_rupees" } }, 201);
   });
@@ -1467,27 +1618,50 @@ function buildApp() {
     const db = requireDatabase(c.env);
     let where;
     let binds;
+    let joins = "";
+    let selectExtras = "";
+    let order = "a.created_at DESC";
+    let mapOptions = {};
     if (user.role === "vendor") {
       const vendor = await approvedVendorForUser(db, user);
       if (!vendor || vendor.status !== "approved") throw new ApiError(403, "vendor_not_approved", "Vendor approval is required");
+      joins = `LEFT JOIN auction_vendor_invites avi
+                 ON avi.auction_id = a.id AND avi.vendor_id = ?`;
+      selectExtras = `,
+        CASE WHEN avi.vendor_id IS NULL THEN 0 ELSE 1 END AS direct_invite,
+        avi.status AS direct_invite_status`;
       where = `a.status = 'open' AND a.bidding_ends_at > ? AND ${VENDOR_AUCTION_MATCH_SQL}`;
-      binds = [new Date().toISOString(), vendor.id];
+      binds = [vendor.id, new Date().toISOString(), vendor.id];
+      order = "CASE WHEN avi.vendor_id IS NULL THEN 1 ELSE 0 END, a.created_at DESC";
+      mapOptions = { vendorView: true };
     } else if (user.role === "admin" && !mine) {
       where = "a.status = 'open' AND a.bidding_ends_at > ?";
       binds = [new Date().toISOString()];
     } else {
+      joins = `LEFT JOIN auction_vendor_invites avi ON avi.auction_id = a.id
+               LEFT JOIN vendors preferred_vendor ON preferred_vendor.id = avi.vendor_id`;
+      selectExtras = `,
+        avi.status AS preferred_invite_status,
+        preferred_vendor.id AS preferred_vendor_id,
+        preferred_vendor.slug AS preferred_vendor_slug,
+        preferred_vendor.business_name AS preferred_vendor_business_name,
+        preferred_vendor.category AS preferred_vendor_category,
+        preferred_vendor.city AS preferred_vendor_city,
+        preferred_vendor.verified AS preferred_vendor_verified`;
       where = "a.couple_user_id = ?";
       binds = [user.id];
+      mapOptions = { ownerView: true };
     }
     const result = await db
       .prepare(
         `SELECT a.*, (SELECT COUNT(*) FROM bids b WHERE b.auction_id = a.id AND b.status != 'withdrawn') AS bid_count
-         FROM auctions a WHERE ${where}
-         ORDER BY a.created_at DESC LIMIT ? OFFSET ?`,
+                ${selectExtras}
+         FROM auctions a ${joins} WHERE ${where}
+         ORDER BY ${order} LIMIT ? OFFSET ?`,
       )
       .bind(...binds, limit, (page - 1) * limit)
       .all();
-    const auctions = (result.results || []).map(mapAuction);
+    const auctions = (result.results || []).map((row) => mapAuction(row, mapOptions));
     return c.json({ data: auctions, meta: { page, limit, hasMore: auctions.length === limit } });
   });
 
@@ -1510,6 +1684,34 @@ function buildApp() {
       if (!vendor || row.status !== "open" || !vendorMatchesAuction(vendor, row)) {
         throw new ApiError(404, "auction_not_found", "Request not found");
       }
+      const invite = await db
+        .prepare("SELECT status FROM auction_vendor_invites WHERE auction_id = ? AND vendor_id = ? LIMIT 1")
+        .bind(row.id, vendor.id)
+        .first();
+      return c.json({
+        data: mapAuction(
+          { ...row, direct_invite: invite ? 1 : 0, direct_invite_status: invite?.status || null },
+          { vendorView: true },
+        ),
+      });
+    }
+    if (isOwner) {
+      const preferred = await db
+        .prepare(
+          `SELECT avi.status AS preferred_invite_status,
+                  preferred_vendor.id AS preferred_vendor_id,
+                  preferred_vendor.slug AS preferred_vendor_slug,
+                  preferred_vendor.business_name AS preferred_vendor_business_name,
+                  preferred_vendor.category AS preferred_vendor_category,
+                  preferred_vendor.city AS preferred_vendor_city,
+                  preferred_vendor.verified AS preferred_vendor_verified
+           FROM auction_vendor_invites avi
+           JOIN vendors preferred_vendor ON preferred_vendor.id = avi.vendor_id
+           WHERE avi.auction_id = ? LIMIT 1`,
+        )
+        .bind(row.id)
+        .first();
+      return c.json({ data: mapAuction({ ...row, ...(preferred || {}) }, { ownerView: true }) });
     }
     return c.json({ data: mapAuction(row) });
   });
@@ -1582,16 +1784,24 @@ function buildApp() {
       throw new ApiError(404, "auction_not_found", "Request not found");
     }
     const bid = await db
-      .prepare("SELECT id, status, valid_until FROM bids WHERE id = ? AND auction_id = ? LIMIT 1")
+      .prepare(
+        `SELECT b.id, b.status, b.valid_until, b.vendor_id, v.status AS vendor_status
+         FROM bids b JOIN vendors v ON v.id = b.vendor_id
+         WHERE b.id = ? AND b.auction_id = ? LIMIT 1`,
+      )
       .bind(c.req.param("bidId"), auction.id)
       .first();
     if (!bid) throw new ApiError(404, "bid_not_found", "Proposal not found");
-    const requestKey = input.action === "accept" ? idempotencyKey(c) : null;
+    const requestKey = idempotencyKey(c, { required: input.action === "accept" });
+    const requestHash = requestKey ? await canonicalRequestHash(input) : null;
     const scope = `bid-accept:${auction.id}:${bid.id}`;
-    const replay = await findIdempotentResult(db, scope, requestKey, user.id);
+    const replay = await findIdempotentResult(db, scope, requestKey, user.id, requestHash);
     if (replay) return c.json({ data: replay.value, meta: { replayed: true } }, replay.status);
     if (auction.status === "open") {
       throw new ApiError(409, "bids_sealed", "Offers remain sealed until this request closes");
+    }
+    if (["shortlist", "accept"].includes(input.action) && bid.vendor_status !== "approved") {
+      throw new ApiError(409, "vendor_not_approved", "This vendor is no longer eligible for selection");
     }
     if (!["submitted", "shortlisted"].includes(bid.status) || auction.status !== "closed") {
       throw new ApiError(409, "invalid_status_transition", "This proposal can no longer be changed");
@@ -1608,11 +1818,23 @@ function buildApp() {
           .prepare(
              `UPDATE bids SET status = 'accepted', updated_at = CURRENT_TIMESTAMP
              WHERE id = ? AND auction_id = ? AND status IN ('submitted', 'shortlisted')
-               AND EXISTS (SELECT 1 FROM auctions WHERE id = ? AND status = 'closed')`,
+               AND EXISTS (SELECT 1 FROM auctions WHERE id = ? AND status = 'closed')
+               AND EXISTS (
+                 SELECT 1 FROM vendors current_vendor
+                 WHERE current_vendor.id = bids.vendor_id AND current_vendor.status = 'approved'
+               )`,
           )
           .bind(bid.id, auction.id, auction.id),
       ];
-      const idem = await conditionalIdempotencyStatement(db, scope, requestKey, user.id, 200, responseValue);
+      const idem = await conditionalIdempotencyStatement(
+        db,
+        scope,
+        requestKey,
+        user.id,
+        requestHash,
+        200,
+        responseValue,
+      );
       if (idem) statements.push(idem);
       const awardResultIndex = idem ? 3 : 2;
       statements.push(
@@ -1642,7 +1864,7 @@ function buildApp() {
         results = await db.batch(statements);
       } catch (error) {
         if (isUniqueConstraint(error)) {
-          const concurrentReplay = await findIdempotentResult(db, scope, requestKey, user.id);
+          const concurrentReplay = await findIdempotentResult(db, scope, requestKey, user.id, requestHash);
           if (concurrentReplay) {
             return c.json({ data: concurrentReplay.value, meta: { replayed: true } }, concurrentReplay.status);
           }
@@ -1658,9 +1880,16 @@ function buildApp() {
         .prepare(
           `UPDATE bids SET status = ?, updated_at = CURRENT_TIMESTAMP
            WHERE id = ? AND auction_id = ? AND status IN ('submitted', 'shortlisted')
-             AND EXISTS (SELECT 1 FROM auctions WHERE id = ? AND status = 'closed')`,
+             AND EXISTS (SELECT 1 FROM auctions WHERE id = ? AND status = 'closed')
+             AND (
+               ? = 'rejected'
+               OR EXISTS (
+                 SELECT 1 FROM vendors current_vendor
+                 WHERE current_vendor.id = bids.vendor_id AND current_vendor.status = 'approved'
+               )
+             )`,
         )
-        .bind(status, bid.id, auction.id, auction.id)
+        .bind(status, bid.id, auction.id, auction.id, status)
         .run();
       if (Number(update?.meta?.changes || 0) !== 1) {
         throw new ApiError(409, "invalid_status_transition", "This request changed before your decision; refresh and try again");
@@ -1706,35 +1935,47 @@ function buildApp() {
       throw new ApiError(422, "invalid_valid_until", "Proposal validity must end in the future");
     }
     const id = crypto.randomUUID();
+    let results;
     try {
-      const insert = await db
-        .prepare(
-          `INSERT INTO bids (id, auction_id, vendor_id, amount, currency, proposal, deliverables_json, valid_until, status)
-           SELECT ?, a.id, ?, ?, ?, ?, ?, ?, 'submitted'
-           FROM auctions a
-           WHERE a.id = ? AND a.status = 'open' AND a.bidding_ends_at > ?
-             AND ${VENDOR_AUCTION_MATCH_SQL}`,
-        )
-        .bind(
-          id,
-          vendor.id,
-          input.amount,
-          input.currency,
-          input.proposal,
-          JSON.stringify(input.deliverables),
-          input.validUntil || null,
-          auction.id,
-          new Date().toISOString(),
-          vendor.id,
-        )
-        .run();
-      if (Number(insert?.meta?.changes || 0) !== 1) {
-        throw new ApiError(409, "bidding_closed", "Bidding closed before this proposal was submitted");
-      }
+      results = await db.batch([
+        db
+          .prepare(
+            `INSERT INTO bids (id, auction_id, vendor_id, amount, currency, proposal, deliverables_json, valid_until, status)
+             SELECT ?, a.id, ?, ?, ?, ?, ?, ?, 'submitted'
+             FROM auctions a
+             WHERE a.id = ? AND a.status = 'open' AND a.bidding_ends_at > ?
+               AND ${VENDOR_AUCTION_MATCH_SQL}`,
+          )
+          .bind(
+            id,
+            vendor.id,
+            input.amount,
+            input.currency,
+            input.proposal,
+            JSON.stringify(input.deliverables),
+            input.validUntil || null,
+            auction.id,
+            new Date().toISOString(),
+            vendor.id,
+          ),
+        db
+          .prepare(
+            `UPDATE auction_vendor_invites
+             SET status = 'responded', updated_at = CURRENT_TIMESTAMP
+             WHERE auction_id = ? AND vendor_id = ? AND status = 'invited'
+               AND EXISTS (
+                 SELECT 1 FROM bids
+                 WHERE id = ? AND auction_id = ? AND vendor_id = ? AND status = 'submitted'
+               )`,
+          )
+          .bind(auction.id, vendor.id, id, auction.id, vendor.id),
+      ]);
     } catch (error) {
-      if (error instanceof ApiError) throw error;
       if (isUniqueConstraint(error)) throw new ApiError(409, "bid_exists", "Your business has already bid on this request");
       throw error;
+    }
+    if (Number(results?.[0]?.meta?.changes || 0) !== 1) {
+      throw new ApiError(409, "bidding_closed", "Bidding closed before this proposal was submitted");
     }
     return c.json(
       {
@@ -1874,17 +2115,37 @@ function buildApp() {
     const db = requireDatabase(c.env);
     const vendor = await db.prepare("SELECT id, status FROM vendors WHERE id = ? LIMIT 1").bind(c.req.param("id")).first();
     if (!vendor) throw new ApiError(404, "vendor_not_found", "Vendor not found");
-    await db.batch([
+    const statements = [
       db
         .prepare("UPDATE vendors SET status = ?, verified = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?")
         .bind(input.status, input.status === "approved" ? 1 : 0, vendor.id),
+    ];
+    if (["rejected", "suspended"].includes(input.status)) {
+      statements.push(
+        db
+          .prepare(
+            `UPDATE bids SET status = 'withdrawn', updated_at = CURRENT_TIMESTAMP
+             WHERE vendor_id = ? AND status IN ('submitted', 'shortlisted')`,
+          )
+          .bind(vendor.id),
+        db
+          .prepare(
+            `UPDATE auction_vendor_invites
+             SET status = 'unavailable', updated_at = CURRENT_TIMESTAMP
+             WHERE vendor_id = ? AND status IN ('invited', 'responded')`,
+          )
+          .bind(vendor.id),
+      );
+    }
+    statements.push(
       db
         .prepare(
           `INSERT INTO audit_events (actor_user_id, action, entity_type, entity_id, metadata_json)
            VALUES (?, 'vendor.reviewed', 'vendor', ?, ?)`,
         )
         .bind(user.id, vendor.id, JSON.stringify({ from: vendor.status, to: input.status, note: input.note || null })),
-    ]);
+    );
+    await db.batch(statements);
     return c.json({ data: { id: vendor.id, status: input.status, verified: input.status === "approved" } });
   });
 

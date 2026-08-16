@@ -35,6 +35,9 @@ jobs:
       - name: Verify Sites-compatible fallback
         run: npm run test:sites
 
+      - name: Validate release smoke checks
+        run: node --check scripts/readiness-smoke.mjs && node --check scripts/production-smoke.mjs
+
       - name: Install API dependencies
         working-directory: workers/app
         run: npm ci
@@ -49,4 +52,6 @@ jobs:
 
       - name: Validate Cloudflare bundle
         working-directory: workers/app
-        run: npx wrangler deploy --dry-run --outdir dist/dry-run
+        run: |
+          npx wrangler deploy --env="" --dry-run --outdir dist/dry-run
+          npx wrangler deploy --env staging --dry-run --outdir dist/dry-run-staging

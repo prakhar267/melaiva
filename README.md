@@ -9,13 +9,14 @@ The launch build is a single Cloudflare Worker: it serves the React application,
 ## What is implemented
 
 - Responsive customer marketplace and vendor discovery
-- Four-step private request builder with sealed offer workflow
+- Four-step private request builder with sealed offer workflow and explicit preferred-partner invitations
 - Customer dashboard backed by the signed-in user's requests
 - Vendor onboarding, opportunity feed, and bid submission
 - Customer bid review, shortlist/reject/accept state transitions
 - Gemini-assisted planning with schema validation, quotas, timeout, kill switch, and a transparent deterministic fallback
 - Client-derived password verifiers, server-side peppering, revocable secure sessions, role checks, rate limits, origin checks, and idempotent critical mutations
 - Hourly Durable Object cleanup/auction-close alarm, structured request IDs, fail-closed health endpoints, CI, and production runbooks
+- Isolated staging configuration, Git-provenanced releases, CodeQL merge protection, and read-only production readiness monitoring
 
 Demo vendor cards and workspace figures are clearly labelled examples. Production never represents them as verified businesses.
 
@@ -70,8 +71,10 @@ cd workers/app
 npm ci
 npm run check
 npm test
-npx wrangler deploy --dry-run
-npx wrangler deploy
+npx wrangler deploy --env="" --dry-run
+npx wrangler deploy --env staging --dry-run
+npx wrangler deploy --env=""
+MELAIVA_SMOKE_BASE_URL=https://melaiva.prakhargupta267.workers.dev npm run smoke:readiness
 ```
 
 The free launch target is the Worker `melaiva` on `workers.dev`. A paid custom domain, production email/payment providers, approved vendor supply, legal/trademark clearance, and operational verification are separate commercial launch gates—not claims made by this codebase.

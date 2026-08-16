@@ -23,6 +23,7 @@ import { SaveButton } from "../components/Shell.jsx";
 function normalizeVendor(vendor) {
   return {
     id: vendor.slug || vendor.id,
+    slug: vendor.slug || null,
     name: vendor.businessName || vendor.name,
     category: vendor.category || vendor.categories?.[0] || "venues",
     categoryLabel: categories.find((item) => item.id === (vendor.category || vendor.categories?.[0]))?.name || vendor.categoryLabel || "Wedding partner",
@@ -92,6 +93,9 @@ function FilterPanel({ draft, setDraft, onApply, onClear, mobile, onClose }) {
 }
 
 function VendorCard({ vendor, saved, onSave, onCompare, compared, view, demo }) {
+  const requestParams = new URLSearchParams({ category: vendor.category });
+  if (!demo && vendor.slug) requestParams.set("vendor", vendor.slug);
+
   return (
     <article className={`vendor-card ${view === "list" ? "vendor-card--list" : ""}`}>
       <div className={`vendor-card__visual tone--${vendor.tone}`}>
@@ -111,7 +115,7 @@ function VendorCard({ vendor, saved, onSave, onCompare, compared, view, demo }) 
           <div><small>Typical starting price</small><strong>{vendor.priceLabel}</strong></div>
           <div className="vendor-card__actions">
             <label className="compare-check"><input type="checkbox" checked={compared} onChange={onCompare} /><span>Compare</span></label>
-            <Link className="button button--outline button--small" to={`/request?category=${vendor.category}`}>{demo ? "Try example brief" : "Create brief"}</Link>
+            <Link className="button button--outline button--small" to={`/request?${requestParams.toString()}`}>{demo ? "Try example brief" : "Create brief"}</Link>
           </div>
         </div>
       </div>
@@ -169,7 +173,7 @@ export function MarketplacePage({ notify }) {
         if (!response.ok) throw new Error("Catalog unavailable");
         const payload = await response.json();
         setVendors((payload.data || []).map(normalizeVendor));
-        setDemoData(false);
+        setDemoData(payload.meta?.source === "demo");
       } catch (requestError) {
         if (requestError.name === "AbortError") return;
         let fallback = seededVendors.map(normalizeVendor);

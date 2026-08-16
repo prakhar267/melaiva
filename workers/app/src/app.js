@@ -271,6 +271,20 @@ const bidSchema = z
     }
   });
 
+const bookingMessageSchema = z
+  .object({
+    body: z
+      .string()
+      .trim()
+      .min(2)
+      .max(2_000)
+      .refine(
+        (body) => !/[\u0000-\u0008\u000B\u000C\u000E-\u001F\u007F\u202A-\u202E\u2066-\u2069]/u.test(body),
+        "Messages cannot contain control or bidirectional formatting characters",
+      ),
+  })
+  .strict();
+
 const bidDecisionSchema = z
   .object({ action: z.enum(["shortlist", "reject", "accept"]) })
   .strict();
@@ -1163,7 +1177,66 @@ function mapAward(row, user) {
     status: row.status,
     awardedAt: row.awarded_at,
     audienceRole,
+    messageCount: Number(row.message_count || 0),
     snapshot,
+  };
+}
+
+async function bookingForConversation(db, bookingId, user) {
+  if (typeof bookingId !== "string" || !/^[A-Za-z0-9-]{1,100}$/.test(bookingId)) {
+    throw new ApiError(404, "conversation_not_found", "Conversation not found");
+  }
+  const row = await db
+    .prepare(
+      `SELECT booking.id, booking.couple_user_id, booking.vendor_id,
+              vendor.user_id AS vendor_user_id, vendor.status AS vendor_status,
+              vendor.business_name AS vendor_business_name
+       FROM bookings booking
+       JOIN vendors vendor ON vendor.id = booking.vendor_id
+       WHERE booking.id = ? LIMIT 1`,
+    )
+    .bind(bookingId)
+    .first();
+  if (
+    !row
+    || (user.role !== "admin" && row.couple_user_id !== user.id && row.vendor_user_id !== user.id)
+  ) {
+    throw new ApiError(404, "conversation_not_found", "Conversation not found");
+  }
+  return row;
+}
+
+function conversationPermissions(booking, user) {
+  if (user.role === "admin") {
+    return { canSend: false, pausedReason: "Administrator access is read-only." };
+  }
+  if (booking.vendor_status !== "approved") {
+    return {
+      canSend: false,
+      pausedReason: "Messaging is paused because the partner account is not currently approved. Contact Melaiva support.",
+    };
+  }
+  return { canSend: true, pausedReason: null };
+}
+
+function mapBookingMessage(row, booking, user) {
+  const senderRole = row.sender_user_id === booking.couple_user_id
+    ? "couple"
+    : row.sender_user_id === booking.vendor_user_id
+      ? "vendor"
+      : "admin";
+  return {
+    id: row.id,
+    bookingId: row.booking_id,
+    body: row.body,
+    senderRole,
+    senderLabel: senderRole === "couple"
+      ? "Celebration host"
+      : senderRole === "vendor"
+        ? booking.vendor_business_name
+        : "Melaiva support",
+    mine: row.sender_user_id === user.id,
+    createdAt: row.created_at,
   };
 }
 
@@ -1846,7 +1919,8 @@ function buildApp() {
     const binds = user.role === "admin" ? [] : [user.id, user.id];
     const result = await db
       .prepare(
-        `SELECT booking.*, vendor.user_id AS vendor_user_id
+        `SELECT booking.*, vendor.user_id AS vendor_user_id, vendor.status AS vendor_status,
+                (SELECT COUNT(*) FROM booking_messages message WHERE message.booking_id = booking.id) AS message_count
          FROM bookings booking
          JOIN vendors vendor ON vendor.id = booking.vendor_id
          WHERE ${where}
@@ -1859,13 +1933,164 @@ function buildApp() {
     return c.json({ data: awards, meta: { page, limit, hasMore: awards.length === limit } });
   });
 
+  app.get(`${API_PREFIX}/bookings/:id/messages`, async (c) => {
+    const user = await currentUser(c);
+    const limit = parsePositiveInt(c.req.query("limit"), 50, 50);
+    const cursor = c.req.query("cursor") || null;
+    const db = requireDatabase(c.env);
+    const booking = await bookingForConversation(db, c.req.param("id"), user);
+    let cursorRow = null;
+    if (cursor) {
+      if (!/^[A-Za-z0-9-]{1,100}$/.test(cursor)) {
+        throw new ApiError(422, "invalid_cursor", "Message cursor is invalid");
+      }
+      cursorRow = await db
+        .prepare("SELECT id, created_at FROM booking_messages WHERE id = ? AND booking_id = ? LIMIT 1")
+        .bind(cursor, booking.id)
+        .first();
+      if (!cursorRow) throw new ApiError(422, "invalid_cursor", "Message cursor is invalid");
+    }
+    const result = await db
+      .prepare(
+        `SELECT id, booking_id, sender_user_id, body, created_at
+         FROM booking_messages
+         WHERE booking_id = ?
+           AND (
+             ? IS NULL
+             OR created_at < ?
+             OR (created_at = ? AND id < ?)
+           )
+         ORDER BY created_at DESC, id DESC
+         LIMIT ?`,
+      )
+      .bind(
+        booking.id,
+        cursorRow?.created_at || null,
+        cursorRow?.created_at || null,
+        cursorRow?.created_at || null,
+        cursorRow?.id || null,
+        limit + 1,
+      )
+      .all();
+    const newestFirst = result.results || [];
+    const hasMore = newestFirst.length > limit;
+    const pageRows = newestFirst.slice(0, limit);
+    const messages = pageRows.slice().reverse().map((row) => mapBookingMessage(row, booking, user));
+    return c.json({
+      data: messages,
+      meta: {
+        limit,
+        hasMore,
+        nextCursor: hasMore ? pageRows[pageRows.length - 1]?.id || null : null,
+        permissions: conversationPermissions(booking, user),
+      },
+    });
+  });
+
+  app.post(`${API_PREFIX}/bookings/:id/messages`, async (c) => {
+    const user = await currentUser(c);
+    await enforceRateLimit(c, `booking-message:${user.id}`, 120, 60 * 60);
+    const input = await parseJson(c, bookingMessageSchema, 8_000);
+    const requestKey = idempotencyKey(c, { required: true });
+    const requestHash = await canonicalRequestHash(input);
+    const db = requireDatabase(c.env);
+    const booking = await bookingForConversation(db, c.req.param("id"), user);
+    const permissions = conversationPermissions(booking, user);
+    if (!permissions.canSend) {
+      throw new ApiError(403, "messaging_paused", permissions.pausedReason);
+    }
+    const scope = `booking-message:${booking.id}`;
+    const replay = await findIdempotentResult(db, scope, requestKey, user.id, requestHash);
+    if (replay) return c.json({ data: replay.value, meta: { replayed: true } }, replay.status);
+
+    const requestKeyHash = await idempotencyHash(scope, requestKey, user.id);
+    await db
+      .prepare(
+        `DELETE FROM idempotency_keys
+         WHERE scope = ? AND key_hash = ? AND user_id = ? AND expires_at <= ?`,
+      )
+      .bind(scope, requestKeyHash, user.id, new Date().toISOString())
+      .run();
+
+    const id = crypto.randomUUID();
+    const createdAt = new Date().toISOString();
+    const responseValue = mapBookingMessage(
+      {
+        id,
+        booking_id: booking.id,
+        sender_user_id: user.id,
+        body: input.body,
+        created_at: createdAt,
+      },
+      booking,
+      user,
+    );
+    const idempotencyStatement = db
+      .prepare(
+        `INSERT INTO idempotency_keys
+         (scope, key_hash, user_id, request_hash, response_status, response_json, expires_at)
+         SELECT ?, ?, ?, ?, 201, ?, ?
+         WHERE EXISTS (
+           SELECT 1 FROM booking_messages WHERE id = ? AND booking_id = ?
+         )`,
+      )
+      .bind(
+        scope,
+        requestKeyHash,
+        user.id,
+        requestHash,
+        JSON.stringify(responseValue),
+        new Date(Date.now() + 24 * 60 * 60 * 1000).toISOString(),
+        id,
+        booking.id,
+      );
+    try {
+      const results = await db.batch([
+        db
+          .prepare(
+            `INSERT INTO booking_messages (id, booking_id, sender_user_id, body, created_at)
+             SELECT ?, booking.id, ?, ?, ?
+             FROM bookings booking
+             JOIN vendors vendor ON vendor.id = booking.vendor_id
+             WHERE booking.id = ?
+               AND vendor.status = 'approved'
+               AND (booking.couple_user_id = ? OR vendor.user_id = ?)`,
+          )
+          .bind(id, user.id, input.body, createdAt, booking.id, user.id, user.id),
+        idempotencyStatement,
+        db
+          .prepare(
+            `INSERT INTO audit_events (actor_user_id, action, entity_type, entity_id, metadata_json)
+             SELECT ?, 'booking.message_sent', 'booking_message', ?, ?
+             WHERE EXISTS (
+               SELECT 1 FROM booking_messages WHERE id = ? AND booking_id = ?
+             )`,
+          )
+          .bind(user.id, id, JSON.stringify({ bookingId: booking.id }), id, booking.id),
+      ]);
+      if (Number(results?.[0]?.meta?.changes || 0) !== 1 || Number(results?.[1]?.meta?.changes || 0) !== 1) {
+        throw new ApiError(409, "message_not_sent", "This message was not sent; refresh and try again");
+      }
+    } catch (error) {
+      if (isUniqueConstraint(error)) {
+        const concurrentReplay = await findIdempotentResult(db, scope, requestKey, user.id, requestHash);
+        if (concurrentReplay) {
+          return c.json({ data: concurrentReplay.value, meta: { replayed: true } }, concurrentReplay.status);
+        }
+      }
+      throw error;
+    }
+    return c.json({ data: responseValue }, 201);
+  });
+
   app.get(`${API_PREFIX}/auctions/:id/award`, async (c) => {
     const user = await currentUser(c);
     const auctionId = c.req.param("id");
     if (!/^[0-9a-f-]{36}$/i.test(auctionId)) throw new ApiError(404, "award_not_found", "Award record not found");
     const row = await requireDatabase(c.env)
       .prepare(
-        `SELECT booking.*, vendor.user_id AS vendor_user_id
+        `SELECT booking.*, vendor.user_id AS vendor_user_id, vendor.status AS vendor_status,
+                (SELECT COUNT(*) FROM booking_messages message WHERE message.booking_id = booking.id) AS message_count
          FROM bookings booking
          JOIN vendors vendor ON vendor.id = booking.vendor_id
          WHERE booking.auction_id = ? LIMIT 1`,

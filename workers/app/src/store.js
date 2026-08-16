@@ -1,4 +1,4 @@
-const STORE_SCHEMA_VERSION = 4;
+const STORE_SCHEMA_VERSION = 5;
 const MAINTENANCE_INTERVAL_MS = 60 * 60 * 1000;
 
 const STORE_SCHEMA_V1_SQL = `
@@ -366,7 +366,37 @@ INSERT OR IGNORE INTO _sql_schema_migrations (id) VALUES (4);
 PRAGMA optimize;
 `;
 
-const STORE_SCHEMA_SQL = `${STORE_SCHEMA_V1_SQL}\n${STORE_SCHEMA_V2_MIGRATION_SQL}\n${STORE_SCHEMA_V3_MIGRATION_SQL}\n${STORE_SCHEMA_V4_MIGRATION_SQL}`;
+const STORE_SCHEMA_V5_MIGRATION_SQL = `
+CREATE TABLE IF NOT EXISTS booking_messages (
+  id TEXT PRIMARY KEY,
+  booking_id TEXT NOT NULL REFERENCES bookings(id) ON DELETE RESTRICT,
+  sender_user_id TEXT NOT NULL REFERENCES users(id) ON DELETE RESTRICT,
+  body TEXT NOT NULL CHECK (length(trim(body)) BETWEEN 2 AND 2000),
+  created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+);
+CREATE INDEX IF NOT EXISTS idx_booking_messages_thread
+  ON booking_messages(booking_id, created_at DESC, id DESC);
+CREATE INDEX IF NOT EXISTS idx_booking_messages_sender
+  ON booking_messages(sender_user_id, created_at DESC);
+
+CREATE TRIGGER IF NOT EXISTS booking_messages_participant_insert
+BEFORE INSERT ON booking_messages
+WHEN NOT EXISTS (
+  SELECT 1
+  FROM bookings booking
+  JOIN vendors vendor ON vendor.id = booking.vendor_id
+  WHERE booking.id = NEW.booking_id
+    AND NEW.sender_user_id IN (booking.couple_user_id, vendor.user_id)
+)
+BEGIN
+  SELECT RAISE(ABORT, 'booking message sender must be a participant');
+END;
+
+INSERT OR IGNORE INTO _sql_schema_migrations (id) VALUES (5);
+PRAGMA optimize;
+`;
+
+const STORE_SCHEMA_SQL = `${STORE_SCHEMA_V1_SQL}\n${STORE_SCHEMA_V2_MIGRATION_SQL}\n${STORE_SCHEMA_V3_MIGRATION_SQL}\n${STORE_SCHEMA_V4_MIGRATION_SQL}\n${STORE_SCHEMA_V5_MIGRATION_SQL}`;
 
 const DEMO_CATALOG_SQL = `
 INSERT OR IGNORE INTO vendors
@@ -429,7 +459,7 @@ export class MelaivaStore {
         }
         this.sql.exec(STORE_SCHEMA_V2_FINALIZE_SQL).toArray();
       }
-      if (version > 0 && version < STORE_SCHEMA_VERSION) {
+      if (version > 0 && version < 4) {
         const bidColumns = new Set(this.sql.exec("PRAGMA table_info(bids)").toArray().map((column) => column.name));
         for (const [name, sql] of STORE_SCHEMA_V3_COLUMN_MIGRATIONS) {
           if (!bidColumns.has(name)) this.sql.exec(sql).toArray();
@@ -438,6 +468,9 @@ export class MelaivaStore {
       }
       if (version > 0 && version < 4) {
         this.sql.exec(STORE_SCHEMA_V4_MIGRATION_SQL).toArray();
+      }
+      if (version > 0 && version < 5) {
+        this.sql.exec(STORE_SCHEMA_V5_MIGRATION_SQL).toArray();
       }
       if (env?.ENABLE_DEMO_CATALOG === "true" && env?.ENVIRONMENT !== "production") {
         this.sql.exec(DEMO_CATALOG_SQL).toArray();
@@ -573,6 +606,7 @@ export {
   STORE_SCHEMA_V2_MIGRATION_SQL,
   STORE_SCHEMA_V3_MIGRATION_SQL,
   STORE_SCHEMA_V4_MIGRATION_SQL,
+  STORE_SCHEMA_V5_MIGRATION_SQL,
   STORE_SCHEMA_VERSION,
   executeSql,
 };

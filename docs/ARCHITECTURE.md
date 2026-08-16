@@ -18,13 +18,15 @@ This shape is intentional for the free launch tier: it preserves relational cons
 
 ## Storage and invariants
 
-- `MelaivaStore` is the authoritative store for users, revocable sessions, vendor applications, auctions, preferred-vendor invitations, bids, immutable award handoffs, AI quota usage, idempotency results, and rate-limit buckets.
+- `MelaivaStore` is the authoritative store for users, revocable sessions, vendor applications, auctions, preferred-vendor invitations, bids, immutable award handoffs, award-linked messages, AI quota usage, idempotency results, and rate-limit buckets.
 - The Durable Object uses SQLite tables, constraints, indexes, and transactions. Its schema is initialized and versioned in `workers/app/src/store.js`.
 - All money values are integer **whole INR rupees** in this MVP. Payments are not implemented, so no code represents the platform as holding funds or escrow.
 - A partial unique index allows at most one accepted bid per auction.
 - New requests contain exactly one service category, so every offer in a pool is comparable and one award cannot silently close unrelated work. Legacy multi-service requests remain readable but cannot be shortlisted or awarded.
 - Accepting a bid atomically awards it, closes the auction, rejects remaining open bids, and records the accepted request/offer/vendor snapshot as `contract_pending`.
 - Award snapshots cannot be updated or deleted. Only the request owner, winning vendor, and administrators can read them.
+- Award-linked messages do not modify the frozen accepted scope. The request owner and currently approved winning vendor can send plain text; administrators are read-only, unrelated users receive a not-found response, and partner suspension pauses new messages for both parties while preserving prior history.
+- Message writes require idempotency, validate bounded plain text, atomically recheck current participant and vendor approval state, and record only the message and booking identifiers—not message bodies—in audit metadata.
 - Auction creation and bid acceptance require/replay an `Idempotency-Key` result.
 - A preferred vendor is attached only when the vendor remains approved and matches the brief's category and city at the atomic create boundary. Other matched vendors cannot see that preference.
 - Suspending or rejecting a vendor withdraws open proposals and makes unanswered direct invitations unavailable; award selection rechecks current vendor approval.
@@ -40,7 +42,7 @@ This shape is intentional for the free launch tier: it preserves relational cons
 - Planning: deterministic brief rules plus optional Gemini planning.
 - Requests: private structured briefs, optional explicit preferred-partner invitations, and date-bounded auctions.
 - Offers: vendor bids and customer shortlist/reject/accept decisions.
-- Awards: immutable accepted-scope handoffs for the couple and winning vendor; contracts, signatures, invoices, and payments are deliberately out of scope.
+- Awards: immutable accepted-scope handoffs plus private text coordination for the couple and winning vendor; attachments, contracts, signatures, invoices, notifications, and payments are deliberately out of scope.
 - Partners: vendor onboarding and manual approval state.
 - Reliability: rate limits, quotas, idempotency, fail-closed health checks, cleanup alarm, request IDs, safe telemetry.
 
@@ -49,7 +51,7 @@ This shape is intentional for the free launch tier: it preserves relational cons
 - `/health` and `/api/v1/health`
 - `/api/v1/auth/*`
 - `/api/v1/vendors` and `/api/v1/vendors/onboarding`
-- `/api/v1/auctions`, `/api/v1/auctions/:id/status`, `/api/v1/auctions/:id/bids`, `/api/v1/auctions/:id/award`, and `/api/v1/bookings`
+- `/api/v1/auctions`, `/api/v1/auctions/:id/status`, `/api/v1/auctions/:id/bids`, `/api/v1/auctions/:id/award`, `/api/v1/bookings`, and `/api/v1/bookings/:id/messages`
 - `/api/v1/ai/plan`
 - `/api/v1/admin/*`
 
@@ -98,5 +100,5 @@ Use an external synthetic monitor for `/health` because a Worker cannot reliably
 - CI gates frozen installs, frontend build, SPA fallback tests, syntax checks, SQLite integration/security tests, and a Wrangler bundle dry run. The protected default branch also requires CodeQL security analysis.
 - Production deployment remains a manual authenticated Wrangler release until least-privilege Cloudflare credentials are installed in the protected GitHub environment; the checked-in workflow cannot deploy without them.
 - Staging targets the separate `melaiva-staging` Worker and Durable Object namespace with production-strength runtime posture but AI, demo data, and Turnstile disabled until their integrations are ready.
-- `wrangler deploy` provisions the Durable Object class via Cloudflare migration `v1`; the class then applies its resumable internal SQLite schema migrations through schema version 4.
+- `wrangler deploy` provisions the Durable Object class via Cloudflare migration `v1`; the class then applies its resumable internal SQLite schema migrations through schema version 5.
 - Free-plan limits are capacity limits, not an enterprise SLA. A custom domain, production support, transactional email, payments, legal/KYC, and model usage need explicit operating budgets and vendor contracts.

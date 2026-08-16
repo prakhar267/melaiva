@@ -33,6 +33,7 @@ import {
 } from "lucide-react";
 import { categories, cities, formatCurrency, opportunities as exampleOpportunities } from "../data.js";
 import { isServiceUnavailable, readApiResponse } from "../api.js";
+import { BookingMessages } from "../components/BookingMessages.jsx";
 
 function categoryLabel(value) {
   return categories.find((category) => category.id === value)?.name || value?.replaceAll("_", " ") || "Service";
@@ -116,14 +117,15 @@ function createAddOn() {
   };
 }
 
-function VendorWorkspaceNav({ active, setActive, opportunityCount, offerCount, awardCount }) {
-  const items = [
+function VendorWorkspaceNav({ active, setActive, opportunityCount, offerCount, awardCount, conversationCount, restricted = false }) {
+  const allItems = [
     ["opportunities", BriefcaseBusiness, "Opportunities", opportunityCount],
     ["offers", FileText, "My offers", offerCount],
     ["awards", Handshake, "Award handoffs", awardCount],
-    ["messages", MessageSquareText, "Messages"],
+    ["messages", MessageSquareText, "Messages", conversationCount],
     ["profile", Store, "Business profile"],
   ];
+  const items = restricted ? allItems.filter(([id]) => ["awards", "messages"].includes(id)) : allItems;
   return (
     <nav className="vendor-workspace-nav" aria-label="Vendor workspace">
       {items.map(([id, Icon, label, count]) => (
@@ -292,9 +294,9 @@ function VendorOffers({ offers, demo }) {
   );
 }
 
-function VendorAwards({ awards, demo, loading, error, onRetry }) {
+function VendorAwards({ awards, demo, loading, error, onRetry, onMessage }) {
   if (!demo && loading) return <div className="vendor-tab-panel"><div className="vendor-empty" role="status" aria-live="polite"><span><LoaderCircle className="spin-icon" size={28} /></span><h2>Loading award handoffs</h2><p>Retrieving the read-only records for work awarded to this business.</p></div></div>;
-  if (!demo && error) return <div className="vendor-tab-panel"><div className="vendor-empty" role="alert"><span><CircleAlert size={28} /></span><h2>Award handoffs could not be loaded</h2><p>{error} Your live opportunities and submitted offers remain available.</p><button className="button button--outline" type="button" onClick={onRetry}><RefreshCw size={15} /> Retry awards</button></div></div>;
+  if (!demo && error) return <div className="vendor-tab-panel"><div className="vendor-empty" role="alert"><span><CircleAlert size={28} /></span><h2>Award handoffs could not be loaded</h2><p>{error} Retrying will not change any workspace data.</p><button className="button button--outline" type="button" onClick={onRetry}><RefreshCw size={15} /> Retry awards</button></div></div>;
   if (!awards.length) return <div className="vendor-empty" role="status"><span><Handshake size={28} /></span><h2>{demo ? "Example awards are not live" : "No awarded work yet"}</h2><p>{demo ? "The live service is unavailable, so this preview does not invent award records." : "When a couple awards one of your offers, the frozen scope and contract-pending handoff will appear here."}</p></div>;
   return (
     <div className="vendor-tab-panel">
@@ -316,7 +318,7 @@ function VendorAwards({ awards, demo, loading, error, onRetry }) {
               <section className="vendor-award-card__proposal"><h4>Accepted proposal</h4><p>{proposal}</p></section>
               <div className="vendor-award-card__scope"><section className="offer-term-card"><h4>Accepted inclusions</h4><VendorAwardTermList items={Array.isArray(offer.deliverables) ? offer.deliverables : null} /></section><section className="offer-term-card"><h4>Accepted exclusions</h4><VendorAwardTermList items={exclusions} tone="excluded" /></section></div>
               <div className="vendor-award-card__terms"><section className="offer-term-card"><h4>Priced add-ons</h4><VendorAwardTermList items={addOns} emptyLabel={structured ? "No priced add-ons" : "Not provided"} formatItem={(item) => `${item?.name || "Unnamed add-on"} · ${Number.isFinite(Number(item?.amount)) ? formatCurrency(item.amount) : "Price not provided"}`} /></section><section className="offer-term-card"><h4>Delivery plan</h4><p>{structured ? offer.deliveryPlan : "Not provided"}</p></section><section className="offer-term-card"><h4>Cancellation terms</h4><p>{structured ? offer.cancellationTerms : "Not provided"}</p></section></div>
-              <div className="vendor-award-card__next"><ShieldCheck size={17} /><p><strong>Arrange and review a written contract outside Melaiva.</strong><span>Before any signature or payment, agree it directly with the couple and confirm it mirrors every frozen term above. Melaiva does not provide signing or payment in this workspace.</span></p></div>
+              <div className="vendor-award-card__next"><ShieldCheck size={17} /><p><strong>Arrange and review a written contract outside Melaiva.</strong><span>Before any signature or payment, agree it directly with the couple and confirm it mirrors every frozen term above. Melaiva does not provide signing or payment in this workspace.</span></p><button className="button button--small button--outline" type="button" onClick={() => onMessage?.(award.id)}><MessageSquareText size={14} /> Message couple</button></div>
             </article>
           );
         })}
@@ -327,14 +329,14 @@ function VendorAwards({ awards, demo, loading, error, onRetry }) {
 
 function VendorEmpty({ type }) {
   const Icon = type === "profile" ? Store : MessageSquareText;
-  return <div className="vendor-empty"><span><Icon size={28} /></span><h2>{type === "profile" ? "Your business profile" : "No open conversations"}</h2><p>{type === "profile" ? "Complete onboarding to manage portfolio details, service areas and starting budgets here." : "When a couple chooses to connect after reviewing an offer, the conversation will appear here."}</p>{type === "profile" && <Link className="button button--primary" to="/vendor/onboarding">Complete profile</Link>}</div>;
+  return <div className="vendor-empty"><span><Icon size={28} /></span><h2>{type === "profile" ? "Your business profile" : "Live conversations are unavailable in preview"}</h2><p>{type === "profile" ? "Complete onboarding to manage portfolio details, service areas and starting budgets here." : "Sign in to read messages connected to awarded work. No example conversations are fabricated."}</p>{type === "profile" && <Link className="button button--primary" to="/vendor/onboarding">Complete profile</Link>}</div>;
 }
 
 function VendorAccessState({ icon: Icon, eyebrow, title, message, children }) {
   return <div className="shell vendor-access-state"><div className="vendor-empty"><span><Icon size={29} /></span><div className="eyebrow">{eyebrow}</div><h1>{title}</h1><p>{message}</p><div className="vendor-access-state__actions">{children}</div></div></div>;
 }
 
-export function VendorPage({ notify, onOpenAuth }) {
+export function VendorPage({ notify, onOpenAuth, authRevision = 0 }) {
   const [active, setActive] = useState("opportunities");
   const [mode, setMode] = useState("loading");
   const [profile, setProfile] = useState(null);
@@ -345,6 +347,7 @@ export function VendorPage({ notify, onOpenAuth }) {
   const [awardsError, setAwardsError] = useState("");
   const [awardsRefreshKey, setAwardsRefreshKey] = useState(0);
   const [refreshKey, setRefreshKey] = useState(0);
+  const [messageBookingId, setMessageBookingId] = useState(null);
 
   useEffect(() => {
     const controller = new AbortController();
@@ -357,7 +360,20 @@ export function VendorPage({ notify, onOpenAuth }) {
         const nextUser = mePayload.data?.user;
         const nextVendor = mePayload.data?.vendor;
         if (!nextVendor) { if (!controller.signal.aborted) { setProfile({ user: nextUser, vendor: nextVendor }); setMode("not-vendor"); } return; }
-        if (nextVendor.status !== "approved") { if (!controller.signal.aborted) { setProfile({ user: nextUser, vendor: nextVendor }); setMode("pending"); } return; }
+        if (nextVendor.status !== "approved") {
+          if (!controller.signal.aborted) {
+            setProfile({ user: nextUser, vendor: nextVendor });
+            if (["suspended", "rejected"].includes(nextVendor.status)) {
+              setAwardsLoading(true);
+              setAwardsError("");
+              setActive("messages");
+              setMode("restricted");
+            } else {
+              setMode("pending");
+            }
+          }
+          return;
+        }
         const [auctionResponse, offerResponse] = await Promise.all([
           fetch("/api/v1/auctions?limit=50", { credentials: "include", signal: controller.signal }),
           fetch("/api/v1/bids/mine", { credentials: "include", signal: controller.signal }),
@@ -380,10 +396,10 @@ export function VendorPage({ notify, onOpenAuth }) {
     }
     load();
     return () => controller.abort();
-  }, [refreshKey]);
+  }, [authRevision, refreshKey]);
 
   useEffect(() => {
-    if (mode !== "live" || profile?.vendor?.status !== "approved") {
+    if (!["live", "restricted"].includes(mode)) {
       setAwards([]);
       setAwardsError("");
       setAwardsLoading(false);
@@ -418,23 +434,25 @@ export function VendorPage({ notify, onOpenAuth }) {
   if (mode === "not-vendor") return <div className="vendor-page page-surface"><VendorAccessState icon={Store} eyebrow="Partner application" title="Introduce your business first" message="Complete the partner application before accessing private opportunities or sending proposals."><Link className="button button--primary" to="/vendor/onboarding">Start application</Link><Link className="button button--outline" to="/dashboard">Open couple workspace</Link></VendorAccessState></div>;
   if (mode === "pending") return <div className="vendor-page page-surface"><VendorAccessState icon={ShieldCheck} eyebrow="Application status" title={`Your application is ${profile.vendor.status}.`} message="Private briefs remain locked until the partner review is complete. Submission does not guarantee approval."><Link className="button button--outline" to="/marketplace">View public marketplace</Link></VendorAccessState></div>;
 
-  const businessName = mode === "live" ? profile.vendor.businessName : "Example partner studio";
+  const restricted = mode === "restricted";
+  const businessName = ["live", "restricted"].includes(mode) ? profile.vendor.businessName : "Example partner studio";
   const initials = businessName.split(" ").map((word) => word[0]).join("").slice(0, 2).toUpperCase();
   const underReview = offers.filter((offer) => ["submitted", "shortlisted"].includes(offer.status)).length;
 
   return (
     <div className="vendor-page page-surface">
-      <section className="vendor-top"><div className="shell vendor-top__inner"><div className="vendor-business"><span>{initials}</span><div><small>{mode === "demo" ? "Preview vendor workspace" : "Approved partner workspace"}</small><strong>{businessName}</strong></div>{mode === "live" && <BadgeCheck size={18} />}</div><div className="vendor-top__actions"><Link className="text-link" to="/marketplace">View marketplace <ArrowRight size={15} /></Link><button className="icon-button" type="button" aria-label="Vendor notifications"><Sparkles size={18} /></button></div></div></section>
+      <section className="vendor-top"><div className="shell vendor-top__inner"><div className="vendor-business"><span>{initials}</span><div><small>{mode === "demo" ? "Preview vendor workspace" : restricted ? "Restricted partner workspace" : "Approved partner workspace"}</small><strong>{businessName}</strong></div>{mode === "live" && <BadgeCheck size={18} />}</div><div className="vendor-top__actions"><Link className="text-link" to="/marketplace">View marketplace <ArrowRight size={15} /></Link><button className="icon-button" type="button" aria-label="Vendor notifications"><Sparkles size={18} /></button></div></div></section>
       <div className="shell vendor-shell">
         {mode === "demo" && <div className="demo-catalog-note vendor-preview-note"><CircleAlert size={16} /><p><strong>Preview workspace</strong> The live partner service could not be reached. Examples below never submit to real request IDs.</p><button className="text-button" type="button" onClick={() => setRefreshKey((value) => value + 1)}><RefreshCw size={14} /> Retry</button></div>}
-        <div className="vendor-welcome"><div><div className="eyebrow">{mode === "demo" ? "Partner workspace preview" : "Partner workspace"}</div><h1>Good opportunities, clearly briefed.</h1><p>{mode === "demo" ? "Explore a clearly labelled example without changing live marketplace data." : "Focus on celebrations that fit your dates, services and working range."}</p></div>{mode === "demo" && <div className="vendor-demo-note"><ShieldCheck size={16} /><span>Example workspace data</span></div>}</div>
-        <div className="vendor-metrics"><div><span className="card-icon"><BriefcaseBusiness size={18} /></span><p><small>{mode === "demo" ? "Example matches" : "Open opportunities"}</small><strong>{visibleOpportunities.length}</strong><em>{mode === "demo" ? "Preview" : "Live"}</em></p></div><div><span className="card-icon card-icon--teal"><FileCheck2 size={18} /></span><p><small>Offers under review</small><strong>{mode === "demo" ? "—" : underReview}</strong><em>{mode === "demo" ? "No live data" : "Live"}</em></p></div><div><span className="card-icon card-icon--marigold"><TrendingUp size={18} /></span><p><small>Profile status</small><strong>{mode === "demo" ? "Preview" : "Approved"}</strong><em>{mode === "demo" ? "Example" : "Verified"}</em></p></div><div><span className="card-icon card-icon--rose"><Star size={18} /></span><p><small>Review quality</small><strong>—</strong><em>No rating yet</em></p></div></div>
-        <VendorWorkspaceNav active={active} setActive={setActive} opportunityCount={visibleOpportunities.length} offerCount={mode === "demo" ? 0 : offers.length} awardCount={mode === "demo" ? 0 : awards.length} />
-        {active === "opportunities" && <div className="vendor-tab-panel"><div className="vendor-panel-heading"><div><h2>{mode === "demo" ? "Example opportunities" : "Open opportunities"}</h2><p>{mode === "demo" ? "Static examples for evaluating the workflow." : "Private briefs available to your approved business."}</p></div></div>{visibleOpportunities.length ? <div className="opportunity-list">{visibleOpportunities.map((opportunity) => <OpportunityCard opportunity={opportunity} notify={notify} onOpenAuth={onOpenAuth} onSubmitted={() => setRefreshKey((value) => value + 1)} key={opportunity.id} />)}</div> : <div className="vendor-empty"><span><BriefcaseBusiness size={28} /></span><h2>No suitable live briefs right now</h2><p>New approved requests will appear here when they match your partner account.</p></div>}</div>}
-        {active === "offers" && <VendorOffers offers={mode === "demo" ? [] : offers} demo={mode === "demo"} />}
-        {active === "awards" && <VendorAwards awards={mode === "demo" ? [] : awards} demo={mode === "demo"} loading={awardsLoading} error={awardsError} onRetry={() => setAwardsRefreshKey((value) => value + 1)} />}
-        {active === "messages" && <VendorEmpty type="messages" />}
-        {active === "profile" && <VendorEmpty type="profile" />}
+        {restricted
+          ? <div className="demo-catalog-note vendor-preview-note" role="status"><ShieldCheck size={16} /><p><strong>Account access is restricted.</strong> New opportunities and new messages are paused. Prior award records and conversation history remain available for reference; contact Melaiva support for help.</p></div>
+          : <><div className="vendor-welcome"><div><div className="eyebrow">{mode === "demo" ? "Partner workspace preview" : "Partner workspace"}</div><h1>Good opportunities, clearly briefed.</h1><p>{mode === "demo" ? "Explore a clearly labelled example without changing live marketplace data." : "Focus on celebrations that fit your dates, services and working range."}</p></div>{mode === "demo" && <div className="vendor-demo-note"><ShieldCheck size={16} /><span>Example workspace data</span></div>}</div><div className="vendor-metrics"><div><span className="card-icon"><BriefcaseBusiness size={18} /></span><p><small>{mode === "demo" ? "Example matches" : "Open opportunities"}</small><strong>{visibleOpportunities.length}</strong><em>{mode === "demo" ? "Preview" : "Live"}</em></p></div><div><span className="card-icon card-icon--teal"><FileCheck2 size={18} /></span><p><small>Offers under review</small><strong>{mode === "demo" ? "—" : underReview}</strong><em>{mode === "demo" ? "No live data" : "Live"}</em></p></div><div><span className="card-icon card-icon--marigold"><TrendingUp size={18} /></span><p><small>Profile status</small><strong>{mode === "demo" ? "Preview" : "Approved"}</strong><em>{mode === "demo" ? "Example" : "Verified"}</em></p></div><div><span className="card-icon card-icon--rose"><Star size={18} /></span><p><small>Review quality</small><strong>—</strong><em>No rating yet</em></p></div></div></>}
+        <VendorWorkspaceNav active={active} setActive={setActive} opportunityCount={visibleOpportunities.length} offerCount={mode === "demo" ? 0 : offers.length} awardCount={mode === "demo" ? 0 : awards.length} conversationCount={mode === "demo" ? 0 : awards.length} restricted={restricted} />
+        {!restricted && active === "opportunities" && <div className="vendor-tab-panel"><div className="vendor-panel-heading"><div><h2>{mode === "demo" ? "Example opportunities" : "Open opportunities"}</h2><p>{mode === "demo" ? "Static examples for evaluating the workflow." : "Private briefs available to your approved business."}</p></div></div>{visibleOpportunities.length ? <div className="opportunity-list">{visibleOpportunities.map((opportunity) => <OpportunityCard opportunity={opportunity} notify={notify} onOpenAuth={onOpenAuth} onSubmitted={() => setRefreshKey((value) => value + 1)} key={opportunity.id} />)}</div> : <div className="vendor-empty"><span><BriefcaseBusiness size={28} /></span><h2>No suitable live briefs right now</h2><p>New approved requests will appear here when they match your partner account.</p></div>}</div>}
+        {!restricted && active === "offers" && <VendorOffers offers={mode === "demo" ? [] : offers} demo={mode === "demo"} />}
+        {active === "awards" && <VendorAwards awards={mode === "demo" ? [] : awards} demo={mode === "demo"} loading={awardsLoading} error={awardsError} onRetry={() => setAwardsRefreshKey((value) => value + 1)} onMessage={(bookingId) => { setMessageBookingId(bookingId); setActive("messages"); }} />}
+        {active === "messages" && (["live", "restricted"].includes(mode) ? <BookingMessages audience="vendor" preferredBookingId={messageBookingId} onViewScope={() => setActive("awards")} emptyActionLabel={restricted ? "View award handoffs" : "View opportunities"} onEmptyAction={() => setActive(restricted ? "awards" : "opportunities")} /> : <VendorEmpty type="messages" />)}
+        {!restricted && active === "profile" && <VendorEmpty type="profile" />}
       </div>
     </div>
   );

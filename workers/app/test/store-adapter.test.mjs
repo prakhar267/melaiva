@@ -9,6 +9,7 @@ import {
   STORE_SCHEMA_V2_MIGRATION_SQL,
   STORE_SCHEMA_V3_MIGRATION_SQL,
   STORE_SCHEMA_V4_MIGRATION_SQL,
+  STORE_SCHEMA_V5_MIGRATION_SQL,
   STORE_SCHEMA_VERSION,
   createDurableDatabase,
   executeSql,
@@ -468,6 +469,71 @@ test("schema v4 resumes a partial backfill and falls through malformed timestamp
   );
 });
 
+test("schema v5 adds restart-safe booking messages without mutating existing awards", () => {
+  const sqlite = createV3AwardDatabase();
+  const seeded = seedAcceptedAward(sqlite, "messages", { auditCreatedAt: "2027-10-01T04:05:06.000Z" });
+  sqlite.exec(STORE_SCHEMA_V4_MIGRATION_SQL);
+  const bookingBefore = sqlite
+    .prepare("SELECT * FROM bookings WHERE accepted_bid_id = ?")
+    .get(seeded.bidId);
+
+  sqlite.exec(STORE_SCHEMA_V5_MIGRATION_SQL);
+  sqlite.exec(STORE_SCHEMA_V5_MIGRATION_SQL);
+
+  assert.equal(sqlite.prepare("SELECT MAX(id) AS version FROM _sql_schema_migrations").get().version, 5);
+  assert.deepEqual(
+    sqlite.prepare("SELECT * FROM bookings WHERE accepted_bid_id = ?").get(seeded.bidId),
+    bookingBefore,
+  );
+  assert.deepEqual(
+    sqlite.prepare("PRAGMA table_info(booking_messages)").all().map((column) => column.name),
+    ["id", "booking_id", "sender_user_id", "body", "created_at"],
+  );
+  assert.deepEqual(
+    sqlite
+      .prepare("PRAGMA index_list(booking_messages)")
+      .all()
+      .map((index) => index.name)
+      .filter((name) => name.startsWith("idx_booking_messages_"))
+      .sort(),
+    ["idx_booking_messages_sender", "idx_booking_messages_thread"],
+  );
+  assert.equal(
+    sqlite
+      .prepare("SELECT COUNT(*) AS count FROM sqlite_master WHERE type = 'trigger' AND name = 'booking_messages_participant_insert'")
+      .get().count,
+    1,
+  );
+
+  sqlite.exec("PRAGMA foreign_keys = ON");
+  sqlite
+    .prepare(
+      `INSERT INTO booking_messages (id, booking_id, sender_user_id, body, created_at)
+       VALUES ('message-valid', ?, 'migration-couple', 'Please confirm the first coordination call.',
+               '2027-10-02T03:04:05.000Z')`,
+    )
+    .run(bookingBefore.id);
+  assert.equal(sqlite.prepare("SELECT COUNT(*) AS count FROM booking_messages").get().count, 1);
+  assert.throws(
+    () => sqlite
+      .prepare("INSERT INTO booking_messages (id, booking_id, sender_user_id, body) VALUES ('message-blank', ?, 'migration-couple', '  ')")
+      .run(bookingBefore.id),
+    /CHECK constraint failed/,
+  );
+  assert.throws(
+    () => sqlite
+      .prepare("INSERT INTO booking_messages (id, booking_id, sender_user_id, body) VALUES ('message-long', ?, 'migration-couple', ?)")
+      .run(bookingBefore.id, "x".repeat(2_001)),
+    /CHECK constraint failed/,
+  );
+  assert.throws(
+    () => sqlite
+      .prepare("INSERT INTO booking_messages (id, booking_id, sender_user_id, body) VALUES ('message-orphan', 'missing-booking', 'migration-couple', 'No orphan thread')")
+      .run(),
+    /booking message sender must be a participant/,
+  );
+});
+
 test("schema initialization resumes from an already-added v3 column through the latest migration", async () => {
   const sqlite = new DatabaseSync(":memory:");
   sqlite.exec(`CREATE TABLE _sql_schema_migrations (
@@ -521,4 +587,5 @@ test("schema initialization resumes from an already-added v3 column through the 
     assert.ok(columns.has(name), `missing resumed bids.${name}`);
   }
   assert.ok(sqlite.prepare("PRAGMA table_info(bookings)").all().some((column) => column.name === "accepted_scope_json"));
+  assert.ok(sqlite.prepare("PRAGMA table_info(booking_messages)").all().some((column) => column.name === "sender_user_id"));
 });

@@ -1,0 +1,52 @@
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  validate:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: |
+            package-lock.json
+            workers/app/package-lock.json
+
+      - name: Install web dependencies
+        run: npm ci
+
+      - name: Build web app
+        run: npm run build
+
+      - name: Verify Sites-compatible fallback
+        run: npm run test:sites
+
+      - name: Install API dependencies
+        working-directory: workers/app
+        run: npm ci
+
+      - name: Validate API
+        working-directory: workers/app
+        run: npm run check
+
+      - name: Test API
+        working-directory: workers/app
+        run: npm test
+
+      - name: Validate Cloudflare bundle
+        working-directory: workers/app
+        run: npx wrangler deploy --dry-run --outdir dist/dry-run

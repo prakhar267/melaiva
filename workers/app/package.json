@@ -1,0 +1,22 @@
+{
+  "name": "@melaiva/api",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "dev": "wrangler dev",
+    "test": "node --test test/*.test.mjs",
+    "check": "node --check src/index.js && node --check src/app.js && node --check src/store.js",
+    "deploy": "wrangler deploy"
+  },
+  "dependencies": {
+    "hono": "^4.13.2",
+    "zod": "^4.4.3"
+  },
+  "devDependencies": {
+    "wrangler": "^4.30.0"
+  },
+  "engines": {
+    "node": ">=20"
+  }
+}

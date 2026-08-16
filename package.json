@@ -1,0 +1,25 @@
+{
+  "name": "melaiva",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "dev": "vite",
+    "build": "vite build && node scripts/prepare-sites-build.mjs",
+    "preview": "vite preview",
+    "smoke:production": "node scripts/production-smoke.mjs",
+    "test:sites": "node --test tests/sites-worker.test.mjs",
+    "test:api": "node --test workers/app/test/*.test.mjs",
+    "check:api": "node --check workers/app/src/index.js && node --check workers/app/src/app.js && node --check workers/app/src/store.js"
+  },
+  "dependencies": {
+    "@fontsource/fraunces": "^5.3.0",
+    "@fontsource/manrope": "^5.3.0",
+    "@vitejs/plugin-react": "5.0.4",
+    "lucide-react": "^1.31.0",
+    "react": "19.2.0",
+    "react-dom": "19.2.0",
+    "react-router-dom": "^7.18.2",
+    "vite": "6.4.3"
+  }
+}

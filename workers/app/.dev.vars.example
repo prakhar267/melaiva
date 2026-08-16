@@ -1,0 +1,13 @@
+SESSION_SECRET=replace-with-at-least-32-random-characters
+PASSWORD_PEPPER=replace-with-an-independent-32-character-secret
+# PASSWORD_PEPPER_PREVIOUS=only-during-a-planned-pepper-rotation
+# GEMINI_API_KEY=replace-with-a-google-ai-studio-api-key
+# Optional; registration/planner require X-Turnstile-Token when set.
+# TURNSTILE_SECRET_KEY=replace-with-a-turnstile-secret
+# Cross-origin local frontend previews only. Production wrangler.toml remains same-origin.
+ALLOWED_ORIGINS=http://localhost:4173,http://127.0.0.1:4173,http://localhost:5173,http://127.0.0.1:5173
+# Set false only for local HTTP testing. Production cookies should remain Secure.
+COOKIE_SECURE=false
+# Local migration/testing escape hatch. Never set this in production.
+ALLOW_SERVER_PASSWORD_HASHING=true
+ENVIRONMENT=development

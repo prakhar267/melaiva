@@ -1,0 +1,74 @@
+# Melaiva Worker
+
+One Cloudflare Worker serves the Melaiva SPA and the versioned `/api/v1` API. Stateful data lives in the `MelaivaStore` SQLite-backed Durable Object, so production does not require a D1 database. The Worker uses one named `global` object to provide relational constraints and serializable marketplace decisions.
+
+## Local development
+
+1. From this directory, run `npm ci`.
+2. Copy `.dev.vars.example` to `.dev.vars`, replace `SESSION_SECRET`, and keep the file uncommitted.
+3. Build the frontend from `app/` with `npm run build` so `dist/client` exists.
+4. Run `npm run dev` here. SQLite tables and indexes initialize automatically on the first Durable Object request; there is no manual database-migration command.
+5. Run `npm test` for the API/security suite. It includes a real SQLite marketplace integration test.
+
+`GET /health` checks the Durable Object adapter and required authentication configuration, and returns `503` when either is unavailable. JSON errors use `{"error":{"code":"...","message":"...","requestId":"..."}}`.
+
+## Authentication contract
+
+Production never receives plaintext passwords and does not perform a costly password KDF inside the Free-plan Worker CPU budget.
+
+The browser:
+
+1. Normalizes email with `trim().toLowerCase()`.
+2. Uses UTF-8 `melaiva:password:v1:<normalized-email>` as the salt.
+3. Derives 256 bits with PBKDF2-SHA-256 at 310,000 iterations.
+4. Encodes the result as unpadded base64url.
+5. Sends `passwordVerifier` and `passwordKdf: "pbkdf2-sha256-v1"` to register/login.
+
+The Worker HMAC-peppers that verifier with `PASSWORD_PEPPER` before storage and uses constant-time comparison. Treat the verifier as a password-equivalent: send it only over HTTPS and never log it. The test vector for password `StrongWedding123` and email `mira@example.com` is `2ElopB-2WRviXwYatnXCSMKokkqCZG-Ra8ARF5H7m4I`. `GET /api/v1/auth/config` exposes the non-secret KDF parameters.
+
+Sessions are opaque signed cookies (`HttpOnly`, `Secure`, `SameSite=Lax`); only a SHA-256 token digest is stored. Plaintext-password hashing can be enabled only in a non-production local environment with `ALLOW_SERVER_PASSWORD_HASHING=true` and exists for migration/testing—not deployment.
+
+## Configuration
+
+Required secrets:
+
+- `SESSION_SECRET`: at least 32 high-entropy characters; signs sessions and request fingerprints.
+- `PASSWORD_PEPPER`: an independent high-entropy secret used only for stored password verifiers. Back it up securely—losing it prevents password login.
+
+Optional secrets:
+
+- `GEMINI_API_KEY`: server-only Google AI Studio key. Without it, the planner returns a validated deterministic fallback.
+- `TURNSTILE_SECRET_KEY`: when set, registration and AI planning fail closed unless `X-Turnstile-Token` verifies with actions `register` or `planner`.
+- `PASSWORD_PEPPER_PREVIOUS`: temporary rotation-only secret. When a login matches it, the Worker automatically re-peppers the verifier with `PASSWORD_PEPPER`; remove it after the migration window.
+
+Set secrets with `wrangler secret put <NAME>`. Never place them in `wrangler.toml`, GitHub variables, frontend code, or logs.
+
+Important non-secret variables in `wrangler.toml`:
+
+- `ALLOWED_ORIGINS`: comma-separated cross-origin frontends. The production default is empty because SPA and API are same-origin. Localhost is trusted only outside `ENVIRONMENT=production`.
+- `GEMINI_MODEL`: defaults to the free-tier-compatible `gemini-3.5-flash` and remains configurable.
+- `AI_PLANNER_ENABLED`: emergency AI kill switch.
+- `AI_DAILY_LIMIT`: global daily generation ceiling in addition to per-user limits.
+- `ENABLE_DEMO_CATALOG`: development-only. Production ignores it and never fabricates or verifies demo businesses.
+
+## Deployment
+
+From `app/`, run the frontend build and API tests. From this directory, run `npm ci`, `npm run check`, and `npm exec wrangler -- deploy --dry-run` before `npm run deploy`.
+
+Wrangler provisions the SQLite Durable Object class through the `v1` `new_sqlite_classes` migration and uploads `../../dist/client` as Static Assets. The schema is initialized/versioned inside `src/store.js` using `_sql_schema_migrations`; `PRAGMA user_version` is intentionally not used because Durable Objects do not support it.
+
+Bootstrap the first administrator out of band through Cloudflare's Durable Object SQLite/Data Studio tooling by promoting one trusted user to `role='admin'`. There is intentionally no public admin-registration route. Protect admin use with Cloudflare Access/MFA before delegating it to staff.
+
+The Durable Object maintains an hourly alarm that deletes expired sessions, rate-limit buckets, and idempotency records, then closes expired auctions. This avoids consuming an account-level Cron Trigger and keeps maintenance colocated with the authoritative store. SQLite Durable Objects provide point-in-time recovery; include recovery drills in production operations.
+
+## Production behavior and invariants
+
+- Catalog failures return explicit `503`; an empty real catalog returns an empty list. Demo listings are unverified and development-only.
+- Wedding briefs require authentication. Only the owning couple, an administrator, or an approved vendor whose categories and service areas match can read full requirements or bid.
+- Money fields are integer whole rupees for this INR-only MVP (`moneyUnit: "whole_rupees"`), not paise. Change the schema/API together before adding payments or another currency.
+- Bidding timestamps are normalized to UTC. Conditional writes prevent submit-versus-close races.
+- Offers are sealed while a request is open. Couples can list, shortlist, reject, or accept proposals only after the request closes; administrators retain moderation access.
+- A partial unique index permits at most one accepted bid per auction. Accepting a bid atomically awards the auction and rejects remaining open bids.
+- Auction creation and bid acceptance honor `Idempotency-Key` (8-128 safe characters) and replay the original result for retry-safe clients.
+- Gemini responses are schema-checked; amounts are recomputed server-side to total the requested budget, milestone dates are bounded by today/event date, calls time out, and safe telemetry excludes prompts and personal planning data.
+- Production writes fail closed if SQLite is unavailable. Security-sensitive routes never switch to mock state.

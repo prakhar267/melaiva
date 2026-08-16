@@ -42,6 +42,7 @@ ul, ol { margin: 0; padding: 0; }
 ::selection { background: var(--marigold-soft); color: var(--aubergine); }
 :focus-visible { outline: 3px solid rgba(22, 125, 127, 0.34); outline-offset: 3px; }
 input:focus, select:focus, textarea:focus { outline: none; border-color: var(--teal) !important; box-shadow: 0 0 0 3px rgba(22, 125, 127, 0.12); }
+.sr-only { position: absolute; width: 1px; height: 1px; padding: 0; margin: -1px; overflow: hidden; clip: rect(0, 0, 0, 0); white-space: nowrap; border: 0; }
 
 .shell { width: min(100% - 48px, 1240px); margin-inline: auto; }
 .section { padding: 108px 0; }
@@ -512,11 +513,14 @@ input:focus, select:focus, textarea:focus { outline: none; border-color: var(--t
 .preferred-vendor-context--unavailable .preferred-vendor-context__copy small { color: var(--error); }
 .preferred-vendor-context--skipped { border-color: var(--line); background: var(--ivory); }
 .preferred-vendor-context--skipped > svg { color: var(--marigold); }
+.service-choice-fieldset { min-width: 0; margin: 0; padding: 0; border: 0; }
+.service-choice-fieldset > legend { margin-bottom: 10px; color: var(--aubergine); font-size: 10px; font-weight: 700; }
 .service-choice-grid { display: grid; grid-template-columns: repeat(3, 1fr); gap: 11px; }
 .service-choice-grid label { position: relative; min-height: 105px; display: flex; flex-direction: column; justify-content: flex-end; padding: 16px; border: 1px solid var(--line); border-radius: 12px; background: var(--paper); cursor: pointer; transition: border-color .18s, background .18s, transform .18s; }
 .service-choice-grid label:hover { transform: translateY(-2px); border-color: #b9a8b6; }
 .service-choice-grid label.is-selected { border-color: var(--teal); background: var(--teal-soft); }
 .service-choice-grid input { position: absolute; opacity: 0; }
+.service-choice-grid label:has(input:focus-visible) { outline: 3px solid rgba(22, 125, 127, .34); outline-offset: 3px; }
 .service-choice__check { position: absolute; right: 12px; top: 12px; width: 21px; height: 21px; display: grid; place-items: center; border: 1px solid #c3b7c0; border-radius: 50%; background: var(--paper); color: transparent; }
 .service-choice-grid label.is-selected .service-choice__check { border-color: var(--teal); background: var(--teal); color: #fff; }
 .service-choice-grid label > div { display: grid; gap: 4px; }
@@ -752,7 +756,37 @@ input:focus, select:focus, textarea:focus { outline: none; border-color: var(--t
 .award-offer-dialog__acknowledgement > input:focus-visible + span { outline: 3px solid rgba(22, 125, 127, .34); outline-offset: 3px; }
 .award-offer-dialog__acknowledgement > strong { font-size: 10px; line-height: 1.5; }
 .award-offer-dialog__actions { display: flex; justify-content: flex-end; gap: 9px; margin-top: 24px; }
+.award-handoff { margin-top: 18px; overflow: hidden; }
+.award-handoff__hero { display: grid; grid-template-columns: auto minmax(0, 1fr) auto; gap: 16px; align-items: center; padding: 24px; background: linear-gradient(125deg, #f1f8f6, var(--paper) 70%); border-bottom: 1px solid var(--line); }
+.award-handoff__icon { width: 54px; height: 54px; display: grid; place-items: center; border-radius: 16px 16px 16px 5px; background: var(--teal); color: #fff; box-shadow: 0 10px 24px rgba(22, 125, 127, .16); }
+.award-handoff__hero h2 { margin-top: 7px; color: var(--aubergine); font-family: var(--font-display); font-size: clamp(27px, 3vw, 37px); line-height: 1.08; font-weight: 600; letter-spacing: -.025em; }
+.award-handoff__hero p { max-width: 720px; margin-top: 8px; color: var(--muted); font-size: 10px; line-height: 1.65; }
+.award-handoff__hero p strong { color: var(--ink); }
+.award-handoff__steps { display: grid; grid-template-columns: repeat(3, 1fr); padding: 0 24px; list-style: none; border-bottom: 1px solid var(--line); }
+.award-handoff__steps li { position: relative; min-width: 0; display: grid; grid-template-columns: auto 1fr; gap: 10px; padding: 22px 18px; }
+.award-handoff__steps li + li { border-left: 1px solid var(--line); }
+.award-handoff__steps li > span { width: 28px; height: 28px; display: grid; place-items: center; border: 1px solid var(--line); border-radius: 50%; background: var(--paper); color: var(--muted); font-size: 9px; font-weight: 800; }
+.award-handoff__steps li.is-complete > span { border-color: var(--teal); background: var(--teal); color: #fff; }
+.award-handoff__steps li.is-current > span { border-color: var(--marigold); background: var(--marigold-soft); color: #76500a; box-shadow: 0 0 0 4px rgba(242, 169, 0, .11); }
+.award-handoff__steps li > div { min-width: 0; display: grid; gap: 3px; }
+.award-handoff__steps small { color: var(--muted); font-size: 7px; font-weight: 700; text-transform: uppercase; letter-spacing: .07em; }
+.award-handoff__steps strong { color: var(--aubergine); font-size: 10px; }
+.award-handoff__steps p { color: var(--muted); font-size: 8px; line-height: 1.5; }
+.award-handoff__legacy { margin: 18px 24px 0; }
+.award-handoff__summary { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 1px; margin: 20px 24px 12px; border: 1px solid var(--line); border-radius: 12px; background: var(--line); overflow: hidden; }
+.award-handoff__summary > div { min-width: 0; display: grid; gap: 5px; padding: 14px; background: var(--ivory); }
+.award-handoff__summary dt { color: var(--muted); font-size: 8px; font-weight: 700; letter-spacing: .05em; text-transform: uppercase; }
+.award-handoff__summary dd { margin: 0; color: var(--aubergine); font-size: 10px; font-weight: 700; line-height: 1.45; overflow-wrap: anywhere; }
+.award-handoff__scope { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 10px; margin: 0 24px; }
+.award-handoff__terms { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 10px; margin: 10px 24px 0; }
+.award-handoff__record { display: grid; grid-template-columns: auto 1fr auto; gap: 10px; align-items: center; margin-top: 22px; padding: 16px 24px; border-top: 1px solid var(--line); background: #f7f2e9; }
+.award-handoff__record > svg { color: var(--teal); }
+.award-handoff__record p { display: grid; gap: 2px; }
+.award-handoff__record strong { color: var(--aubergine); font-size: 9px; }
+.award-handoff__record span, .award-handoff__record > small { color: var(--muted); font-size: 8px; line-height: 1.45; }
+.award-handoff-state { margin-top: 18px; }
 .live-offers-card { margin-top: 18px; }
+.live-offers-card--awarded { margin-top: 12px; }
 .live-offer-list { display: grid; }
 .live-offer { display: grid; gap: 15px; padding: 21px; border-bottom: 1px solid var(--line); }
 .live-offer:last-child { border-bottom: 0; }
@@ -816,6 +850,36 @@ input:focus, select:focus, textarea:focus { outline: none; border-color: var(--t
 .vendor-panel-heading label { position: relative; display: flex; align-items: center; gap: 6px; color: var(--muted); font-size: 8px; }
 .vendor-panel-heading select { appearance: none; height: 34px; padding: 0 27px 0 9px; border: 1px solid var(--line); border-radius: 8px; background: var(--paper); color: var(--ink); font-size: 8px; }
 .vendor-panel-heading label svg { position: absolute; right: 7px; }
+.vendor-award-list { display: grid; }
+.vendor-award-card { display: grid; gap: 16px; padding: 22px; border-bottom: 1px solid var(--line); }
+.vendor-award-card:last-child { border-bottom: 0; }
+.vendor-award-card__top { display: grid; grid-template-columns: auto minmax(0, 1fr) auto; gap: 12px; align-items: center; }
+.vendor-award-card__top > div { min-width: 0; display: grid; gap: 3px; }
+.vendor-award-card__top small { color: var(--muted); font-size: 7px; text-transform: uppercase; letter-spacing: .06em; }
+.vendor-award-card__top h3 { color: var(--aubergine); font-family: var(--font-display); font-size: 22px; font-weight: 600; }
+.vendor-award-card__top p { color: var(--muted); font-size: 8px; }
+.vendor-award-card > dl { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 1px; border: 1px solid var(--line); border-radius: 10px; background: var(--line); overflow: hidden; }
+.vendor-award-card > dl > div { display: grid; gap: 4px; padding: 12px; background: var(--ivory); }
+.vendor-award-card dt { color: var(--muted); font-size: 7px; font-weight: 700; text-transform: uppercase; letter-spacing: .05em; }
+.vendor-award-card dd { margin: 0; color: var(--aubergine); font-size: 10px; font-weight: 700; }
+.vendor-award-card__legacy { margin: 0; }
+.vendor-award-card__proposal { display: grid; gap: 6px; padding: 13px; border: 1px solid var(--line); border-radius: 10px; background: var(--ivory); }
+.vendor-award-card__proposal h4, .vendor-award-card__terms h4 { color: var(--aubergine); font-size: 9px; }
+.vendor-award-card__proposal p, .vendor-award-card__terms .offer-term-card > p { color: var(--muted); font-size: 8px; line-height: 1.6; overflow-wrap: anywhere; white-space: pre-wrap; }
+.vendor-award-card__scope { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 10px; }
+.vendor-award-card__scope > section { display: grid; align-content: start; gap: 8px; padding: 13px; border: 1px solid var(--line); border-radius: 10px; background: var(--ivory); }
+.vendor-award-card__scope h4 { color: var(--aubergine); font-size: 9px; }
+.vendor-award-card__scope ul { display: grid; gap: 6px; list-style: none; }
+.vendor-award-card__scope li { display: flex; align-items: flex-start; gap: 6px; color: var(--teal); font-size: 8px; line-height: 1.45; }
+.vendor-award-card__scope li svg { flex: 0 0 auto; }
+.vendor-award-card__scope ul.is-excluded li { color: #8a4d37; }
+.vendor-award-card__scope p { color: var(--muted); font-size: 8px; }
+.vendor-award-card__terms { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 10px; }
+.vendor-award-card__next { display: flex; align-items: flex-start; gap: 9px; padding: 13px; border-radius: 10px; background: var(--teal-soft); color: var(--teal); }
+.vendor-award-card__next > svg { flex: 0 0 auto; }
+.vendor-award-card__next p { display: grid; gap: 3px; }
+.vendor-award-card__next strong { color: #185f61; font-size: 9px; }
+.vendor-award-card__next span { color: #376e70; font-size: 8px; line-height: 1.5; }
 .opportunity-list { display: grid; }
 .opportunity-card { border-bottom: 1px solid var(--line); }
 .opportunity-card:last-child { border: 0; }
@@ -1058,6 +1122,7 @@ input:focus, select:focus, textarea:focus { outline: none; border-color: var(--t
   .dashboard-grid { grid-template-columns: 1fr; }
   .live-dashboard-grid { grid-template-columns: 1fr; }
   .live-offer__terms-grid { grid-template-columns: 1fr; }
+  .award-handoff__terms { grid-template-columns: 1fr; }
   .vendor-metrics { grid-template-columns: repeat(2, 1fr); }
   .opportunity-card__detail { padding-left: 40px; }
   .onboarding-aside { grid-template-columns: 1fr 1fr; }
@@ -1183,6 +1248,15 @@ input:focus, select:focus, textarea:focus { outline: none; border-color: var(--t
   .award-offer-dialog__details { grid-template-columns: 1fr; }
   .award-offer-dialog__actions { align-items: stretch; flex-direction: column-reverse; }
   .award-offer-dialog__actions .button { width: 100%; }
+  .award-handoff__hero { grid-template-columns: auto minmax(0, 1fr); padding: 20px; }
+  .award-handoff__hero > .status-pill { grid-column: 2; width: fit-content; }
+  .award-handoff__steps { grid-template-columns: 1fr; padding: 0 20px; }
+  .award-handoff__steps li { padding: 17px 0; }
+  .award-handoff__steps li + li { border-left: 0; border-top: 1px solid var(--line); }
+  .award-handoff__summary { grid-template-columns: repeat(2, minmax(0, 1fr)); margin-inline: 20px; }
+  .award-handoff__scope, .award-handoff__terms { grid-template-columns: 1fr; margin-inline: 20px; }
+  .award-handoff__record { grid-template-columns: auto 1fr; padding-inline: 20px; }
+  .award-handoff__record > small { grid-column: 2; }
   .dashboard-account-state__actions, .vendor-access-state__actions { align-items: stretch; flex-direction: column; width: 100%; }
   .dashboard-account-state__actions .button, .vendor-access-state__actions .button { justify-content: center; width: 100%; }
   .demo-disclaimer { align-items: flex-start; text-align: center; }
@@ -1200,6 +1274,10 @@ input:focus, select:focus, textarea:focus { outline: none; border-color: var(--t
   .vendor-offer-table__head { display: none; }
   .vendor-offer-table > div { grid-template-columns: 1fr auto; }
   .vendor-offer-table > div > span:nth-child(3) { grid-column: 1; }
+  .vendor-award-card { padding: 18px; }
+  .vendor-award-card__top { grid-template-columns: auto minmax(0, 1fr); }
+  .vendor-award-card__top > .status-pill { grid-column: 2; width: fit-content; }
+  .vendor-award-card > dl, .vendor-award-card__scope, .vendor-award-card__terms { grid-template-columns: 1fr; }
   .onboarding-form { padding: 22px; }
   .onboarding-aside { grid-template-columns: 1fr; }
   .auth-page { padding: 35px 0 60px; }

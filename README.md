@@ -1,6 +1,6 @@
 # Melaiva
 
-Melaiva is a two-sided celebration marketplace for India. A customer creates one structured brief, relevant vendors respond with sealed offers, and the customer compares scope and price before choosing a partner.
+Melaiva is a two-sided celebration marketplace for India. A customer creates a category-specific structured brief, relevant vendors respond with sealed offers, and the customer compares scope and price before choosing a partner.
 
 Live release: [melaiva.prakhargupta267.workers.dev](https://melaiva.prakhargupta267.workers.dev)
 
@@ -9,12 +9,13 @@ The launch build is a single Cloudflare Worker: it serves the React application,
 ## What is implemented
 
 - Responsive customer marketplace and vendor discovery
-- Four-step private request builder with sealed offer workflow and explicit preferred-partner invitations
+- Four-step, single-service private request builder with sealed offer workflow and explicit preferred-partner invitations
 - Customer dashboard backed by the signed-in user's requests, with a private sealed state and an explicit close-and-reveal decision
 - Vendor onboarding, opportunity feed, and normalized offer submission covering inclusions, exclusions, GST, travel, priced add-ons, delivery, cancellation, and validity
 - Customer commercial-term comparison plus shortlist/reject/accept state transitions, with a review-and-acknowledge award dialog and exact offer counts
+- Immutable, access-scoped award handoffs shared with the couple and winning vendor, explicitly marked contract pending without implying signatures, booking, or payment
 - Gemini-assisted planning with schema validation, quotas, timeout, kill switch, and a transparent deterministic fallback
-- Client-derived password verifiers, server-side peppering, revocable secure sessions, role checks, rate limits, origin checks, and idempotent critical mutations
+- Client-derived password verifiers, server-side peppering, revocable secure sessions, capability-aware access checks, rate limits, origin checks, and idempotent critical mutations
 - Hourly Durable Object cleanup/auction-close alarm, structured request IDs, fail-closed health endpoints, CI, and production runbooks
 - Isolated staging configuration, Git-provenanced releases, CodeQL merge protection, and read-only production readiness monitoring
 

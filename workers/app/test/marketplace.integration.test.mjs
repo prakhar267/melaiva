@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import { createHash } from "node:crypto";
 import { DatabaseSync } from "node:sqlite";
 import test from "node:test";
 
@@ -6,6 +7,22 @@ import { buildApp } from "../src/app.js";
 import { STORE_SCHEMA_SQL } from "../src/store.js";
 
 const SESSION_SECRET = "integration-session-secret-with-at-least-thirty-two-characters";
+
+function canonicalJson(value) {
+  if (Array.isArray(value)) return `[${value.map((item) => canonicalJson(item)).join(",")}]`;
+  if (value && typeof value === "object") {
+    return `{${Object.keys(value)
+      .sort()
+      .filter((key) => value[key] !== undefined)
+      .map((key) => `${JSON.stringify(key)}:${canonicalJson(value[key])}`)
+      .join(",")}}`;
+  }
+  return JSON.stringify(value);
+}
+
+function canonicalRequestHash(value) {
+  return createHash("sha256").update(canonicalJson(value)).digest("base64url");
+}
 
 class SqliteStatement {
   constructor(database, sql, args = []) {
@@ -436,6 +453,26 @@ test("marketplace authorization and state transitions remain private, atomic, an
   assert.equal((await tooShortValidity.json()).error.code, "invalid_valid_until");
   assert.equal(db.sqlite.prepare("SELECT COUNT(*) AS count FROM bids WHERE auction_id = ?").get(auction.id).count, 0);
 
+  const indiaValidityDate = new Date(Date.now() + 45 * 24 * 60 * 60 * 1000).toISOString().slice(0, 10);
+  const indiaBoundaryCreated = await requestJson(app, env, "/auctions", {
+    cookie: couple.cookie,
+    headers: { "idempotency-key": "auction-create-india-validity-0001" },
+    body: {
+      ...genericAuctionBody,
+      title: "An India validity boundary photography brief",
+      biddingEndsAt: `${indiaValidityDate}T20:00:00.000Z`,
+    },
+  });
+  assert.equal(indiaBoundaryCreated.status, 201, await indiaBoundaryCreated.clone().text());
+  const indiaBoundaryAuction = (await indiaBoundaryCreated.json()).data;
+  const indiaBoundaryBid = await requestJson(app, env, `/auctions/${indiaBoundaryAuction.id}/bids`, {
+    cookie: vendorOne.cookie,
+    body: { ...validBidBase, validUntil: indiaValidityDate },
+  });
+  assert.equal(indiaBoundaryBid.status, 422, await indiaBoundaryBid.clone().text());
+  assert.equal((await indiaBoundaryBid.json()).error.code, "invalid_valid_until");
+  assert.equal(db.sqlite.prepare("SELECT COUNT(*) AS count FROM bids WHERE auction_id = ?").get(indiaBoundaryAuction.id).count, 0);
+
   const multilingualCreated = await requestJson(app, env, "/auctions", {
     cookie: couple.cookie,
     headers: { "idempotency-key": "auction-create-multilingual-0001" },
@@ -632,6 +669,26 @@ test("marketplace authorization and state transitions remain private, atomic, an
   assert.equal(otherVendorHistory.status, 200, await otherVendorHistory.clone().text());
   assert.doesNotMatch(JSON.stringify((await otherVendorHistory.json()).data), /Raw footage|Same-day edit|Premium album/);
 
+  const firstShortlist = await requestJson(app, env, `/auctions/${auction.id}/bids/${bidIds[0]}`, {
+    method: "PATCH",
+    cookie: couple.cookie,
+    body: { action: "shortlist" },
+  });
+  assert.equal(firstShortlist.status, 200, await firstShortlist.clone().text());
+  const repeatedShortlist = await requestJson(app, env, `/auctions/${auction.id}/bids/${bidIds[0]}`, {
+    method: "PATCH",
+    cookie: couple.cookie,
+    body: { action: "shortlist" },
+  });
+  assert.equal(repeatedShortlist.status, 200, await repeatedShortlist.clone().text());
+  const repeatedShortlistPayload = await repeatedShortlist.json();
+  assert.equal(repeatedShortlistPayload.data.status, "shortlisted");
+  assert.equal(repeatedShortlistPayload.meta.unchanged, true);
+  assert.equal(
+    db.sqlite.prepare("SELECT COUNT(*) AS count FROM audit_events WHERE action = 'bid.shortlisted' AND entity_id = ?").get(bidIds[0]).count,
+    1,
+  );
+
   const missingAcceptKey = await requestJson(app, env, `/auctions/${auction.id}/bids/${bidIds[0]}`, {
     method: "PATCH",
     cookie: couple.cookie,
@@ -652,11 +709,81 @@ test("marketplace authorization and state transitions remain private, atomic, an
     ),
   );
   assert.deepEqual(decisions.map((response) => response.status).sort(), [200, 409]);
+  const decisionPayloads = await Promise.all(decisions.map((response) => response.json()));
+  const successfulDecision = decisionPayloads.find((payload) => payload.data?.status === "accepted");
+  assert.match(successfulDecision.data.awardId, /^[0-9a-f-]{36}$/i);
+  assert.equal(successfulDecision.data.awardStatus, "contract_pending");
   assert.equal(db.sqlite.prepare("SELECT COUNT(*) AS count FROM bids WHERE status = 'accepted'").get().count, 1);
   assert.equal(db.sqlite.prepare("SELECT status FROM auctions WHERE id = ?").get(auction.id).status, "awarded");
+  assert.equal(db.sqlite.prepare("SELECT COUNT(*) AS count FROM bookings WHERE auction_id = ?").get(auction.id).count, 1);
 
   const acceptedBidId = db.sqlite.prepare("SELECT id FROM bids WHERE status = 'accepted'").get().id;
   const acceptedIndex = bidIds.indexOf(acceptedBidId);
+  const acceptedOfferBeforeAward = ownerBidData.find((offer) => offer.id === acceptedBidId);
+  const winningVendor = [vendorOne, vendorTwo][acceptedIndex];
+  const losingVendor = [vendorOne, vendorTwo][acceptedIndex === 0 ? 1 : 0];
+  const ownerAward = await requestJson(app, env, `/auctions/${auction.id}/award`, { cookie: couple.cookie });
+  assert.equal(ownerAward.status, 200, await ownerAward.clone().text());
+  const ownerAwardData = (await ownerAward.json()).data;
+  assert.equal(ownerAwardData.id, successfulDecision.data.awardId);
+  assert.equal(ownerAwardData.acceptedBidId, acceptedBidId);
+  assert.equal(ownerAwardData.status, "contract_pending");
+  assert.equal(ownerAwardData.audienceRole, "owner");
+  assert.equal(ownerAwardData.snapshot.request.id, auction.id);
+  assert.equal(ownerAwardData.snapshot.request.status, "awarded");
+  assert.equal(ownerAwardData.snapshot.request.requirements, auctionBody.requirements);
+  assert.equal(ownerAwardData.snapshot.offer.status, "accepted");
+  for (const key of [
+    "amount",
+    "currency",
+    "proposal",
+    "deliverables",
+    "exclusions",
+    "gstIncluded",
+    "gstRate",
+    "travelPolicy",
+    "travelFee",
+    "addOns",
+    "cancellationTerms",
+    "deliveryPlan",
+    "structuredTermsProvided",
+    "validUntil",
+  ]) {
+    assert.deepEqual(ownerAwardData.snapshot.offer[key], acceptedOfferBeforeAward[key], `snapshot mismatch for offer.${key}`);
+  }
+  assert.deepEqual(ownerAwardData.snapshot.vendor, acceptedOfferBeforeAward.vendor);
+
+  const winnerAward = await requestJson(app, env, `/auctions/${auction.id}/award`, { cookie: winningVendor.cookie });
+  assert.equal(winnerAward.status, 200, await winnerAward.clone().text());
+  assert.equal((await winnerAward.json()).data.audienceRole, "vendor");
+  const adminAward = await requestJson(app, env, `/auctions/${auction.id}/award`, { cookie: admin.cookie });
+  assert.equal(adminAward.status, 200, await adminAward.clone().text());
+  assert.equal((await adminAward.json()).data.audienceRole, "admin");
+  const losingVendorAward = await requestJson(app, env, `/auctions/${auction.id}/award`, { cookie: losingVendor.cookie });
+  assert.equal(losingVendorAward.status, 404);
+  const unrelatedAward = await requestJson(app, env, `/auctions/${auction.id}/award`, { cookie: otherCouple.cookie });
+  assert.equal(unrelatedAward.status, 404);
+  const anonymousAward = await requestJson(app, env, `/auctions/${auction.id}/award`);
+  assert.equal(anonymousAward.status, 401);
+
+  const ownerBookings = await requestJson(app, env, "/bookings", { cookie: couple.cookie });
+  assert.equal(ownerBookings.status, 200, await ownerBookings.clone().text());
+  assert.deepEqual((await ownerBookings.json()).data.map((booking) => booking.id), [ownerAwardData.id]);
+  const winnerBookings = await requestJson(app, env, "/bookings", { cookie: winningVendor.cookie });
+  assert.equal(winnerBookings.status, 200, await winnerBookings.clone().text());
+  assert.deepEqual((await winnerBookings.json()).data.map((booking) => booking.id), [ownerAwardData.id]);
+  const loserBookings = await requestJson(app, env, "/bookings", { cookie: losingVendor.cookie });
+  assert.equal(loserBookings.status, 200, await loserBookings.clone().text());
+  assert.deepEqual((await loserBookings.json()).data, []);
+  assert.throws(
+    () => db.sqlite.prepare("UPDATE bookings SET status = 'contract_pending' WHERE id = ?").run(ownerAwardData.id),
+    /booking records are immutable/,
+  );
+  assert.throws(
+    () => db.sqlite.prepare("DELETE FROM bookings WHERE id = ?").run(ownerAwardData.id),
+    /booking records are immutable/,
+  );
+
   const acceptReplay = await requestJson(app, env, `/auctions/${auction.id}/bids/${acceptedBidId}`, {
     method: "PATCH",
     cookie: couple.cookie,
@@ -664,7 +791,9 @@ test("marketplace authorization and state transitions remain private, atomic, an
     body: { action: "accept" },
   });
   assert.equal(acceptReplay.status, 200, await acceptReplay.clone().text());
-  assert.equal((await acceptReplay.json()).meta.replayed, true);
+  const acceptReplayPayload = await acceptReplay.json();
+  assert.equal(acceptReplayPayload.meta.replayed, true);
+  assert.equal(acceptReplayPayload.data.awardId, ownerAwardData.id);
 
   const acceptPayloadConflict = await requestJson(app, env, `/auctions/${auction.id}/bids/${acceptedBidId}`, {
     method: "PATCH",
@@ -708,6 +837,32 @@ test("marketplace authorization and state transitions remain private, atomic, an
   assert.equal(legacyOffer.cancellationTerms, "");
   assert.equal(legacyOffer.deliveryPlan, "");
 
+  db.sqlite.exec(`CREATE TRIGGER fail_acceptance_audit
+    BEFORE INSERT ON audit_events
+    WHEN NEW.action = 'bid.accepted'
+    BEGIN SELECT RAISE(ABORT, 'forced acceptance audit failure'); END`);
+  let failedAccept;
+  try {
+    console.error = () => {};
+    failedAccept = await requestJson(app, env, `/auctions/${genericAuction.id}/bids/${retriedBidId}`, {
+      method: "PATCH",
+      cookie: couple.cookie,
+      headers: { "idempotency-key": "forced-accept-audit-failure-0001" },
+      body: { action: "accept" },
+    });
+  } finally {
+    console.error = originalConsoleError;
+  }
+  assert.equal(failedAccept.status, 500);
+  assert.equal(db.sqlite.prepare("SELECT status FROM auctions WHERE id = ?").get(genericAuction.id).status, "closed");
+  assert.equal(db.sqlite.prepare("SELECT status FROM bids WHERE id = ?").get(retriedBidId).status, "submitted");
+  assert.equal(db.sqlite.prepare("SELECT COUNT(*) AS count FROM bookings WHERE auction_id = ?").get(genericAuction.id).count, 0);
+  assert.equal(
+    db.sqlite.prepare("SELECT COUNT(*) AS count FROM idempotency_keys WHERE scope = ?").get(`bid-accept:${genericAuction.id}:${retriedBidId}`).count,
+    0,
+  );
+  db.sqlite.exec("DROP TRIGGER fail_acceptance_audit");
+
   const retryAccept = () => requestJson(app, env, `/auctions/${genericAuction.id}/bids/${retriedBidId}`, {
     method: "PATCH",
     cookie: couple.cookie,
@@ -718,6 +873,8 @@ test("marketplace authorization and state transitions remain private, atomic, an
   assert.deepEqual(retryResponses.map((response) => response.status), [200, 200]);
   const retryPayloads = await Promise.all(retryResponses.map((response) => response.json()));
   assert.equal(retryPayloads.filter((payload) => payload.meta?.replayed).length, 1);
+  assert.equal(new Set(retryPayloads.map((payload) => payload.data.awardId)).size, 1);
+  assert.equal(db.sqlite.prepare("SELECT COUNT(*) AS count FROM bookings WHERE auction_id = ?").get(genericAuction.id).count, 1);
   assert.equal(
     db.sqlite.prepare("SELECT COUNT(*) AS count FROM audit_events WHERE action = 'bid.accepted' AND entity_id = ?").get(retriedBidId).count,
     1,
@@ -756,6 +913,228 @@ test("marketplace authorization and state transitions remain private, atomic, an
     () => db.sqlite.prepare("UPDATE bids SET status = 'accepted' WHERE auction_id = ? AND status = 'rejected'").run(auction.id),
     /UNIQUE constraint failed/,
   );
+});
+
+test("single-category creation preserves legacy replays and blocks ambiguous legacy awards", async () => {
+  const db = new SqliteD1(STORE_SCHEMA_SQL);
+  const env = {
+    DB: db,
+    SESSION_SECRET,
+    PASSWORD_PEPPER: "category-test-password-pepper-with-at-least-thirty-two-characters",
+    ENVIRONMENT: "production",
+    COOKIE_SECURE: "true",
+  };
+  const app = buildApp();
+  const couple = await register(app, env, { name: "Category Couple", email: "category-couple@example.com", verifier: "K".repeat(43) });
+  const vendor = await register(app, env, { name: "Category Vendor", email: "category-vendor@example.com", verifier: "L".repeat(43) });
+  const admin = await register(app, env, { name: "Category Admin", email: "category-admin@example.com", verifier: "M".repeat(43) });
+  db.sqlite.prepare("UPDATE users SET role = 'admin' WHERE id = ?").run(admin.user.id);
+  const profile = await onboardVendor(app, env, vendor.cookie, "Category");
+  const approval = await requestJson(app, env, `/admin/vendors/${profile.id}`, {
+    method: "PATCH",
+    cookie: admin.cookie,
+    body: { status: "approved", note: "Category contract test" },
+  });
+  assert.equal(approval.status, 200, await approval.clone().text());
+
+  const eventDate = new Date(Date.now() + 365 * 24 * 60 * 60 * 1000).toISOString().slice(0, 10);
+  const biddingEndsAt = new Date(Date.now() + 30 * 24 * 60 * 60 * 1000).toISOString();
+  const validUntil = new Date(Date.now() + 60 * 24 * 60 * 60 * 1000).toISOString().slice(0, 10);
+  const requestBody = {
+    title: "A category-safe Jaipur request",
+    eventType: "wedding",
+    eventDate,
+    city: "Jaipur",
+    guestCount: 150,
+    budgetMin: 200000,
+    budgetMax: 450000,
+    currency: "INR",
+    categories: ["photography"],
+    requirements: "A category-specific brief with enough detail for a comparable and safely awarded proposal.",
+    biddingEndsAt,
+  };
+
+  const rejectedMultiCategory = await requestJson(app, env, "/auctions", {
+    cookie: couple.cookie,
+    headers: { "idempotency-key": "new-multi-category-reject-0001" },
+    body: { ...requestBody, categories: ["photography", "catering"] },
+  });
+  assert.equal(rejectedMultiCategory.status, 422, await rejectedMultiCategory.clone().text());
+  assert.equal((await rejectedMultiCategory.json()).error.code, "single_category_required");
+  assert.equal(db.sqlite.prepare("SELECT COUNT(*) AS count FROM auctions").get().count, 0);
+
+  const replayKey = "legacy-multi-category-replay-0001";
+  const original = await requestJson(app, env, "/auctions", {
+    cookie: couple.cookie,
+    headers: { "idempotency-key": replayKey },
+    body: requestBody,
+  });
+  assert.equal(original.status, 201, await original.clone().text());
+  const originalAuction = (await original.json()).data;
+  const legacyCategories = ["photography", "catering"];
+  const legacyRequestBody = { ...requestBody, categories: legacyCategories };
+  const legacyReplayValue = { ...originalAuction, categories: legacyCategories };
+  db.sqlite.prepare("UPDATE auctions SET categories_json = ? WHERE id = ?").run(JSON.stringify(legacyCategories), originalAuction.id);
+  db.sqlite
+    .prepare("UPDATE idempotency_keys SET request_hash = ?, response_json = ? WHERE scope = 'auction-create' AND user_id = ?")
+    .run(
+      canonicalRequestHash({
+        ...legacyRequestBody,
+        biddingEndsAt: new Date(legacyRequestBody.biddingEndsAt).toISOString(),
+        preferredVendorId: null,
+      }),
+      JSON.stringify(legacyReplayValue),
+      couple.user.id,
+    );
+  const legacyReplay = await requestJson(app, env, "/auctions", {
+    cookie: couple.cookie,
+    headers: { "idempotency-key": replayKey },
+    body: legacyRequestBody,
+  });
+  assert.equal(legacyReplay.status, 201, await legacyReplay.clone().text());
+  const legacyReplayPayload = await legacyReplay.json();
+  assert.equal(legacyReplayPayload.meta.replayed, true);
+  assert.deepEqual(legacyReplayPayload.data.categories, legacyCategories);
+  assert.equal(db.sqlite.prepare("SELECT COUNT(*) AS count FROM auctions").get().count, 1);
+
+  const submitted = await requestJson(app, env, `/auctions/${originalAuction.id}/bids`, {
+    cookie: vendor.cookie,
+    body: {
+      amount: 300000,
+      currency: "INR",
+      proposal: "A complete photography proposal for exercising the legacy multi-category decision guard.",
+      deliverables: ["Two photographers", "Edited gallery"],
+      validUntil,
+      ...normalizedOfferTerms({ travelPolicy: "included", travelFee: undefined, addOns: [] }),
+    },
+  });
+  assert.equal(submitted.status, 201, await submitted.clone().text());
+  const bidId = (await submitted.json()).data.id;
+  const closed = await requestJson(app, env, `/auctions/${originalAuction.id}/status`, {
+    method: "PATCH",
+    cookie: couple.cookie,
+    body: { status: "closed" },
+  });
+  assert.equal(closed.status, 200, await closed.clone().text());
+  const legacyShortlist = await requestJson(app, env, `/auctions/${originalAuction.id}/bids/${bidId}`, {
+    method: "PATCH",
+    cookie: couple.cookie,
+    body: { action: "shortlist" },
+  });
+  assert.equal(legacyShortlist.status, 409, await legacyShortlist.clone().text());
+  assert.equal((await legacyShortlist.json()).error.code, "legacy_multi_category_request");
+  const legacyAccept = await requestJson(app, env, `/auctions/${originalAuction.id}/bids/${bidId}`, {
+    method: "PATCH",
+    cookie: couple.cookie,
+    headers: { "idempotency-key": "legacy-multi-category-accept-0001" },
+    body: { action: "accept" },
+  });
+  assert.equal(legacyAccept.status, 409, await legacyAccept.clone().text());
+  assert.equal((await legacyAccept.json()).error.code, "legacy_multi_category_request");
+  assert.equal(db.sqlite.prepare("SELECT COUNT(*) AS count FROM bookings").get().count, 0);
+  assert.equal(db.sqlite.prepare("SELECT status FROM bids WHERE id = ?").get(bidId).status, "submitted");
+});
+
+test("vendor capability preserves the customer workspace and enforces linked self-bid boundaries", async () => {
+  const db = new SqliteD1(STORE_SCHEMA_SQL);
+  const env = {
+    DB: db,
+    SESSION_SECRET,
+    PASSWORD_PEPPER: "dual-capability-password-pepper-with-at-least-thirty-two-characters",
+    ENVIRONMENT: "production",
+    COOKIE_SECURE: "true",
+  };
+  const app = buildApp();
+  const dual = await register(app, env, { name: "Dual Workspace", email: "dual@example.com", verifier: "N".repeat(43) });
+  const otherCouple = await register(app, env, { name: "Other Workspace", email: "other-workspace@example.com", verifier: "O".repeat(43) });
+  const admin = await register(app, env, { name: "Dual Admin", email: "dual-admin@example.com", verifier: "P".repeat(43) });
+  db.sqlite.prepare("UPDATE users SET role = 'admin' WHERE id = ?").run(admin.user.id);
+  const eventDate = new Date(Date.now() + 365 * 24 * 60 * 60 * 1000).toISOString().slice(0, 10);
+  const biddingEndsAt = new Date(Date.now() + 30 * 24 * 60 * 60 * 1000).toISOString();
+  const requestBody = (title) => ({
+    title,
+    eventType: "wedding",
+    eventDate,
+    city: "Jaipur",
+    guestCount: 120,
+    budgetMin: 150000,
+    budgetMax: 400000,
+    currency: "INR",
+    categories: ["photography"],
+    requirements: "A private single-category request used to verify independent customer and vendor capabilities.",
+    biddingEndsAt,
+  });
+  const ownCreated = await requestJson(app, env, "/auctions", {
+    cookie: dual.cookie,
+    headers: { "idempotency-key": "dual-own-request-create-0001" },
+    body: requestBody("Dual account's own photography request"),
+  });
+  assert.equal(ownCreated.status, 201, await ownCreated.clone().text());
+  const ownAuction = (await ownCreated.json()).data;
+
+  const profile = await onboardVendor(app, env, dual.cookie, "Dual");
+  assert.equal(db.sqlite.prepare("SELECT role FROM users WHERE id = ?").get(dual.user.id).role, "couple");
+  const me = await requestJson(app, env, "/auth/me", { cookie: dual.cookie });
+  assert.equal(me.status, 200, await me.clone().text());
+  const meData = (await me.json()).data;
+  assert.equal(meData.user.role, "couple");
+  assert.equal(meData.vendor.id, profile.id);
+  assert.equal(meData.vendor.status, "pending");
+  const pendingMine = await requestJson(app, env, "/auctions?mine=true", { cookie: dual.cookie });
+  assert.equal(pendingMine.status, 200, await pendingMine.clone().text());
+  assert.deepEqual((await pendingMine.json()).data.map((auction) => auction.id), [ownAuction.id]);
+  const pendingFeed = await requestJson(app, env, "/auctions", { cookie: dual.cookie });
+  assert.equal(pendingFeed.status, 403);
+
+  const approval = await requestJson(app, env, `/admin/vendors/${profile.id}`, {
+    method: "PATCH",
+    cookie: admin.cookie,
+    body: { status: "approved", note: "Dual capability test" },
+  });
+  assert.equal(approval.status, 200, await approval.clone().text());
+  const otherCreated = await requestJson(app, env, "/auctions", {
+    cookie: otherCouple.cookie,
+    headers: { "idempotency-key": "dual-other-request-create-0001" },
+    body: requestBody("Another couple's photography request"),
+  });
+  assert.equal(otherCreated.status, 201, await otherCreated.clone().text());
+  const otherAuction = (await otherCreated.json()).data;
+
+  const mine = await requestJson(app, env, "/auctions?mine=true", { cookie: dual.cookie });
+  assert.equal(mine.status, 200, await mine.clone().text());
+  assert.deepEqual((await mine.json()).data.map((auction) => auction.id), [ownAuction.id]);
+  const opportunityFeed = await requestJson(app, env, "/auctions", { cookie: dual.cookie });
+  assert.equal(opportunityFeed.status, 200, await opportunityFeed.clone().text());
+  const opportunityIds = (await opportunityFeed.json()).data.map((auction) => auction.id);
+  assert.ok(opportunityIds.includes(otherAuction.id));
+  assert.ok(!opportunityIds.includes(ownAuction.id));
+
+  const offerBody = {
+    amount: 275000,
+    currency: "INR",
+    proposal: "A complete linked-vendor photography proposal with clear scope and commercial terms.",
+    deliverables: ["Photography team", "Edited gallery"],
+    ...normalizedOfferTerms({ travelPolicy: "included", travelFee: undefined, addOns: [] }),
+  };
+  const selfBid = await requestJson(app, env, `/auctions/${ownAuction.id}/bids`, { cookie: dual.cookie, body: offerBody });
+  assert.equal(selfBid.status, 403, await selfBid.clone().text());
+  assert.equal((await selfBid.json()).error.code, "self_bid_not_allowed");
+  const otherBid = await requestJson(app, env, `/auctions/${otherAuction.id}/bids`, { cookie: dual.cookie, body: offerBody });
+  assert.equal(otherBid.status, 201, await otherBid.clone().text());
+  const ownOffers = await requestJson(app, env, "/bids/mine", { cookie: dual.cookie });
+  assert.equal(ownOffers.status, 200, await ownOffers.clone().text());
+  assert.deepEqual((await ownOffers.json()).data.map((offer) => offer.auction.id), [otherAuction.id]);
+
+  db.sqlite.prepare("UPDATE users SET role = 'vendor' WHERE id = ?").run(dual.user.id);
+  const legacyVendorMine = await requestJson(app, env, "/auctions?mine=true", { cookie: dual.cookie });
+  assert.equal(legacyVendorMine.status, 200, await legacyVendorMine.clone().text());
+  assert.deepEqual((await legacyVendorMine.json()).data.map((auction) => auction.id), [ownAuction.id]);
+  const legacyVendorCreate = await requestJson(app, env, "/auctions", {
+    cookie: dual.cookie,
+    headers: { "idempotency-key": "legacy-vendor-customer-create-0001" },
+    body: requestBody("A legacy vendor role's new customer request"),
+  });
+  assert.equal(legacyVendorCreate.status, 201, await legacyVendorCreate.clone().text());
 });
 
 test("preferred-vendor validation and moderation changes are atomic against selection races", async () => {

@@ -2,7 +2,7 @@
 
 ## Product thesis
 
-Melaiva is a two-sided celebration procurement marketplace. A customer submits one structured brief; the platform matches relevant vendors; vendors submit sealed, itemized offers; the customer compares scope, quality, terms, and price before booking.
+Melaiva is a two-sided celebration procurement marketplace. A customer submits one category-specific structured brief per service; the platform matches relevant vendors; vendors submit sealed, itemized offers; the customer compares scope, quality, terms, and price before choosing a partner.
 
 The durable advantage is not a large directory. It is a normalized workflow and data set connecting requirements, offers, accepted scope, fulfillment, and verified outcomes.
 
@@ -59,6 +59,7 @@ Verification, marketplace operations, support, disputes, finance, moderation, an
 
 ### Competitive quotation
 
+- Keep each request to one service category so its offers are comparable and its award affects only that workstream.
 - Match on category, city/radius, date, capacity, budget, verification, availability, and response performance.
 - Mask customer contact details until the right stage.
 - Invite a controlled vendor pool.
@@ -68,7 +69,7 @@ Verification, marketplace operations, support, disputes, finance, moderation, an
 
 ### Booking and fulfillment
 
-- Freeze an immutable accepted-scope snapshot.
+- Freeze an immutable accepted-scope snapshot and expose it to the couple and winning vendor as a contract-pending handoff.
 - Record contract/signature, deposit, milestones, receipts, and invoices.
 - Track messages, files, tasks, calendar items, change orders, and completion evidence.
 - Provide cancellation, replacement, refund, dispute, and escalation workflows.

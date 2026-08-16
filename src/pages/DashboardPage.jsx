@@ -11,6 +11,7 @@ import {
   ClipboardCheck,
   Clock3,
   FileText,
+  Handshake,
   LayoutDashboard,
   LoaderCircle,
   LockKeyhole,
@@ -22,6 +23,7 @@ import {
   ShieldCheck,
   Sparkles,
   Star,
+  ScrollText,
   Users,
   X,
 } from "lucide-react";
@@ -424,10 +426,63 @@ function AwardOfferDialog({ auction, bid, open, busy, onClose, onConfirm }) {
   );
 }
 
-function LiveOffers({ auction, bids, loading, error, decidingId, closing, onDecision, onRequestClose, onRequestAward }) {
+function AwardHandoff({ award }) {
+  if (!award) return null;
+  const snapshot = award.snapshot || {};
+  const request = snapshot.request || {};
+  const offer = snapshot.offer || {};
+  const vendor = snapshot.vendor || {};
+  const structured = hasStructuredTerms(offer);
+  const businessName = vendor.businessName || "Selected partner";
+  const exclusions = structured && Array.isArray(offer.exclusions) ? offer.exclusions : null;
+  const addOns = structured && Array.isArray(offer.addOns) ? offer.addOns : null;
+  return (
+    <section className="dashboard-card award-handoff" aria-labelledby={`award-handoff-${award.id}`}>
+      <span className="sr-only" role="status" aria-live="polite">Award record loaded. The accepted scope for {businessName} is available below.</span>
+      <div className="award-handoff__hero">
+        <span className="award-handoff__icon"><Handshake size={28} /></span>
+        <div>
+          <div className="eyebrow">Offer awarded</div>
+          <h2 id={`award-handoff-${award.id}`}>Your accepted scope is saved.</h2>
+          <p>Melaiva froze the offer you awarded to <strong>{businessName}</strong>. You and the partner must arrange and review a written contract outside Melaiva before any signature or payment.</p>
+        </div>
+        <span className="status-pill status-pill--direct"><span /> Contract pending</span>
+      </div>
+      <ol className="award-handoff__steps" aria-label="Award handoff progress">
+        <li className="is-complete"><span><Check size={15} /></span><div><small>Complete</small><strong>Award recorded</strong><p>Scope saved {award.awardedAt ? formatDate(award.awardedAt, { hour: "numeric", minute: "2-digit" }) : "securely"}.</p></div></li>
+        <li className="is-current" aria-current="step"><span>2</span><div><small>Next</small><strong>Arrange and review a contract outside Melaiva</strong><p>Agree it directly with the partner and confirm it matches the frozen scope, exclusions and commercial terms below.</p></div></li>
+        <li><span>3</span><div><small>Not yet enabled</small><strong>Booking confirmation</strong><p>Melaiva does not yet collect signatures or payments in this workspace.</p></div></li>
+      </ol>
+      {!structured && <div className="offer-legacy-note award-handoff__legacy"><CircleAlert size={16} /><span>This legacy offer did not capture every normalized commercial term. Missing details remain explicitly marked “Not provided.”</span></div>}
+      <dl className="award-handoff__summary">
+        <div><dt>Accepted amount</dt><dd>{formatCurrency(offer.amount)}</dd></div>
+        <div><dt>GST</dt><dd>{gstSummary(offer)}</dd></div>
+        <div><dt>Travel</dt><dd>{travelSummary(offer)}</dd></div>
+        <div><dt>Valid until</dt><dd>{offer.validUntil ? formatDate(offer.validUntil) : "Not provided"}</dd></div>
+      </dl>
+      <div className="award-handoff__scope">
+        <section className="offer-term-card"><h3>Accepted inclusions</h3><OfferTermList items={Array.isArray(offer.deliverables) ? offer.deliverables : null} /></section>
+        <section className="offer-term-card"><h3>Accepted exclusions</h3><OfferTermList items={exclusions} tone="excluded" /></section>
+      </div>
+      <div className="award-handoff__terms">
+        <section className="offer-term-card"><h3>Priced add-ons</h3><OfferTermList items={addOns} emptyLabel={structured ? "No priced add-ons" : "Not provided"} formatItem={(item) => `${item?.name || "Unnamed add-on"} · ${Number.isFinite(Number(item?.amount)) ? formatCurrency(item.amount) : "Price not provided"}`} /></section>
+        <section className="offer-term-card"><h3>Delivery plan</h3><p>{structured ? offer.deliveryPlan : "Not provided"}</p></section>
+        <section className="offer-term-card"><h3>Cancellation terms</h3><p>{structured ? offer.cancellationTerms : "Not provided"}</p></section>
+      </div>
+      <div className="award-handoff__record"><ScrollText size={16} /><p><strong>Immutable decision record</strong><span>Reference {String(award.id).slice(0, 8).toUpperCase()} · {request.title || "Celebration request"}</span></p><small>This record is not a signed contract, invoice or proof of payment.</small></div>
+    </section>
+  );
+}
+
+function LiveOffers({ auction, bids, loading, error, decidingId, closing, award, awardLoading, awardError, onRetryAward, onDecision, onRequestClose, onRequestAward }) {
   if (!auction) return null;
   return (
-    <div className="live-offers-focus" role="region" aria-label={`Offers for ${auction.title}`} aria-busy={loading} data-offers-focus-target="true" tabIndex="-1">
+    <div className="live-offers-focus" role="region" aria-label={`Offers for ${auction.title}`} aria-busy={loading || awardLoading} data-offers-focus-target="true" tabIndex="-1">
+      {auction.status === "awarded" && (awardLoading ? (
+        <div className="dashboard-card dashboard-empty dashboard-empty--compact award-handoff-state" role="status" aria-live="polite"><span><LoaderCircle className="spin-icon" size={27} /></span><h2>Loading your award record</h2><p>Retrieving the frozen scope and contract-pending handoff.</p></div>
+      ) : awardError ? (
+        <div className="dashboard-card dashboard-empty dashboard-empty--compact award-handoff-state" role="alert"><span><CircleAlert size={27} /></span><h2>Award record could not be loaded</h2><p>{awardError}</p><button className="button button--outline" type="button" onClick={onRetryAward}><RefreshCw size={15} /> Retry</button></div>
+      ) : <AwardHandoff award={award} />)}
       {auction.status === "open" ? (
         <SealedOffersState auction={auction} closing={closing} onRequestClose={onRequestClose} />
       ) : loading ? (
@@ -437,8 +492,8 @@ function LiveOffers({ auction, bids, loading, error, decidingId, closing, onDeci
       ) : !bids.length ? (
         <div className="dashboard-card dashboard-empty dashboard-empty--compact"><span><FileText size={27} /></span><h2>No offers were received</h2><p>This request closed without a proposal. Create a revised brief or contact Melaiva support before making a vendor decision.</p><Link className="button button--primary" to="/request">Create a new brief</Link></div>
       ) : (
-        <section className="dashboard-card live-offers-card">
-          <div className="dashboard-card__heading"><div><span className="card-icon card-icon--marigold"><FileText size={18} /></span><div><h2>Offers for {auction.title}</h2><p>{bids.length} proposal{bids.length === 1 ? "" : "s"} received</p></div></div><span className="trust-note"><LockKeyhole size={14} /> Private comparison</span></div>
+        <section className={`dashboard-card live-offers-card ${auction.status === "awarded" ? "live-offers-card--awarded" : ""}`}>
+          <div className="dashboard-card__heading"><div><span className="card-icon card-icon--marigold"><FileText size={18} /></span><div><h2>{auction.status === "awarded" ? "Decision record" : "Offers"} for {auction.title}</h2><p>{bids.length} proposal{bids.length === 1 ? "" : "s"} received</p></div></div><span className="trust-note">{auction.status === "awarded" ? <><ShieldCheck size={14} /> Award complete</> : <><LockKeyhole size={14} /> Private comparison</>}</span></div>
           <div className="live-offer-list">
             {bids.map((bid) => {
               const businessName = bid.vendor?.businessName || "Approved partner";
@@ -481,7 +536,7 @@ function LiveOffers({ auction, bids, loading, error, decidingId, closing, onDeci
   );
 }
 
-function LiveDashboard({ user, auctions, selectedAuction, onSelect, bids, bidsLoading, bidsError, decidingId, closingOfferWindow, onDecision, onRequestClose, onRequestAward, active, setActive }) {
+function LiveDashboard({ user, auctions, selectedAuction, onSelect, bids, bidsLoading, bidsError, decidingId, closingOfferWindow, award, awardLoading, awardError, onRetryAward, onDecision, onRequestClose, onRequestAward, active, setActive }) {
   const totalOffers = auctions.reduce((sum, auction) => sum + Number(auction.bidCount || 0), 0);
   return (
     <>
@@ -494,7 +549,7 @@ function LiveDashboard({ user, auctions, selectedAuction, onSelect, bids, bidsLo
           <>
             <DashboardNav active={active} setActive={setActive} offersCount={totalOffers} />
             {active === "overview" && <div className="live-dashboard-grid"><RequestSelector auctions={auctions} selectedId={selectedAuction?.id} onSelect={onSelect} /><LiveRequestSummary auction={selectedAuction} /></div>}
-            {active === "offers" && <><RequestSelector auctions={auctions} selectedId={selectedAuction?.id} onSelect={onSelect} /><LiveOffers auction={selectedAuction} bids={bids} loading={bidsLoading} error={bidsError} decidingId={decidingId} closing={closingOfferWindow} onDecision={onDecision} onRequestClose={onRequestClose} onRequestAward={onRequestAward} /></>}
+            {active === "offers" && <><RequestSelector auctions={auctions} selectedId={selectedAuction?.id} onSelect={onSelect} /><LiveOffers auction={selectedAuction} bids={bids} loading={bidsLoading} error={bidsError} decidingId={decidingId} closing={closingOfferWindow} award={award} awardLoading={awardLoading} awardError={awardError} onRetryAward={onRetryAward} onDecision={onDecision} onRequestClose={onRequestClose} onRequestAward={onRequestAward} /></>}
             {active === "tasks" && <div className="dashboard-card dashboard-empty"><span><ClipboardCheck size={27} /></span><h2>No task list yet</h2><p>Request and offer decisions are live. Personal task management is the next workspace module.</p></div>}
             {active === "messages" && <MessagesEmpty />}
           </>
@@ -521,6 +576,11 @@ export function DashboardPage({ notify, onOpenAuth }) {
   const [awardDialog, setAwardDialog] = useState(null);
   const [closeDialogAuctionId, setCloseDialogAuctionId] = useState(null);
   const [closingOfferWindow, setClosingOfferWindow] = useState(false);
+  const [award, setAward] = useState(null);
+  const [awardAuctionId, setAwardAuctionId] = useState(null);
+  const [awardLoading, setAwardLoading] = useState(false);
+  const [awardError, setAwardError] = useState("");
+  const [awardRefreshKey, setAwardRefreshKey] = useState(0);
   const [refreshKey, setRefreshKey] = useState(0);
   const bidAcceptanceKeys = useRef(new Map());
   const selectedIdRef = useRef(selectedId);
@@ -540,7 +600,7 @@ export function DashboardPage({ notify, onOpenAuth }) {
         }
         const mePayload = await readApiResponse(meResponse, "Your planning space is temporarily unavailable.");
         const nextUser = mePayload.data?.user;
-        if (!nextUser || !["couple", "admin"].includes(nextUser.role)) {
+        if (!nextUser) {
           if (!controller.signal.aborted) { setUser(nextUser || null); setMode("wrong-role"); }
           return;
         }
@@ -553,6 +613,9 @@ export function DashboardPage({ notify, onOpenAuth }) {
         setBids([]);
         setBidsAuctionId(null);
         setBidsError("");
+        setAward(null);
+        setAwardAuctionId(null);
+        setAwardError("");
         setSelectedId((current) => nextAuctions.some((auction) => auction.id === current) ? current : nextAuctions[0]?.id || null);
         setMode("live");
       } catch (error) {
@@ -592,6 +655,32 @@ export function DashboardPage({ notify, onOpenAuth }) {
     return () => controller.abort();
   }, [mode, selectedAuction?.bidCount, selectedAuction?.status, selectedId]);
 
+  useEffect(() => {
+    if (mode !== "live" || !selectedId || selectedAuction?.status !== "awarded") {
+      setAward(null);
+      setAwardAuctionId(selectedId || null);
+      setAwardError("");
+      setAwardLoading(false);
+      return undefined;
+    }
+    const controller = new AbortController();
+    async function loadAward() {
+      setAward(null); setAwardAuctionId(selectedId); setAwardLoading(true); setAwardError("");
+      try {
+        const response = await fetch(`/api/v1/auctions/${selectedId}/award`, { credentials: "include", signal: controller.signal });
+        const payload = await readApiResponse(response, "The award record could not be loaded.");
+        if (!controller.signal.aborted) setAward(payload.data || null);
+      } catch (error) {
+        if (error?.name === "AbortError" || controller.signal.aborted) return;
+        setAward(null); setAwardError(error.message || "The award record could not be loaded.");
+      } finally {
+        if (!controller.signal.aborted) setAwardLoading(false);
+      }
+    }
+    loadAward();
+    return () => controller.abort();
+  }, [awardRefreshKey, mode, selectedAuction?.status, selectedId]);
+
   function acceptanceKeyFor(auctionId, bidId) {
     const scope = `${auctionId}:${bidId}`;
     if (bidAcceptanceKeys.current.has(scope)) return bidAcceptanceKeys.current.get(scope);
@@ -630,7 +719,7 @@ export function DashboardPage({ notify, onOpenAuth }) {
       }
       if (action === "accept") setAuctions((current) => current.map((auction) => auction.id === auctionId ? { ...auction, status: "awarded" } : auction));
       if (action === "accept") setAwardDialog(null);
-      notify({ title: action === "accept" ? "Offer awarded" : action === "shortlist" ? "Offer shortlisted" : "Offer removed from shortlist", message: action === "accept" ? "The request is awarded and the other open offers are now closed." : "Your live planning space is up to date." });
+      notify({ title: action === "accept" ? "Award recorded" : action === "shortlist" ? "Offer shortlisted" : "Offer removed from shortlist", message: action === "accept" ? "The accepted scope is frozen. Arrange and review the written contract outside Melaiva next." : "Your live planning space is up to date." });
     } catch (error) {
       notify({ type: "error", title: "Decision not saved", message: error.message || "Please refresh and try again." });
     } finally {
@@ -674,7 +763,7 @@ export function DashboardPage({ notify, onOpenAuth }) {
 
   if (mode === "loading") return <div className="dashboard-page page-surface"><AccountState icon={LoaderCircle} eyebrow="Loading your workspace" title="Gathering your plans" message="Checking your account, requests and offers." /></div>;
   if (mode === "guest") return <div className="dashboard-page page-surface"><AccountState icon={LockKeyhole} eyebrow="Private planning space" title="Sign in to see your live plan" message="Your requests, offers and decisions are available only from your secure account."><button className="button button--primary" type="button" onClick={onOpenAuth}>Sign in</button><Link className="button button--outline" to="/request">Create a brief first</Link></AccountState></div>;
-  if (mode === "wrong-role") return <div className="dashboard-page page-surface"><AccountState icon={ShieldCheck} eyebrow="Account workspace" title="This is the couple planning space" message="Vendor accounts manage matched opportunities and proposals from the partner workspace."><Link className="button button--primary" to="/vendor">Open vendor workspace</Link></AccountState></div>;
+  if (mode === "wrong-role") return <div className="dashboard-page page-surface"><AccountState icon={ShieldCheck} eyebrow="Account workspace" title="Your planning profile could not be loaded" message="Refresh the page or sign in again before opening private requests and offers."><button className="button button--primary" type="button" onClick={() => setRefreshKey((value) => value + 1)}>Retry</button></AccountState></div>;
 
   if (mode === "live") {
     const dialogAuction = auctions.find((auction) => auction.id === closeDialogAuctionId) || null;
@@ -683,7 +772,9 @@ export function DashboardPage({ notify, onOpenAuth }) {
     const awardAuction = awardDialog ? auctions.find((auction) => auction.id === awardDialog.auctionId) || null : null;
     const awardBid = awardDialog && bidsAuctionId === awardDialog.auctionId ? bids.find((bid) => bid.id === awardDialog.bidId) || null : null;
     const awardBusy = Boolean(awardDialog && decidingId === `${awardDialog.auctionId}:${awardDialog.bidId}`);
-    return <div className="dashboard-page page-surface"><LiveDashboard user={user} auctions={auctions} selectedAuction={selectedAuction} onSelect={setSelectedId} bids={visibleBids} bidsLoading={visibleBidsLoading} bidsError={bidsAuctionId === selectedId ? bidsError : ""} decidingId={decidingId} closingOfferWindow={closingOfferWindow} onDecision={decideOnBid} onRequestClose={setCloseDialogAuctionId} onRequestAward={(bid) => selectedAuction && setAwardDialog({ auctionId: selectedAuction.id, bidId: bid.id })} active={active} setActive={setActive} /><CloseOfferWindowDialog auction={dialogAuction} open={Boolean(dialogAuction)} closing={closingOfferWindow} onClose={() => !closingOfferWindow && setCloseDialogAuctionId(null)} onConfirm={closeOfferWindow} /><AwardOfferDialog auction={awardAuction} bid={awardBid} open={Boolean(awardAuction && awardBid)} busy={awardBusy} onClose={() => !awardBusy && setAwardDialog(null)} onConfirm={() => awardDialog && decideOnBid(awardDialog.bidId, "accept", awardDialog.auctionId)} /></div>;
+    const visibleAward = awardAuctionId === selectedId ? award : null;
+    const visibleAwardLoading = selectedAuction?.status === "awarded" && (awardAuctionId !== selectedId || awardLoading);
+    return <div className="dashboard-page page-surface"><LiveDashboard user={user} auctions={auctions} selectedAuction={selectedAuction} onSelect={setSelectedId} bids={visibleBids} bidsLoading={visibleBidsLoading} bidsError={bidsAuctionId === selectedId ? bidsError : ""} decidingId={decidingId} closingOfferWindow={closingOfferWindow} award={visibleAward} awardLoading={visibleAwardLoading} awardError={awardAuctionId === selectedId ? awardError : ""} onRetryAward={() => setAwardRefreshKey((value) => value + 1)} onDecision={decideOnBid} onRequestClose={setCloseDialogAuctionId} onRequestAward={(bid) => selectedAuction && setAwardDialog({ auctionId: selectedAuction.id, bidId: bid.id })} active={active} setActive={setActive} /><CloseOfferWindowDialog auction={dialogAuction} open={Boolean(dialogAuction)} closing={closingOfferWindow} onClose={() => !closingOfferWindow && setCloseDialogAuctionId(null)} onConfirm={closeOfferWindow} /><AwardOfferDialog auction={awardAuction} bid={awardBid} open={Boolean(awardAuction && awardBid)} busy={awardBusy} onClose={() => !awardBusy && setAwardDialog(null)} onConfirm={() => awardDialog && decideOnBid(awardDialog.bidId, "accept", awardDialog.auctionId)} /></div>;
   }
 
   return (

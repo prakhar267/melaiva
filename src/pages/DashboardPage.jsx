@@ -211,7 +211,7 @@ function LiveOffers({ auction, bids, loading, error, decidingId, onDecision }) {
               <p>{bid.proposal}</p>
               <ul>{bid.deliverables.map((item) => <li key={item}><Check size={14} /> {item}</li>)}</ul>
               {bid.validUntil && <small className="live-offer__validity">Valid until {formatDate(bid.validUntil)}</small>}
-              {auction.status === "open" && ["submitted", "shortlisted"].includes(bid.status) && (
+              {auction.status === "closed" && ["submitted", "shortlisted"].includes(bid.status) && (
                 <div className="live-offer__actions">
                   <button className="button button--small button--outline" type="button" disabled={busy} onClick={() => onDecision(bid.id, bid.status === "shortlisted" ? "reject" : "shortlist")}>{bid.status === "shortlisted" ? "Decline" : "Shortlist"}</button>
                   <button className="button button--small button--primary" type="button" disabled={busy} onClick={() => onDecision(bid.id, "accept")}>{busy ? "Saving…" : "Accept offer"}</button>

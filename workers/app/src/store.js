@@ -295,8 +295,13 @@ export class MelaivaStore {
         return jsonResponse({ data });
       }
       return jsonResponse({ error: "unsupported_operation" }, 400);
-    } catch {
-      return jsonResponse({ error: "storage_error" }, 409);
+    } catch (error) {
+      const code = /unique constraint failed|SQLITE_CONSTRAINT_(?:UNIQUE|PRIMARYKEY)/i.test(
+        String(error?.message || error),
+      )
+        ? "unique_constraint"
+        : "storage_error";
+      return jsonResponse({ error: "storage_error", code }, 409);
     }
   }
 }
@@ -341,7 +346,11 @@ class DurableObjectDatabase {
       body: JSON.stringify(payload),
     });
     const body = await response.json();
-    if (!response.ok) throw new Error(body?.message || body?.error || "Durable Object storage request failed");
+    if (!response.ok) {
+      const error = new Error(body?.error || "Durable Object storage request failed");
+      error.code = body?.code || body?.error || "storage_error";
+      throw error;
+    }
     return body.data;
   }
 

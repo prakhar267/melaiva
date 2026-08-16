@@ -569,7 +569,8 @@ async function parseJson(c, schema, maxBytes = MAX_JSON_BYTES) {
 }
 
 function isUniqueConstraint(error) {
-  return /unique constraint|constraint failed|SQLITE_CONSTRAINT/i.test(String(error?.message || error));
+  return error?.code === "unique_constraint"
+    || /unique constraint|SQLITE_CONSTRAINT_(?:UNIQUE|PRIMARYKEY)/i.test(String(error?.message || error));
 }
 
 async function prepareSession(c, userId) {
@@ -1856,7 +1857,8 @@ function buildApp() {
           .prepare(
             `INSERT INTO audit_events (actor_user_id, action, entity_type, entity_id, metadata_json)
              SELECT ?, 'bid.accepted', 'bid', ?, ?
-             WHERE EXISTS (SELECT 1 FROM bids WHERE id = ? AND status = 'accepted')`,
+             WHERE changes() = 1
+               AND EXISTS (SELECT 1 FROM bids WHERE id = ? AND status = 'accepted')`,
           )
           .bind(user.id, bid.id, JSON.stringify({ auctionId: auction.id }), bid.id),
       );
@@ -1873,6 +1875,10 @@ function buildApp() {
         throw error;
       }
       if (Number(results?.[0]?.meta?.changes || 0) !== 1 || Number(results?.[awardResultIndex]?.meta?.changes || 0) !== 1) {
+        const concurrentReplay = await findIdempotentResult(db, scope, requestKey, user.id, requestHash);
+        if (concurrentReplay) {
+          return c.json({ data: concurrentReplay.value, meta: { replayed: true } }, concurrentReplay.status);
+        }
         throw new ApiError(409, "invalid_status_transition", "This request changed before your decision; refresh and try again");
       }
     } else {

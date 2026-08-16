@@ -392,6 +392,43 @@ test("marketplace authorization and state transitions remain private, atomic, an
   assert.equal(acceptPayloadConflict.status, 409, await acceptPayloadConflict.clone().text());
   assert.equal((await acceptPayloadConflict.json()).error.code, "idempotency_conflict");
 
+  const retriedBidResponse = await requestJson(app, env, `/auctions/${genericAuction.id}/bids`, {
+    cookie: vendorOne.cookie,
+    body: {
+      amount: 285000,
+      currency: "INR",
+      proposal: "A complete photography proposal for retry testing with coverage, editing, delivery, and clear terms.",
+      deliverables: ["Two photographers", "Edited photographs"],
+    },
+  });
+  assert.equal(retriedBidResponse.status, 201, await retriedBidResponse.clone().text());
+  const retriedBidId = (await retriedBidResponse.json()).data.id;
+  const genericClosed = await requestJson(app, env, `/auctions/${genericAuction.id}/status`, {
+    method: "PATCH",
+    cookie: couple.cookie,
+    body: { status: "closed" },
+  });
+  assert.equal(genericClosed.status, 200, await genericClosed.clone().text());
+
+  const retryAccept = () => requestJson(app, env, `/auctions/${genericAuction.id}/bids/${retriedBidId}`, {
+    method: "PATCH",
+    cookie: couple.cookie,
+    headers: { "idempotency-key": "same-bid-accept-retry-0001" },
+    body: { action: "accept" },
+  });
+  const retryResponses = await Promise.all([retryAccept(), retryAccept()]);
+  assert.deepEqual(retryResponses.map((response) => response.status), [200, 200]);
+  const retryPayloads = await Promise.all(retryResponses.map((response) => response.json()));
+  assert.equal(retryPayloads.filter((payload) => payload.meta?.replayed).length, 1);
+  assert.equal(
+    db.sqlite.prepare("SELECT COUNT(*) AS count FROM audit_events WHERE action = 'bid.accepted' AND entity_id = ?").get(retriedBidId).count,
+    1,
+  );
+  assert.equal(
+    db.sqlite.prepare("SELECT COUNT(*) AS count FROM idempotency_keys WHERE scope = ?").get(`bid-accept:${genericAuction.id}:${retriedBidId}`).count,
+    1,
+  );
+
   assert.throws(
     () => db.sqlite.prepare("UPDATE bids SET status = 'accepted' WHERE auction_id = ? AND status = 'rejected'").run(auction.id),
     /UNIQUE constraint failed/,

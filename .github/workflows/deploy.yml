@@ -15,9 +15,11 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 20
     environment: production
+    env:
+      RELEASE_SHA: ${{ github.sha }}
     steps:
-      - uses: actions/checkout@v5
-      - uses: actions/setup-node@v5
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
         with:
           node-version: 22
           cache: npm
@@ -54,24 +56,40 @@ jobs:
           CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
         run: >-
           npx wrangler deploy --env="" --strict
-          --tag "${GITHUB_SHA}"
-          --message "git=${GITHUB_SHA} run=${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}"
+          --tag "${RELEASE_SHA}"
+          --message "git=${RELEASE_SHA} run=${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}"
 
       - name: Verify deployed readiness
         env:
           MELAIVA_SMOKE_BASE_URL: https://melaiva.prakhargupta267.workers.dev
         run: node scripts/readiness-smoke.mjs
 
-      - name: Record release provenance
+      - name: Assert and record production provenance
+        id: provenance
         working-directory: workers/app
         env:
           CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
           CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
         run: |
+          versions_json="$(npx wrangler versions list --env="" --json)"
+          release_version_id="$(jq -er --arg sha "${RELEASE_SHA}" '
+            [.[] | select(.annotations["workers/tag"] == $sha)] as $matches |
+            if ($matches | length) == 1 then $matches[0].id
+            else error("expected exactly one Worker version tagged with the release SHA")
+            end
+          ' <<< "${versions_json}")"
+          deployments_json="$(npx wrangler deployments list --env="" --json)"
+          active_version_id="$(jq -er '
+            (sort_by(.created_on) | last | [.versions[] | select(.percentage == 100)]) as $active |
+            if ($active | length) == 1 then $active[0].version_id
+            else error("expected exactly one active Worker version")
+            end
+          ' <<< "${deployments_json}")"
+          test "${release_version_id}" = "${active_version_id}"
+          echo "version_id=${release_version_id}" >> "${GITHUB_OUTPUT}"
           {
             echo "### Production release"
-            echo "- Git SHA: \`${GITHUB_SHA}\`"
+            echo "- Git SHA: \`${RELEASE_SHA}\`"
+            echo "- Worker version: \`${release_version_id}\`"
             echo "- Worker: https://melaiva.prakhargupta267.workers.dev"
-            echo "- Versions:"
-            npx wrangler versions list --env="" --json | jq -r 'reverse | .[0:5][] | "  - `\(.id)` created \(.metadata.created_on)"'
           } >> "$GITHUB_STEP_SUMMARY"

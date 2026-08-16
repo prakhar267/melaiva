@@ -8,6 +8,7 @@ import {
   STORE_SCHEMA_V1_SQL,
   STORE_SCHEMA_V2_MIGRATION_SQL,
   STORE_SCHEMA_VERSION,
+  createDurableDatabase,
   executeSql,
 } from "../src/store.js";
 
@@ -32,6 +33,41 @@ test("Durable Object adapter reports logical changes rather than indexed billing
   assert.equal(result.meta.changes, 1);
   assert.equal(result.meta.rowsWritten, 5);
   assert.deepEqual(calls, ["UPDATE bids SET status = 'accepted' WHERE id = ?", "SELECT changes() AS changes"]);
+});
+
+test("Durable Object storage errors preserve only safe unique-constraint classification", async () => {
+  const store = Object.create(MelaivaStore.prototype);
+  store.sql = {
+    exec() {
+      throw new Error("UNIQUE constraint failed: users.email");
+    },
+  };
+  const response = await store.fetch(new Request("https://melaiva-store.internal/sql", {
+    method: "POST",
+    body: JSON.stringify({ operation: "statement", statement: { mode: "run", sql: "INSERT", args: [] } }),
+  }));
+  const body = await response.json();
+
+  assert.equal(response.status, 409);
+  assert.deepEqual(body, { error: "storage_error", code: "unique_constraint" });
+  assert.doesNotMatch(JSON.stringify(body), /users\.email|UNIQUE constraint/i);
+
+  const database = createDurableDatabase({
+    getByName() {
+      return {
+        async fetch() {
+          return new Response(JSON.stringify(body), {
+            status: 409,
+            headers: { "content-type": "application/json" },
+          });
+        },
+      };
+    },
+  });
+  await assert.rejects(
+    database.prepare("INSERT").run(),
+    (error) => error.code === "unique_constraint" && error.message === "storage_error",
+  );
 });
 
 test("Durable Object alarm performs bounded maintenance and schedules its next run", async () => {

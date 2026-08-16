@@ -4,6 +4,7 @@ on:
   pull_request:
   push:
     branches: [main]
+  workflow_dispatch:
 
 permissions:
   contents: read
@@ -17,8 +18,8 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 15
     steps:
-      - uses: actions/checkout@v5
-      - uses: actions/setup-node@v5
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
         with:
           node-version: 22
           cache: npm
@@ -55,3 +56,84 @@ jobs:
         run: |
           npx wrangler deploy --env="" --dry-run --outdir dist/dry-run
           npx wrangler deploy --env staging --dry-run --outdir dist/dry-run-staging
+
+  deploy-staging:
+    needs: validate
+    if: >-
+      github.ref == 'refs/heads/main' &&
+      (github.event_name == 'workflow_dispatch' || vars.ENABLE_STAGING_DEPLOY == 'true')
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    environment:
+      name: staging
+      url: https://melaiva-staging.prakhargupta267.workers.dev
+    env:
+      RELEASE_SHA: ${{ github.sha }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: |
+            package-lock.json
+            workers/app/package-lock.json
+
+      - name: Build deployable application
+        run: npm ci && npm run build
+
+      - name: Install Worker dependencies
+        working-directory: workers/app
+        run: npm ci
+
+      - name: Deploy isolated staging Worker
+        working-directory: workers/app
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+        run: >-
+          npx wrangler deploy --env staging --strict
+          --tag "${RELEASE_SHA}"
+          --message "git=${RELEASE_SHA} run=${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}"
+
+      - name: Verify staging readiness
+        env:
+          MELAIVA_SMOKE_BASE_URL: https://melaiva-staging.prakhargupta267.workers.dev
+        run: node scripts/readiness-smoke.mjs
+
+      - name: Verify staging request lifecycle
+        env:
+          MELAIVA_SMOKE_BASE_URL: https://melaiva-staging.prakhargupta267.workers.dev
+          MELAIVA_SMOKE_ALLOW_WRITES: "1"
+          MELAIVA_SMOKE_SKIP_PLANNER: "1"
+        run: node scripts/production-smoke.mjs
+
+      - name: Assert and record staging provenance
+        id: provenance
+        working-directory: workers/app
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+        run: |
+          versions_json="$(npx wrangler versions list --env staging --json)"
+          release_version_id="$(jq -er --arg sha "${RELEASE_SHA}" '
+            [.[] | select(.annotations["workers/tag"] == $sha)] as $matches |
+            if ($matches | length) == 1 then $matches[0].id
+            else error("expected exactly one Worker version tagged with the release SHA")
+            end
+          ' <<< "${versions_json}")"
+          deployments_json="$(npx wrangler deployments list --env staging --json)"
+          active_version_id="$(jq -er '
+            (sort_by(.created_on) | last | [.versions[] | select(.percentage == 100)]) as $active |
+            if ($active | length) == 1 then $active[0].version_id
+            else error("expected exactly one active Worker version")
+            end
+          ' <<< "${deployments_json}")"
+          test "${release_version_id}" = "${active_version_id}"
+          echo "version_id=${release_version_id}" >> "${GITHUB_OUTPUT}"
+          {
+            echo "### Staging release"
+            echo "- Git SHA: `${RELEASE_SHA}`"
+            echo "- Worker version: `${release_version_id}`"
+            echo "- Worker: https://melaiva-staging.prakhargupta267.workers.dev"
+          } >> "${GITHUB_STEP_SUMMARY}"

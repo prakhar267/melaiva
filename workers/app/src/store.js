@@ -1,4 +1,4 @@
-const STORE_SCHEMA_VERSION = 2;
+const STORE_SCHEMA_VERSION = 3;
 const MAINTENANCE_INTERVAL_MS = 60 * 60 * 1000;
 
 const STORE_SCHEMA_V1_SQL = `
@@ -184,7 +184,73 @@ ALTER TABLE idempotency_keys ADD COLUMN request_hash TEXT;
 ${STORE_SCHEMA_V2_FINALIZE_SQL}
 `;
 
-const STORE_SCHEMA_SQL = `${STORE_SCHEMA_V1_SQL}\n${STORE_SCHEMA_V2_MIGRATION_SQL}`;
+const STORE_SCHEMA_V3_COLUMN_MIGRATIONS = Object.freeze([
+  [
+    "exclusions_json",
+    `ALTER TABLE bids ADD COLUMN exclusions_json TEXT NOT NULL DEFAULT '[]'
+       CHECK (json_valid(exclusions_json) AND json_type(exclusions_json) = 'array' AND json_array_length(exclusions_json) <= 30)`,
+  ],
+  [
+    "gst_included",
+    "ALTER TABLE bids ADD COLUMN gst_included INTEGER NOT NULL DEFAULT 0 CHECK (gst_included IN (0, 1))",
+  ],
+  [
+    "gst_rate",
+    "ALTER TABLE bids ADD COLUMN gst_rate INTEGER NOT NULL DEFAULT 0 CHECK (gst_rate BETWEEN 0 AND 28 AND gst_rate = CAST(gst_rate AS INTEGER))",
+  ],
+  [
+    "travel_policy",
+    "ALTER TABLE bids ADD COLUMN travel_policy TEXT NOT NULL DEFAULT 'not_applicable' CHECK (travel_policy IN ('included', 'fixed_fee', 'not_applicable'))",
+  ],
+  [
+    "travel_fee",
+    `ALTER TABLE bids ADD COLUMN travel_fee INTEGER NOT NULL DEFAULT 0
+       CHECK (
+         typeof(travel_fee) = 'integer'
+         AND travel_fee BETWEEN 0 AND 1000000000
+         AND (
+           (travel_policy = 'fixed_fee' AND travel_fee > 0)
+           OR (travel_policy != 'fixed_fee' AND travel_fee = 0)
+         )
+       )`,
+  ],
+  [
+    "add_ons_json",
+    `ALTER TABLE bids ADD COLUMN add_ons_json TEXT NOT NULL DEFAULT '[]'
+       CHECK (json_valid(add_ons_json) AND json_type(add_ons_json) = 'array' AND json_array_length(add_ons_json) <= 20)`,
+  ],
+  [
+    "cancellation_terms",
+    "ALTER TABLE bids ADD COLUMN cancellation_terms TEXT NOT NULL DEFAULT '' CHECK (length(cancellation_terms) <= 3000)",
+  ],
+  [
+    "delivery_plan",
+    "ALTER TABLE bids ADD COLUMN delivery_plan TEXT NOT NULL DEFAULT '' CHECK (length(delivery_plan) <= 3000)",
+  ],
+  [
+    "structured_terms_provided",
+    `ALTER TABLE bids ADD COLUMN structured_terms_provided INTEGER NOT NULL DEFAULT 0
+       CHECK (
+         (structured_terms_provided = 0 AND cancellation_terms = '' AND delivery_plan = '')
+         OR (
+           structured_terms_provided = 1
+           AND length(cancellation_terms) BETWEEN 20 AND 3000
+           AND length(delivery_plan) BETWEEN 20 AND 3000
+         )
+       )`,
+  ],
+]);
+
+const STORE_SCHEMA_V3_FINALIZE_SQL = `
+INSERT OR IGNORE INTO _sql_schema_migrations (id) VALUES (3);
+PRAGMA optimize;
+`;
+
+const STORE_SCHEMA_V3_MIGRATION_SQL = `${STORE_SCHEMA_V3_COLUMN_MIGRATIONS
+  .map(([, sql]) => `${sql};`)
+  .join("\n")}\n${STORE_SCHEMA_V3_FINALIZE_SQL}`;
+
+const STORE_SCHEMA_SQL = `${STORE_SCHEMA_V1_SQL}\n${STORE_SCHEMA_V2_MIGRATION_SQL}\n${STORE_SCHEMA_V3_MIGRATION_SQL}`;
 
 const DEMO_CATALOG_SQL = `
 INSERT OR IGNORE INTO vendors
@@ -240,12 +306,19 @@ export class MelaivaStore {
       const version = Number(versionRow.version || 0);
       if (version === 0) {
         this.sql.exec(STORE_SCHEMA_SQL).toArray();
-      } else if (version < STORE_SCHEMA_VERSION) {
+      } else if (version < 2) {
         const idempotencyColumns = this.sql.exec("PRAGMA table_info(idempotency_keys)").toArray();
         if (!idempotencyColumns.some((column) => column.name === "request_hash")) {
           this.sql.exec("ALTER TABLE idempotency_keys ADD COLUMN request_hash TEXT").toArray();
         }
         this.sql.exec(STORE_SCHEMA_V2_FINALIZE_SQL).toArray();
+      }
+      if (version > 0 && version < STORE_SCHEMA_VERSION) {
+        const bidColumns = new Set(this.sql.exec("PRAGMA table_info(bids)").toArray().map((column) => column.name));
+        for (const [name, sql] of STORE_SCHEMA_V3_COLUMN_MIGRATIONS) {
+          if (!bidColumns.has(name)) this.sql.exec(sql).toArray();
+        }
+        this.sql.exec(STORE_SCHEMA_V3_FINALIZE_SQL).toArray();
       }
       if (env?.ENABLE_DEMO_CATALOG === "true" && env?.ENVIRONMENT !== "production") {
         this.sql.exec(DEMO_CATALOG_SQL).toArray();
@@ -379,6 +452,7 @@ export {
   STORE_SCHEMA_SQL,
   STORE_SCHEMA_V1_SQL,
   STORE_SCHEMA_V2_MIGRATION_SQL,
+  STORE_SCHEMA_V3_MIGRATION_SQL,
   STORE_SCHEMA_VERSION,
   executeSql,
 };

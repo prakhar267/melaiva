@@ -27,6 +27,7 @@ This shape is intentional for the free launch tier: it preserves relational cons
 - A preferred vendor is attached only when the vendor remains approved and matches the brief's category and city at the atomic create boundary. Other matched vendors cannot see that preference.
 - Suspending or rejecting a vendor withdraws open proposals and makes unanswered direct invitations unavailable; award selection rechecks current vendor approval.
 - Submitted offers stay sealed while an auction is open. Customer contact data remains private.
+- New offers persist bounded, normalized commercial terms for explicit comparison; schema-v3 legacy rows remain readable and are labelled incomplete instead of receiving invented disclosures.
 - Owner-initiated status changes update the auction and append their audit event in one transaction. Replayed or concurrent requests converge on the same status without duplicating the audit record.
 - Production storage failures fail closed; demo state is never substituted for a write.
 
@@ -92,7 +93,7 @@ Use an external synthetic monitor for `/health` because a Worker cannot reliably
 ## Delivery policy
 
 - CI gates frozen installs, frontend build, SPA fallback tests, syntax checks, SQLite integration/security tests, and a Wrangler bundle dry run. The protected default branch also requires CodeQL security analysis.
-- Production deployment is manual through the GitHub environment until a least-privilege Cloudflare API token is installed as a repository secret.
+- Production deployment remains a manual authenticated Wrangler release until least-privilege Cloudflare credentials are installed in the protected GitHub environment; the checked-in workflow cannot deploy without them.
 - Staging targets the separate `melaiva-staging` Worker and Durable Object namespace with production-strength runtime posture but AI, demo data, and Turnstile disabled until their integrations are ready.
-- `wrangler deploy` provisions the Durable Object class via Cloudflare migration `v1`; the class then applies its resumable internal SQLite schema migrations through schema version 2.
+- `wrangler deploy` provisions the Durable Object class via Cloudflare migration `v1`; the class then applies its resumable internal SQLite schema migrations through schema version 3.
 - Free-plan limits are capacity limits, not an enterprise SLA. A custom domain, production support, transactional email, payments, legal/KYC, and model usage need explicit operating budgets and vendor contracts.

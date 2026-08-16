@@ -11,8 +11,8 @@ The launch build is a single Cloudflare Worker: it serves the React application,
 - Responsive customer marketplace and vendor discovery
 - Four-step private request builder with sealed offer workflow and explicit preferred-partner invitations
 - Customer dashboard backed by the signed-in user's requests, with a private sealed state and an explicit close-and-reveal decision
-- Vendor onboarding, opportunity feed, and bid submission
-- Customer bid review, shortlist/reject/accept state transitions, including an irreversible-action confirmation and exact offer counts
+- Vendor onboarding, opportunity feed, and normalized offer submission covering inclusions, exclusions, GST, travel, priced add-ons, delivery, cancellation, and validity
+- Customer commercial-term comparison plus shortlist/reject/accept state transitions, with a review-and-acknowledge award dialog and exact offer counts
 - Gemini-assisted planning with schema validation, quotas, timeout, kill switch, and a transparent deterministic fallback
 - Client-derived password verifiers, server-side peppering, revocable secure sessions, role checks, rate limits, origin checks, and idempotent critical mutations
 - Hourly Durable Object cleanup/auction-close alarm, structured request IDs, fail-closed health endpoints, CI, and production runbooks

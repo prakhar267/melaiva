@@ -120,6 +120,23 @@ async function onboardVendor(
   return (await response.json()).data;
 }
 
+function normalizedOfferTerms(overrides = {}) {
+  return {
+    exclusions: ["Raw footage and physical albums are excluded unless selected as add-ons."],
+    gstIncluded: false,
+    gstRate: 18,
+    travelPolicy: "fixed_fee",
+    travelFee: 25000,
+    addOns: [
+      { name: "Same-day edit", amount: 45000 },
+      { name: "Premium album", amount: 30000 },
+    ],
+    cancellationTerms: "The booking fee is non-refundable; later cancellations follow the written milestone schedule.",
+    deliveryPlan: "Preview photographs arrive within seven days and the edited gallery and film within twelve weeks.",
+    ...overrides,
+  };
+}
+
 test("marketplace authorization and state transitions remain private, atomic, and idempotent", async () => {
   const db = new SqliteD1(STORE_SCHEMA_SQL);
   const env = {
@@ -248,6 +265,28 @@ test("marketplace authorization and state transitions remain private, atomic, an
   const genericAuction = (await genericCreated.json()).data;
   assert.equal(genericAuction.preferredVendor, null);
   assert.equal(db.sqlite.prepare("SELECT COUNT(*) AS count FROM auctions").get().count, 2);
+  const legacyBidResponse = await requestJson(app, env, `/auctions/${genericAuction.id}/bids`, {
+    cookie: vendorTwo.cookie,
+    body: {
+      amount: 265000,
+      currency: "INR",
+      proposal: "A legacy photography proposal retained without inventing normalized commercial disclosures.",
+      deliverables: ["Legacy photography coverage", "Legacy edited gallery"],
+    },
+  });
+  assert.equal(legacyBidResponse.status, 201, await legacyBidResponse.clone().text());
+  const legacyBidData = (await legacyBidResponse.json()).data;
+  const legacyBidId = legacyBidData.id;
+  assert.equal(legacyBidData.structuredTermsProvided, false);
+  assert.deepEqual(legacyBidData.exclusions, []);
+  assert.equal(legacyBidData.gstIncluded, false);
+  assert.equal(legacyBidData.gstRate, 0);
+  assert.equal(legacyBidData.travelPolicy, "not_applicable");
+  assert.equal(legacyBidData.travelFee, 0);
+  assert.deepEqual(legacyBidData.addOns, []);
+  assert.equal(legacyBidData.cancellationTerms, "");
+  assert.equal(legacyBidData.deliveryPlan, "");
+  assert.equal(db.sqlite.prepare("SELECT structured_terms_provided FROM bids WHERE id = ?").get(legacyBidId).structured_terms_provided, 0);
 
   const ownerList = await requestJson(app, env, "/auctions", { cookie: couple.cookie });
   assert.equal(ownerList.status, 200, await ownerList.clone().text());
@@ -307,12 +346,144 @@ test("marketplace authorization and state transitions remain private, atomic, an
       currency: "INR",
       proposal: "A deliberately mismatched catering proposal that must never enter a photography-only Jaipur request.",
       deliverables: ["Catering service"],
+      ...normalizedOfferTerms(),
     },
   });
   assert.equal(mismatchedBid.status, 404);
 
+  const validBidBase = {
+    amount: 275000,
+    currency: "INR",
+    proposal: "A complete photography proposal with coverage, editing, delivery, and clear commercial terms.",
+    deliverables: ["Two photographers", "Edited photographs", "Wedding film"],
+    ...normalizedOfferTerms(),
+  };
+  const oversizedBid = await requestJson(app, env, `/auctions/${auction.id}/bids`, {
+    cookie: vendorOne.cookie,
+    body: { ...validBidBase, deliveryPlan: "oversized-private-plan-".repeat(12000) },
+  });
+  assert.equal(oversizedBid.status, 413, await oversizedBid.clone().text());
+  assert.equal((await oversizedBid.json()).error.code, "payload_too_large");
+  const invalidBidCases = [
+    {
+      name: "partial normalized fields",
+      body: {
+        amount: validBidBase.amount,
+        currency: validBidBase.currency,
+        proposal: validBidBase.proposal,
+        deliverables: validBidBase.deliverables,
+        exclusions: [],
+      },
+    },
+    {
+      name: "fixed travel fee omitted",
+      body: { ...validBidBase, travelPolicy: "fixed_fee", travelFee: undefined },
+    },
+    {
+      name: "fee attached to included travel",
+      body: { ...validBidBase, travelPolicy: "included", travelFee: 1 },
+    },
+    {
+      name: "too many add-ons",
+      body: {
+        ...validBidBase,
+        addOns: Array.from({ length: 21 }, (_, index) => ({ name: `Extra ${index}`, amount: 1000 })),
+      },
+    },
+    {
+      name: "duplicate add-on names",
+      body: { ...validBidBase, addOns: [{ name: "Album", amount: 1000 }, { name: " album ", amount: 2000 }] },
+    },
+    {
+      name: "combined add-on amount too large",
+      body: { ...validBidBase, addOns: [{ name: "First package", amount: 600000000 }, { name: "Second package", amount: 600000000 }] },
+    },
+    {
+      name: "oversized exclusion",
+      body: { ...validBidBase, exclusions: ["x".repeat(201)] },
+    },
+    {
+      name: "oversized cancellation terms",
+      body: { ...validBidBase, cancellationTerms: "x".repeat(3001) },
+    },
+    {
+      name: "fractional GST rate",
+      body: { ...validBidBase, gstRate: 28.5 },
+    },
+    {
+      name: "GST rate above the supported maximum",
+      body: { ...validBidBase, gstRate: 29 },
+    },
+  ];
+  for (const invalidCase of invalidBidCases) {
+    const invalidBid = await requestJson(app, env, `/auctions/${auction.id}/bids`, {
+      cookie: vendorOne.cookie,
+      body: invalidCase.body,
+    });
+    assert.equal(invalidBid.status, 422, `${invalidCase.name}: ${await invalidBid.clone().text()}`);
+    assert.equal((await invalidBid.json()).error.code, "validation_failed", invalidCase.name);
+  }
+  assert.equal(db.sqlite.prepare("SELECT COUNT(*) AS count FROM bids WHERE auction_id = ?").get(auction.id).count, 0);
+
+  const tooShortValidity = await requestJson(app, env, `/auctions/${auction.id}/bids`, {
+    cookie: vendorOne.cookie,
+    body: {
+      ...validBidBase,
+      validUntil: new Date(Date.now() + 2 * 24 * 60 * 60 * 1000).toISOString().slice(0, 10),
+    },
+  });
+  assert.equal(tooShortValidity.status, 422, await tooShortValidity.clone().text());
+  assert.equal((await tooShortValidity.json()).error.code, "invalid_valid_until");
+  assert.equal(db.sqlite.prepare("SELECT COUNT(*) AS count FROM bids WHERE auction_id = ?").get(auction.id).count, 0);
+
+  const multilingualCreated = await requestJson(app, env, "/auctions", {
+    cookie: couple.cookie,
+    headers: { "idempotency-key": "auction-create-multilingual-0001" },
+    body: { ...genericAuctionBody, title: "A multilingual Jaipur photography brief" },
+  });
+  assert.equal(multilingualCreated.status, 201, await multilingualCreated.clone().text());
+  const multilingualAuction = (await multilingualCreated.json()).data;
+  const multilingualBidBody = {
+    amount: 325000,
+    currency: "INR",
+    proposal: "प".repeat(8000),
+    deliverables: Array.from({ length: 30 }, () => "प".repeat(200)),
+    exclusions: Array.from({ length: 30 }, () => "भ".repeat(200)),
+    gstIncluded: false,
+    gstRate: 18,
+    travelPolicy: "fixed_fee",
+    travelFee: 25000,
+    addOns: Array.from({ length: 20 }, (_, index) => ({
+      name: `विकल्प-${index}-`.padEnd(120, "प"),
+      amount: 10000,
+    })),
+    cancellationTerms: "क".repeat(3000),
+    deliveryPlan: "य".repeat(3000),
+    validUntil: new Date(Date.now() + 60 * 24 * 60 * 60 * 1000).toISOString().slice(0, 10),
+  };
+  const multilingualBidBytes = Buffer.byteLength(JSON.stringify(multilingualBidBody), "utf8");
+  assert.ok(multilingualBidBytes > 32 * 1024);
+  assert.ok(multilingualBidBytes < 256 * 1024);
+  const multilingualBid = await requestJson(app, env, `/auctions/${multilingualAuction.id}/bids`, {
+    cookie: vendorOne.cookie,
+    body: multilingualBidBody,
+  });
+  assert.equal(multilingualBid.status, 201, await multilingualBid.clone().text());
+  assert.equal((await multilingualBid.json()).data.structuredTermsProvided, true);
+
   const bidIds = [];
   for (const [index, vendor] of [vendorOne, vendorTwo].entries()) {
+    const normalizedTerms = index === 0
+      ? normalizedOfferTerms()
+      : normalizedOfferTerms({
+          exclusions: [],
+          gstIncluded: true,
+          travelPolicy: "included",
+          travelFee: undefined,
+          addOns: [],
+          cancellationTerms: "Cancellation is permitted under the signed schedule with notice-based milestone charges.",
+          deliveryPlan: "Edited photographs arrive within ten weeks, followed by the final wedding film within twelve weeks.",
+        });
     const bid = await requestJson(app, env, `/auctions/${auction.id}/bids`, {
       cookie: vendor.cookie,
       body: {
@@ -320,11 +491,31 @@ test("marketplace authorization and state transitions remain private, atomic, an
         currency: "INR",
         proposal: `A complete photography proposal number ${index + 1} with coverage, editing, delivery, and clear commercial terms.`,
         deliverables: ["Two photographers", "Edited photographs", "Wedding film"],
+        ...normalizedTerms,
         validUntil: new Date(Date.now() + 60 * 24 * 60 * 60 * 1000).toISOString().slice(0, 10),
       },
     });
     assert.equal(bid.status, 201, await bid.clone().text());
-    bidIds.push((await bid.json()).data.id);
+    const bidData = (await bid.json()).data;
+    assert.deepEqual(
+      {
+        exclusions: bidData.exclusions,
+        gstIncluded: bidData.gstIncluded,
+        gstRate: bidData.gstRate,
+        travelPolicy: bidData.travelPolicy,
+        travelFee: bidData.travelFee,
+        addOns: bidData.addOns,
+        cancellationTerms: bidData.cancellationTerms,
+        deliveryPlan: bidData.deliveryPlan,
+      },
+      {
+        ...normalizedTerms,
+        travelFee: normalizedTerms.travelFee || 0,
+      },
+    );
+    assert.equal(bidData.structuredTermsProvided, true);
+    assert.equal(db.sqlite.prepare("SELECT structured_terms_provided FROM bids WHERE id = ?").get(bidData.id).structured_terms_provided, 1);
+    bidIds.push(bidData.id);
   }
 
   assert.equal(
@@ -338,7 +529,17 @@ test("marketplace authorization and state transitions remain private, atomic, an
   assert.equal(sealedBids.status, 409);
   const sealedPayload = await sealedBids.json();
   assert.equal(sealedPayload.error.code, "bids_sealed");
-  assert.doesNotMatch(JSON.stringify(sealedPayload), /Vendor One|Vendor Two|275000|300000/);
+  assert.doesNotMatch(
+    JSON.stringify(sealedPayload),
+    /Vendor One|Vendor Two|275000|300000|Raw footage|Same-day edit|non-refundable|twelve weeks/,
+  );
+
+  const unrelatedSealedBids = await requestJson(app, env, `/auctions/${auction.id}/bids`, { cookie: otherCouple.cookie });
+  assert.equal(unrelatedSealedBids.status, 404);
+  assert.doesNotMatch(
+    await unrelatedSealedBids.text(),
+    /Raw footage|Same-day edit|non-refundable|twelve weeks/,
+  );
 
   const unrelatedClose = await requestJson(app, env, `/auctions/${auction.id}/status`, {
     method: "PATCH",
@@ -410,7 +611,26 @@ test("marketplace authorization and state transitions remain private, atomic, an
 
   const ownerBids = await requestJson(app, env, `/auctions/${auction.id}/bids`, { cookie: couple.cookie });
   assert.equal(ownerBids.status, 200);
-  assert.equal((await ownerBids.json()).data.length, 2);
+  const ownerBidData = (await ownerBids.json()).data;
+  assert.equal(ownerBidData.length, 2);
+  const fixedTravelOffer = ownerBidData.find((item) => item.travelPolicy === "fixed_fee");
+  assert.equal(fixedTravelOffer.structuredTermsProvided, true);
+  assert.deepEqual(fixedTravelOffer.exclusions, normalizedOfferTerms().exclusions);
+  assert.equal(fixedTravelOffer.gstIncluded, false);
+  assert.equal(fixedTravelOffer.gstRate, 18);
+  assert.equal(fixedTravelOffer.travelFee, 25000);
+  assert.deepEqual(fixedTravelOffer.addOns, normalizedOfferTerms().addOns);
+  assert.equal(fixedTravelOffer.cancellationTerms, normalizedOfferTerms().cancellationTerms);
+  assert.equal(fixedTravelOffer.deliveryPlan, normalizedOfferTerms().deliveryPlan);
+
+  const ownOfferHistory = await requestJson(app, env, "/bids/mine", { cookie: vendorOne.cookie });
+  assert.equal(ownOfferHistory.status, 200, await ownOfferHistory.clone().text());
+  const ownOffer = (await ownOfferHistory.json()).data.find((item) => item.id === bidIds[0]);
+  assert.deepEqual(ownOffer.exclusions, normalizedOfferTerms().exclusions);
+  assert.deepEqual(ownOffer.addOns, normalizedOfferTerms().addOns);
+  const otherVendorHistory = await requestJson(app, env, "/bids/mine", { cookie: vendorTwo.cookie });
+  assert.equal(otherVendorHistory.status, 200, await otherVendorHistory.clone().text());
+  assert.doesNotMatch(JSON.stringify((await otherVendorHistory.json()).data), /Raw footage|Same-day edit|Premium album/);
 
   const missingAcceptKey = await requestJson(app, env, `/auctions/${auction.id}/bids/${bidIds[0]}`, {
     method: "PATCH",
@@ -462,6 +682,7 @@ test("marketplace authorization and state transitions remain private, atomic, an
       currency: "INR",
       proposal: "A complete photography proposal for retry testing with coverage, editing, delivery, and clear terms.",
       deliverables: ["Two photographers", "Edited photographs"],
+      ...normalizedOfferTerms({ travelPolicy: "not_applicable", travelFee: 0, addOns: [] }),
     },
   });
   assert.equal(retriedBidResponse.status, 201, await retriedBidResponse.clone().text());
@@ -472,6 +693,20 @@ test("marketplace authorization and state transitions remain private, atomic, an
     body: { status: "closed" },
   });
   assert.equal(genericClosed.status, 200, await genericClosed.clone().text());
+  const genericOffers = await requestJson(app, env, `/auctions/${genericAuction.id}/bids`, { cookie: couple.cookie });
+  assert.equal(genericOffers.status, 200, await genericOffers.clone().text());
+  const legacyOffer = (await genericOffers.json()).data.find((item) => item.id === legacyBidId);
+  assert.ok(legacyOffer);
+  assert.equal(legacyOffer.structuredTermsProvided, false);
+  assert.deepEqual(legacyOffer.deliverables, ["Legacy photography coverage", "Legacy edited gallery"]);
+  assert.deepEqual(legacyOffer.exclusions, []);
+  assert.equal(legacyOffer.gstIncluded, false);
+  assert.equal(legacyOffer.gstRate, 0);
+  assert.equal(legacyOffer.travelPolicy, "not_applicable");
+  assert.equal(legacyOffer.travelFee, 0);
+  assert.deepEqual(legacyOffer.addOns, []);
+  assert.equal(legacyOffer.cancellationTerms, "");
+  assert.equal(legacyOffer.deliveryPlan, "");
 
   const retryAccept = () => requestJson(app, env, `/auctions/${genericAuction.id}/bids/${retriedBidId}`, {
     method: "PATCH",
@@ -653,6 +888,7 @@ test("preferred-vendor validation and moderation changes are atomic against sele
       currency: "INR",
       proposal: "A complete invited photography offer with two photographers, editing, delivery, and transparent commercial terms.",
       deliverables: ["Photography team", "Edited gallery"],
+      ...normalizedOfferTerms({ travelPolicy: "included", travelFee: undefined }),
     },
   });
   assert.equal(bid.status, 201, await bid.clone().text());

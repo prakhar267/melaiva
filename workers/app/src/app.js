@@ -9,6 +9,9 @@ const PASSWORD_ITERATIONS = 210_000;
 const CLIENT_PASSWORD_ITERATIONS = 310_000;
 const CLIENT_PASSWORD_SCHEME = "pbkdf2-sha256-v1";
 const MAX_JSON_BYTES = 32 * 1024;
+// A fully populated offer can contain roughly 28,400 user-entered characters. This
+// remains bounded while covering canonical JSON's worst-case escaping overhead.
+const MAX_BID_JSON_BYTES = 256 * 1024;
 const DEFAULT_CURRENCY = "INR";
 
 const encoder = new TextEncoder();
@@ -184,9 +187,89 @@ const bidSchema = z
     currency: inrSchema,
     proposal: z.string().trim().min(40).max(8_000),
     deliverables: z.array(z.string().trim().min(2).max(200)).min(1).max(30),
+    exclusions: z.array(z.string().trim().min(2).max(200)).max(30).optional(),
+    gstIncluded: z.boolean().optional(),
+    gstRate: z.number().int().min(0).max(28).optional(),
+    travelPolicy: z.enum(["included", "fixed_fee", "not_applicable"]).optional(),
+    travelFee: z.number().int().nonnegative().max(1_000_000_000).optional(),
+    addOns: z
+      .array(
+        z
+          .object({
+            name: z.string().trim().min(2).max(120),
+            amount: z.number().int().positive().max(1_000_000_000),
+          })
+          .strict(),
+      )
+      .max(20)
+      .optional(),
+    cancellationTerms: z.string().trim().min(20).max(3_000).optional(),
+    deliveryPlan: z.string().trim().min(20).max(3_000).optional(),
     validUntil: z.string().date().optional(),
   })
-  .strict();
+  .strict()
+  .superRefine((value, context) => {
+    const normalizedFieldNames = [
+      "exclusions",
+      "gstIncluded",
+      "gstRate",
+      "travelPolicy",
+      "addOns",
+      "cancellationTerms",
+      "deliveryPlan",
+    ];
+    const providedNormalizedFields = normalizedFieldNames.filter((field) => value[field] !== undefined);
+    if (providedNormalizedFields.length > 0 && providedNormalizedFields.length !== normalizedFieldNames.length) {
+      for (const field of normalizedFieldNames) {
+        if (value[field] === undefined) {
+          context.addIssue({
+            code: "custom",
+            path: [field],
+            message: "Provide every normalized commercial term or omit all of them for a legacy v1 offer",
+          });
+        }
+      }
+      return;
+    }
+    const structuredTermsProvided = providedNormalizedFields.length === normalizedFieldNames.length;
+    if (!structuredTermsProvided) {
+      if (value.travelFee !== undefined) {
+        context.addIssue({
+          code: "custom",
+          path: ["travelFee"],
+          message: "travelFee requires the complete normalized commercial-terms contract",
+        });
+      }
+      return;
+    }
+    if (value.travelPolicy === "fixed_fee" && (!value.travelFee || value.travelFee <= 0)) {
+      context.addIssue({
+        code: "custom",
+        path: ["travelFee"],
+        message: "A positive travelFee is required when travelPolicy is fixed_fee",
+      });
+    }
+    if (value.travelPolicy !== "fixed_fee" && value.travelFee !== undefined && value.travelFee !== 0) {
+      context.addIssue({
+        code: "custom",
+        path: ["travelFee"],
+        message: "travelFee must be omitted or zero unless travelPolicy is fixed_fee",
+      });
+    }
+    const addOnNames = new Set();
+    let addOnTotal = 0;
+    for (const [index, addOn] of value.addOns.entries()) {
+      const normalizedName = addOn.name.toLowerCase();
+      if (addOnNames.has(normalizedName)) {
+        context.addIssue({ code: "custom", path: ["addOns", index, "name"], message: "Add-on names must be unique" });
+      }
+      addOnNames.add(normalizedName);
+      addOnTotal += addOn.amount;
+    }
+    if (!Number.isSafeInteger(addOnTotal) || addOnTotal > 1_000_000_000) {
+      context.addIssue({ code: "custom", path: ["addOns"], message: "Combined add-on amount is too large" });
+    }
+  });
 
 const bidDecisionSchema = z
   .object({ action: z.enum(["shortlist", "reject", "accept"]) })
@@ -992,6 +1075,15 @@ function mapBid(row) {
     currency: row.currency,
     proposal: row.proposal,
     deliverables: safeJsonArray(row.deliverables_json),
+    exclusions: safeJsonArray(row.exclusions_json),
+    gstIncluded: Boolean(row.gst_included),
+    gstRate: Number(row.gst_rate || 0),
+    travelPolicy: row.travel_policy || "not_applicable",
+    travelFee: Number(row.travel_fee || 0),
+    addOns: safeJsonArray(row.add_ons_json),
+    cancellationTerms: row.cancellation_terms || "",
+    deliveryPlan: row.delivery_plan || "",
+    structuredTermsProvided: Boolean(row.structured_terms_provided),
     validUntil: row.valid_until || null,
     status: row.status,
     createdAt: row.created_at,
@@ -1934,7 +2026,7 @@ function buildApp() {
       throw new ApiError(403, "role_not_allowed", "Only approved vendors can submit proposals");
     }
     await enforceRateLimit(c, `bid-submit:${user.id}`, 30, 60 * 60);
-    const input = await parseJson(c, bidSchema);
+    const input = await parseJson(c, bidSchema, MAX_BID_JSON_BYTES);
     const db = requireDatabase(c.env);
     const vendor = await approvedVendorForUser(db, user);
     if (!vendor || vendor.status !== "approved") {
@@ -1954,17 +2046,32 @@ function buildApp() {
     }
     if (auction.couple_user_id === user.id) throw new ApiError(403, "self_bid_not_allowed", "You cannot bid on your own request");
     if (input.currency !== auction.currency) throw new ApiError(422, "currency_mismatch", `Bid currency must be ${auction.currency}`);
-    if (input.validUntil && new Date(`${input.validUntil}T23:59:59Z`).getTime() < Date.now()) {
-      throw new ApiError(422, "invalid_valid_until", "Proposal validity must end in the future");
+    if (
+      input.validUntil
+      && new Date(`${input.validUntil}T23:59:59.999Z`).getTime() <= new Date(auction.bidding_ends_at).getTime()
+    ) {
+      throw new ApiError(422, "invalid_valid_until", "Proposal validity must end after bidding closes");
     }
+    const structuredTermsProvided = input.exclusions !== undefined;
+    const exclusions = input.exclusions || [];
+    const gstIncluded = input.gstIncluded ?? false;
+    const gstRate = input.gstRate ?? 0;
+    const travelPolicy = input.travelPolicy || "not_applicable";
+    const travelFee = input.travelFee ?? 0;
+    const addOns = input.addOns || [];
+    const cancellationTerms = input.cancellationTerms || "";
+    const deliveryPlan = input.deliveryPlan || "";
     const id = crypto.randomUUID();
     let results;
     try {
       results = await db.batch([
         db
           .prepare(
-            `INSERT INTO bids (id, auction_id, vendor_id, amount, currency, proposal, deliverables_json, valid_until, status)
-             SELECT ?, a.id, ?, ?, ?, ?, ?, ?, 'submitted'
+            `INSERT INTO bids
+             (id, auction_id, vendor_id, amount, currency, proposal, deliverables_json, exclusions_json,
+              gst_included, gst_rate, travel_policy, travel_fee, add_ons_json, cancellation_terms,
+              delivery_plan, structured_terms_provided, valid_until, status)
+             SELECT ?, a.id, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'submitted'
              FROM auctions a
              WHERE a.id = ? AND a.status = 'open' AND a.bidding_ends_at > ?
                AND ${VENDOR_AUCTION_MATCH_SQL}`,
@@ -1976,6 +2083,15 @@ function buildApp() {
             input.currency,
             input.proposal,
             JSON.stringify(input.deliverables),
+            JSON.stringify(exclusions),
+            gstIncluded ? 1 : 0,
+            gstRate,
+            travelPolicy,
+            travelFee,
+            JSON.stringify(addOns),
+            cancellationTerms,
+            deliveryPlan,
+            structuredTermsProvided ? 1 : 0,
             input.validUntil || null,
             auction.id,
             new Date().toISOString(),
@@ -2009,6 +2125,15 @@ function buildApp() {
           currency: input.currency,
           proposal: input.proposal,
           deliverables: input.deliverables,
+          exclusions,
+          gstIncluded,
+          gstRate,
+          travelPolicy,
+          travelFee,
+          addOns,
+          cancellationTerms,
+          deliveryPlan,
+          structuredTermsProvided,
           validUntil: input.validUntil || null,
           status: "submitted",
         },

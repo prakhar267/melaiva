@@ -19,6 +19,7 @@ import {
   LockKeyhole,
   MapPin,
   MessageSquareText,
+  Plus,
   RefreshCw,
   Send,
   ShieldCheck,
@@ -61,6 +62,7 @@ function toOpportunity(auction) {
     guests: auction.guestCount,
     budget: `${formatCurrency(auction.budgetMin)}–${formatCurrency(auction.budgetMax)}`,
     closes: closingLabel(auction.biddingEndsAt),
+    biddingEndsAt: auction.biddingEndsAt,
     notes: auction.requirements,
     directInvite: Boolean(auction.directInvite),
     directInviteStatus: auction.directInviteStatus || null,
@@ -72,6 +74,14 @@ function directInviteLabel(status) {
   if (status === "responded") return "Direct invite · offer sent";
   if (status === "unavailable") return "Direct invite unavailable";
   return "Direct invitation";
+}
+
+function createAddOn() {
+  return {
+    id: globalThis.crypto?.randomUUID?.() || `add-on-${Date.now()}-${Math.random().toString(36).slice(2)}`,
+    name: "",
+    amount: "",
+  };
 }
 
 function VendorWorkspaceNav({ active, setActive, opportunityCount, offerCount }) {
@@ -93,19 +103,57 @@ function VendorWorkspaceNav({ active, setActive, opportunityCount, offerCount })
 }
 
 function BidForm({ opportunity, onClose, notify, onOpenAuth, onSubmitted }) {
-  const [form, setForm] = useState({ amount: "185000", proposal: "", deliverables: "", validUntil: "" });
+  const [form, setForm] = useState({
+    amount: "185000",
+    proposal: "",
+    deliverables: "",
+    exclusions: "",
+    noExclusions: false,
+    gstTreatment: "included",
+    gstRate: "18",
+    travelPolicy: "included",
+    travelFee: "",
+    addOns: [],
+    cancellationTerms: "",
+    deliveryPlan: "",
+    validUntil: "",
+  });
   const [error, setError] = useState("");
   const [loading, setLoading] = useState(false);
   const [saved, setSaved] = useState(false);
   function update(key, value) { setForm((current) => ({ ...current, [key]: value })); setError(""); }
+  function addAddOn() { setForm((current) => ({ ...current, addOns: [...current.addOns, createAddOn()] })); setError(""); }
+  function updateAddOn(id, key, value) { setForm((current) => ({ ...current, addOns: current.addOns.map((item) => item.id === id ? { ...item, [key]: value } : item) })); setError(""); }
+  function removeAddOn(id) { setForm((current) => ({ ...current, addOns: current.addOns.filter((item) => item.id !== id) })); setError(""); }
 
   async function submit(event) {
     event.preventDefault();
     const deliverables = form.deliverables.split("\n").map((item) => item.trim()).filter(Boolean);
-    if (Number(form.amount) < 10000) return setError("Enter a realistic offer amount of at least ₹10,000.");
+    const exclusions = form.noExclusions ? [] : form.exclusions.split("\n").map((item) => item.trim()).filter(Boolean);
+    const amount = Number(form.amount);
+    const gstRate = Number(form.gstRate);
+    const addOns = form.addOns
+      .filter((item) => item.name.trim() || item.amount !== "")
+      .map((item) => ({ name: item.name.trim(), amount: Number(item.amount) }));
+    const travelFee = form.travelPolicy === "fixed_fee" ? Number(form.travelFee) : undefined;
+    if (!Number.isInteger(amount) || amount < 10000 || amount > 1_000_000_000) return setError("Enter a whole-rupee offer amount from ₹10,000 to ₹1,00,00,00,000.");
     if (form.proposal.trim().length < 40) return setError("Explain your approach in at least 40 characters.");
     if (!deliverables.length || deliverables.some((item) => item.length < 2)) return setError("Add at least one clear deliverable, one per line.");
-    if (form.validUntil && new Date(`${form.validUntil}T23:59:59`).getTime() < Date.now()) return setError("Choose a future validity date.");
+    if (deliverables.length > 30 || deliverables.some((item) => item.length > 200)) return setError("Use no more than 30 inclusions, with up to 200 characters per line.");
+    if (!form.noExclusions && (!exclusions.length || exclusions.some((item) => item.length < 2))) return setError("State at least one exclusion or confirm that there are no exclusions.");
+    if (exclusions.length > 30 || exclusions.some((item) => item.length > 200)) return setError("Use no more than 30 exclusions, with up to 200 characters per line.");
+    if (form.gstRate.trim() === "" || !Number.isInteger(gstRate) || gstRate < 0 || gstRate > 28) return setError("Enter a GST rate from 0% to 28%. Use 0% when GST does not apply.");
+    if (form.travelPolicy === "fixed_fee" && (!Number.isInteger(travelFee) || travelFee <= 0 || travelFee > 1_000_000_000)) return setError("Enter a positive whole-rupee travel fee up to ₹1,00,00,00,000.");
+    if (addOns.some((item) => item.name.length < 2 || !Number.isInteger(item.amount) || item.amount <= 0 || item.amount > 1_000_000_000)) return setError("Complete each add-on with a clear name and positive whole-rupee price, or remove the row.");
+    if (new Set(addOns.map((item) => item.name.toLowerCase())).size !== addOns.length) return setError("Give every add-on a unique name.");
+    if (addOns.reduce((sum, item) => sum + item.amount, 0) > 1_000_000_000) return setError("Keep the combined add-on value at or below ₹1,00,00,00,000.");
+    if (form.cancellationTerms.trim().length < 20) return setError("Explain the cancellation terms in at least 20 characters.");
+    if (form.deliveryPlan.trim().length < 20) return setError("Explain the delivery plan in at least 20 characters.");
+    if (form.validUntil) {
+      const validityTimestamp = new Date(`${form.validUntil}T23:59:59`).getTime();
+      if (validityTimestamp < Date.now()) return setError("Choose a future validity date.");
+      if (opportunity.biddingEndsAt && validityTimestamp <= new Date(opportunity.biddingEndsAt).getTime()) return setError("Choose a validity date after the offer window closes.");
+    }
 
     if (opportunity.demo) {
       setSaved(true);
@@ -120,10 +168,18 @@ function BidForm({ opportunity, onClose, notify, onOpenAuth, onSubmitted }) {
         headers: { "Content-Type": "application/json" },
         credentials: "include",
         body: JSON.stringify({
-          amount: Number(form.amount),
+          amount,
           currency: "INR",
           proposal: form.proposal.trim(),
           deliverables,
+          exclusions,
+          gstIncluded: form.gstTreatment === "included",
+          gstRate,
+          travelPolicy: form.travelPolicy,
+          ...(travelFee ? { travelFee } : {}),
+          addOns,
+          cancellationTerms: form.cancellationTerms.trim(),
+          deliveryPlan: form.deliveryPlan.trim(),
           validUntil: form.validUntil || undefined,
         }),
       });
@@ -131,7 +187,7 @@ function BidForm({ opportunity, onClose, notify, onOpenAuth, onSubmitted }) {
       await readApiResponse(response, "The offer could not be sent.");
       setSaved(true);
       onSubmitted?.();
-      notify({ title: "Offer sent", message: "The couple can now review the complete proposal in their planning space." });
+      notify({ title: "Offer sent", message: "The proposal stays sealed until the offer window closes, then the couple can compare it privately." });
     } catch (requestError) {
       if (requestError.code === "SIGN_IN") setError(requestError.message);
       else if (isServiceUnavailable(requestError)) setError("The live service is unavailable. Your form is still open and nothing was submitted.");
@@ -146,9 +202,31 @@ function BidForm({ opportunity, onClose, notify, onOpenAuth, onSubmitted }) {
     <form className="bid-form" onSubmit={submit} noValidate>
       <div className="bid-form__top"><div><div className="eyebrow">{opportunity.demo ? "Example offer preview" : `Offer for ${opportunity.reference}`}</div><h3>Build a clear, complete offer</h3></div><button className="icon-button icon-button--small" onClick={onClose} type="button" aria-label="Close offer form"><X size={18} /></button></div>
       {opportunity.demo && <div className="demo-catalog-note"><Sparkles size={15} /><p><strong>Preview only</strong> Completing this form will never call the live bidding API.</p></div>}
-      <div className="form-grid"><label className="field"><span>Total offer</span><div className="input-wrap"><IndianRupee size={16} /><input value={form.amount} type="number" min="10000" step="5000" onChange={(event) => update("amount", event.target.value)} required /></div><small className="field-hint">{formatCurrency(Number(form.amount || 0))}</small></label><label className="field"><span>Valid until <small>Optional</small></span><input type="date" min={new Date().toISOString().slice(0, 10)} value={form.validUntil} onChange={(event) => update("validUntil", event.target.value)} /></label></div>
-      <label className="field"><span>Your approach</span><textarea rows="4" minLength="40" value={form.proposal} onChange={(event) => update("proposal", event.target.value)} placeholder="Explain why your team and approach fit this celebration…" required /></label>
-      <label className="field"><span>Deliverables <small>One per line</small></span><textarea rows="4" value={form.deliverables} onChange={(event) => update("deliverables", event.target.value)} placeholder={"Two lead photographers\n10-minute film\nPrivate online gallery"} required /></label>
+      <section className="bid-form__section" aria-labelledby={`offer-scope-${opportunity.id}`}>
+        <div className="bid-form__section-heading"><span>01</span><div><h4 id={`offer-scope-${opportunity.id}`}>Scope and quoted amount</h4><p>Separate what is included from what the couple still needs to arrange.</p></div></div>
+        <div className="form-grid"><label className="field"><span>Quoted amount</span><div className="input-wrap"><IndianRupee size={16} /><input value={form.amount} type="number" min="10000" max="1000000000" step="1000" onChange={(event) => update("amount", event.target.value)} required /></div><small className="field-hint">{formatCurrency(Number(form.amount || 0))}, before any additional GST, travel or add-ons stated below.</small></label><label className="field"><span>Valid until <small>Optional</small></span><input type="date" min={new Date().toISOString().slice(0, 10)} value={form.validUntil} onChange={(event) => update("validUntil", event.target.value)} /><small className="field-hint">Leave blank only when the quote has no stated expiry.</small></label></div>
+        <label className="field"><span>Your approach</span><textarea rows="4" minLength="40" maxLength="8000" value={form.proposal} onChange={(event) => update("proposal", event.target.value)} placeholder="Explain why your team and approach fit this celebration…" required /></label>
+        <div className="form-grid"><label className="field"><span>Inclusions <small>One per line</small></span><textarea rows="5" value={form.deliverables} onChange={(event) => update("deliverables", event.target.value)} placeholder={"Two lead photographers\n10-minute film\nPrivate online gallery"} required /></label><div className="field"><span id={`offer-exclusions-${opportunity.id}`}>Exclusions <small>One per line</small></span><textarea rows="5" aria-labelledby={`offer-exclusions-${opportunity.id}`} value={form.exclusions} onChange={(event) => update("exclusions", event.target.value)} placeholder={"Travel outside Delhi NCR\nPhysical album"} disabled={form.noExclusions} required={!form.noExclusions} /><label className="bid-inline-check"><input type="checkbox" checked={form.noExclusions} onChange={(event) => update("noExclusions", event.target.checked)} /><span><Check size={13} /></span><strong>No exclusions beyond the inclusions listed</strong></label></div></div>
+      </section>
+
+      <section className="bid-form__section" aria-labelledby={`offer-costs-${opportunity.id}`}>
+        <div className="bid-form__section-heading"><span>02</span><div><h4 id={`offer-costs-${opportunity.id}`}>Taxes, travel and add-ons</h4><p>Make every possible addition to the quoted amount visible now.</p></div></div>
+        <div className="form-grid">
+          <label className="field"><span>GST treatment</span><div className="input-wrap input-wrap--select"><select value={form.gstTreatment} onChange={(event) => update("gstTreatment", event.target.value)}><option value="included">Included in quoted amount</option><option value="excluded">Added to quoted amount</option></select><ChevronDown size={15} /></div></label>
+          <label className="field"><span>GST rate</span><div className="input-wrap"><input type="number" min="0" max="28" step="1" value={form.gstRate} onChange={(event) => update("gstRate", event.target.value)} required /><span className="input-suffix">%</span></div><small className="field-hint">Use 0% when GST does not apply.</small></label>
+          <label className="field"><span>Travel policy</span><div className="input-wrap input-wrap--select"><select value={form.travelPolicy} onChange={(event) => update("travelPolicy", event.target.value)}><option value="included">Included in quoted amount</option><option value="fixed_fee">Additional fixed fee</option><option value="not_applicable">Not applicable</option></select><ChevronDown size={15} /></div></label>
+          {form.travelPolicy === "fixed_fee" ? <label className="field"><span>Fixed travel fee</span><div className="input-wrap"><IndianRupee size={16} /><input type="number" min="1" max="1000000000" step="1000" value={form.travelFee} onChange={(event) => update("travelFee", event.target.value)} required /></div></label> : <div className="bid-form__policy-note"><ShieldCheck size={16} /><span>{form.travelPolicy === "included" ? "Travel is covered by the quoted amount." : "No travel charge applies to this offer."}</span></div>}
+        </div>
+        <div className="bid-add-ons">
+          <div className="bid-add-ons__heading"><div><strong>Optional priced add-ons</strong><small>Only list extras the couple may choose later.</small></div><button className="text-button" type="button" onClick={addAddOn} disabled={form.addOns.length >= 20}><Plus size={14} /> {form.addOns.length >= 20 ? "20 item limit" : "Add item"}</button></div>
+          {form.addOns.length ? <div className="bid-add-ons__list">{form.addOns.map((item) => <div className="bid-add-on" key={item.id}><label className="field"><span>Add-on name</span><input value={item.name} maxLength="120" onChange={(event) => updateAddOn(item.id, "name", event.target.value)} placeholder="Premium printed album" /></label><label className="field"><span>Price</span><div className="input-wrap"><IndianRupee size={16} /><input type="number" min="1" max="1000000000" step="500" value={item.amount} onChange={(event) => updateAddOn(item.id, "amount", event.target.value)} /></div></label><button className="icon-button icon-button--small" type="button" onClick={() => removeAddOn(item.id)} aria-label={`Remove ${item.name || "add-on"}`}><X size={16} /></button></div>)}</div> : <p className="bid-add-ons__empty">No optional add-ons added. The quoted scope remains the complete offer.</p>}
+        </div>
+      </section>
+
+      <section className="bid-form__section" aria-labelledby={`offer-terms-${opportunity.id}`}>
+        <div className="bid-form__section-heading"><span>03</span><div><h4 id={`offer-terms-${opportunity.id}`}>Delivery and cancellation</h4><p>Give the couple enough detail to compare timing and risk, not only price.</p></div></div>
+        <div className="form-grid"><label className="field"><span>Delivery plan</span><textarea rows="5" minLength="20" maxLength="3000" value={form.deliveryPlan} onChange={(event) => update("deliveryPlan", event.target.value)} placeholder="Share the key stages, handoffs and final delivery timing…" required /></label><label className="field"><span>Cancellation terms</span><textarea rows="5" minLength="20" maxLength="3000" value={form.cancellationTerms} onChange={(event) => update("cancellationTerms", event.target.value)} placeholder="Explain cancellation windows, retained amounts and rescheduling treatment…" required /></label></div>
+      </section>
       {error && <p className="form-error" role="alert">{error}</p>}
       <div className="bid-form__actions"><p><ShieldCheck size={15} /> {opportunity.demo ? "Preview data stays in this page." : "Your offer stays sealed."}</p><button className="button button--primary" disabled={loading} type="submit">{loading ? <span className="button-loader" aria-hidden="true" /> : <Send size={16} />}{loading ? "Sending…" : opportunity.demo ? "Complete example" : "Send sealed offer"}</button></div>
     </form>

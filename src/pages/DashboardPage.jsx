@@ -61,6 +61,37 @@ function preferredVendorStatusLabel(status) {
   return "Preferred partner";
 }
 
+function hasStructuredTerms(bid) {
+  if (bid?.structuredTermsProvided === false) return false;
+  return typeof bid?.cancellationTerms === "string" && bid.cancellationTerms.trim().length > 0
+    && typeof bid?.deliveryPlan === "string" && bid.deliveryPlan.trim().length > 0
+    && typeof bid?.gstIncluded === "boolean"
+    && Number.isInteger(Number(bid?.gstRate))
+    && ["included", "fixed_fee", "not_applicable"].includes(bid?.travelPolicy);
+}
+
+function gstSummary(bid) {
+  if (!hasStructuredTerms(bid)) return "Not provided";
+  const rate = Number(bid.gstRate);
+  if (rate === 0) return "Not applicable (0%)";
+  return `${rate}% GST ${bid.gstIncluded ? "included" : "additional"}`;
+}
+
+function travelSummary(bid) {
+  if (!hasStructuredTerms(bid)) return "Not provided";
+  if (bid.travelPolicy === "included") return "Included in quoted amount";
+  if (bid.travelPolicy === "not_applicable") return "Not applicable";
+  return Number.isInteger(Number(bid.travelFee)) && Number(bid.travelFee) > 0
+    ? `${formatCurrency(bid.travelFee)} fixed fee`
+    : "Fixed fee not provided";
+}
+
+function OfferTermList({ items, emptyLabel = "Not provided", tone = "included", formatItem = (item) => item }) {
+  if (!Array.isArray(items)) return <p className="offer-term-empty">{emptyLabel}</p>;
+  if (!items.length) return <p className="offer-term-empty">{tone === "excluded" ? "No exclusions declared" : emptyLabel}</p>;
+  return <ul className={`offer-term-list offer-term-list--${tone}`}>{items.map((item, index) => <li key={`${typeof item === "string" ? item : item?.name || "item"}-${index}`}>{tone === "excluded" ? <CircleAlert size={13} /> : <Check size={13} />}<span>{formatItem(item)}</span></li>)}</ul>;
+}
+
 function PreferredVendorSummary({ vendor }) {
   if (!vendor) return null;
   const businessName = vendor.businessName || "Preferred partner";
@@ -250,7 +281,10 @@ function CloseOfferWindowDialog({ auction, open, closing, onClose, onConfirm }) 
       }
       const first = focusable[0];
       const last = focusable[focusable.length - 1];
-      if (event.shiftKey && document.activeElement === first) {
+      if (document.activeElement === dialogRef.current) {
+        event.preventDefault();
+        (event.shiftKey ? last : first).focus();
+      } else if (event.shiftKey && document.activeElement === first) {
         event.preventDefault();
         last.focus();
       } else if (!event.shiftKey && document.activeElement === last) {
@@ -296,7 +330,101 @@ function CloseOfferWindowDialog({ auction, open, closing, onClose, onConfirm }) 
   );
 }
 
-function LiveOffers({ auction, bids, loading, error, decidingId, closing, onDecision, onRequestClose }) {
+function AwardOfferDialog({ auction, bid, open, busy, onClose, onConfirm }) {
+  const dialogRef = useRef(null);
+  const onCloseRef = useRef(onClose);
+  const busyRef = useRef(busy);
+  const titleId = useId();
+  const descriptionId = useId();
+  const [acknowledged, setAcknowledged] = useState(false);
+
+  useEffect(() => {
+    onCloseRef.current = onClose;
+    busyRef.current = busy;
+    if (busy) dialogRef.current?.focus();
+  }, [busy, onClose]);
+
+  useEffect(() => {
+    if (!open) return undefined;
+    setAcknowledged(false);
+    const previous = document.activeElement;
+    document.body.classList.add("modal-open");
+    const timer = window.setTimeout(() => {
+      dialogRef.current?.focus({ preventScroll: true });
+      if (dialogRef.current) dialogRef.current.scrollTop = 0;
+    }, 30);
+    function onKeyDown(event) {
+      if (event.key === "Escape" && !busyRef.current) onCloseRef.current();
+      if (event.key !== "Tab") return;
+      const focusable = dialogRef.current?.querySelectorAll(
+        'button:not([disabled]), input:not([disabled]), a[href], [tabindex]:not([tabindex="-1"])',
+      );
+      if (!focusable?.length) {
+        event.preventDefault();
+        dialogRef.current?.focus();
+        return;
+      }
+      const first = focusable[0];
+      const last = focusable[focusable.length - 1];
+      if (document.activeElement === dialogRef.current) {
+        event.preventDefault();
+        (event.shiftKey ? last : first).focus();
+      } else if (event.shiftKey && document.activeElement === first) {
+        event.preventDefault();
+        last.focus();
+      } else if (!event.shiftKey && document.activeElement === last) {
+        event.preventDefault();
+        first.focus();
+      }
+    }
+    window.addEventListener("keydown", onKeyDown);
+    return () => {
+      window.clearTimeout(timer);
+      window.removeEventListener("keydown", onKeyDown);
+      document.body.classList.remove("modal-open");
+      if (previous?.isConnected) previous.focus?.();
+      else (document.querySelector('[data-offers-focus-target="true"]') || document.getElementById("main-content"))?.focus?.();
+    };
+  }, [bid?.id, open]);
+
+  if (!open || !auction || !bid) return null;
+  const businessName = bid.vendor?.businessName || "Approved partner";
+  const structured = hasStructuredTerms(bid);
+  const exclusions = structured && Array.isArray(bid.exclusions) ? bid.exclusions : null;
+  const addOns = structured && Array.isArray(bid.addOns) ? bid.addOns : null;
+  return (
+    <div className="modal-backdrop" onMouseDown={(event) => event.target === event.currentTarget && !busy && onClose()}>
+      <section className="modal-card award-offer-dialog" role="dialog" aria-modal="true" aria-labelledby={titleId} aria-describedby={descriptionId} ref={dialogRef} tabIndex="-1">
+        <button className="icon-button modal-card__close" type="button" onClick={onClose} disabled={busy} aria-label="Keep comparing offers"><X size={20} /></button>
+        <span className="award-offer-dialog__icon"><ShieldCheck size={26} /></span>
+        <div className="eyebrow">Final award decision</div>
+        <h2 id={titleId}>Award this request to {businessName}?</h2>
+        <p id={descriptionId}>Review the quoted amount and commercial terms once more. Awarding closes every other open offer and cannot be undone.</p>
+        {!structured && <div className="offer-legacy-note offer-legacy-note--dialog"><CircleAlert size={17} /><span>This legacy offer does not contain every normalized commercial term. Missing details are shown as “Not provided.”</span></div>}
+        <dl className="award-offer-dialog__summary">
+          <div><dt>Quoted amount</dt><dd>{formatCurrency(bid.amount)}</dd></div>
+          <div><dt>GST</dt><dd>{gstSummary(bid)}</dd></div>
+          <div><dt>Travel</dt><dd>{travelSummary(bid)}</dd></div>
+          <div><dt>Valid until</dt><dd>{bid.validUntil ? formatDate(bid.validUntil) : "Not provided"}</dd></div>
+        </dl>
+        <div className="award-offer-dialog__exclusions"><strong>Exclusions to review</strong><OfferTermList items={exclusions} tone="excluded" emptyLabel="Not provided" /></div>
+        <div className="award-offer-dialog__details">
+          <section><strong>Priced add-ons</strong><OfferTermList items={addOns} emptyLabel={structured ? "No priced add-ons" : "Not provided"} formatItem={(item) => `${item?.name || "Unnamed add-on"} · ${Number.isFinite(Number(item?.amount)) ? formatCurrency(item.amount) : "Price not provided"}`} /></section>
+          <section><strong>Delivery plan</strong><p>{structured ? bid.deliveryPlan : "Not provided"}</p></section>
+          <section><strong>Cancellation terms</strong><p>{structured ? bid.cancellationTerms : "Not provided"}</p></section>
+        </div>
+        <div className="award-offer-dialog__warning"><CircleAlert size={17} /><span>This action awards the request, rejects the remaining open offers and cannot be reversed.</span></div>
+        <label className="award-offer-dialog__acknowledgement"><input type="checkbox" checked={acknowledged} onChange={(event) => setAcknowledged(event.target.checked)} disabled={busy} /><span><Check size={14} /></span><strong>I have reviewed the quoted amount, additions, exclusions and validity.</strong></label>
+        <div className="award-offer-dialog__actions">
+          <button className="button button--outline" type="button" onClick={onClose} disabled={busy}>Keep comparing</button>
+          <button className="button button--primary" type="button" onClick={onConfirm} disabled={busy || !acknowledged}>{busy ? <span className="button-loader" aria-hidden="true" /> : <ShieldCheck size={17} />}{busy ? "Awarding securely…" : "Confirm award"}</button>
+        </div>
+      </section>
+    </div>
+  );
+}
+
+function LiveOffers({ auction, bids, loading, error, decidingId, closing, onDecision, onRequestClose, onRequestAward }) {
   if (!auction) return null;
   return (
     <div className="live-offers-focus" role="region" aria-label={`Offers for ${auction.title}`} aria-busy={loading} data-offers-focus-target="true" tabIndex="-1">
@@ -310,21 +438,37 @@ function LiveOffers({ auction, bids, loading, error, decidingId, closing, onDeci
         <div className="dashboard-card dashboard-empty dashboard-empty--compact"><span><FileText size={27} /></span><h2>No offers were received</h2><p>This request closed without a proposal. Create a revised brief or contact Melaiva support before making a vendor decision.</p><Link className="button button--primary" to="/request">Create a new brief</Link></div>
       ) : (
         <section className="dashboard-card live-offers-card">
-          <div className="dashboard-card__heading"><div><span className="card-icon card-icon--marigold"><FileText size={18} /></span><div><h2>Offers for {auction.title}</h2><p>{bids.length} complete proposal{bids.length === 1 ? "" : "s"}</p></div></div><span className="trust-note"><LockKeyhole size={14} /> Private comparison</span></div>
+          <div className="dashboard-card__heading"><div><span className="card-icon card-icon--marigold"><FileText size={18} /></span><div><h2>Offers for {auction.title}</h2><p>{bids.length} proposal{bids.length === 1 ? "" : "s"} received</p></div></div><span className="trust-note"><LockKeyhole size={14} /> Private comparison</span></div>
           <div className="live-offer-list">
             {bids.map((bid) => {
               const businessName = bid.vendor?.businessName || "Approved partner";
               const busy = decidingId === `${auction.id}:${bid.id}`;
+              const structured = hasStructuredTerms(bid);
+              const exclusions = structured && Array.isArray(bid.exclusions) ? bid.exclusions : null;
+              const addOns = structured && Array.isArray(bid.addOns) ? bid.addOns : null;
               return (
                 <article className="live-offer" key={bid.id}>
-                  <div className="live-offer__top"><span className="offer-logo">{businessName.split(" ").map((word) => word[0]).join("").slice(0, 2)}</span><div><strong>{businessName}</strong><small>{bid.vendor?.verified ? "Melaiva verified" : "Partner proposal"}</small></div><div><small>Total offer</small><strong>{formatCurrency(bid.amount)}</strong></div><span className={`status-pill status-pill--${bid.status === "accepted" ? "teal" : "neutral"}`}><span /> {bid.status}</span></div>
-                  <p>{bid.proposal}</p>
-                  <ul>{bid.deliverables.map((item) => <li key={item}><Check size={14} /> {item}</li>)}</ul>
-                  {bid.validUntil && <small className="live-offer__validity">Valid until {formatDate(bid.validUntil)}</small>}
+                  <div className="live-offer__top"><span className="offer-logo">{businessName.split(" ").map((word) => word[0]).join("").slice(0, 2)}</span><div><strong>{businessName}</strong><small>{bid.vendor?.verified ? "Melaiva verified" : "Partner proposal"}</small></div><div><small>Quoted amount</small><strong>{formatCurrency(bid.amount)}</strong></div><span className={`status-pill status-pill--${bid.status === "accepted" ? "teal" : "neutral"}`}><span /> {bid.status}</span></div>
+                  <p className="live-offer__proposal">{bid.proposal}</p>
+                  {!structured && <div className="offer-legacy-note"><CircleAlert size={16} /><span>Legacy offer · normalized commercial terms were not collected. Missing details are marked “Not provided.”</span></div>}
+                  <div className="live-offer__scope-grid">
+                    <section className="offer-term-card"><h3>Inclusions</h3><OfferTermList items={Array.isArray(bid.deliverables) ? bid.deliverables : null} /></section>
+                    <section className="offer-term-card"><h3>Exclusions</h3><OfferTermList items={exclusions} tone="excluded" /></section>
+                  </div>
+                  <dl className="live-offer__commercial-grid">
+                    <div><dt>GST</dt><dd>{gstSummary(bid)}</dd></div>
+                    <div><dt>Travel</dt><dd>{travelSummary(bid)}</dd></div>
+                    <div><dt>Validity</dt><dd>{bid.validUntil ? formatDate(bid.validUntil) : "Not provided"}</dd></div>
+                  </dl>
+                  <div className="live-offer__terms-grid">
+                    <section className="offer-term-card"><h3>Priced add-ons</h3><OfferTermList items={addOns} emptyLabel={structured ? "No priced add-ons" : "Not provided"} formatItem={(item) => `${item?.name || "Unnamed add-on"} · ${Number.isFinite(Number(item?.amount)) ? formatCurrency(item.amount) : "Price not provided"}`} /></section>
+                    <section className="offer-term-card"><h3>Delivery plan</h3><p>{structured ? bid.deliveryPlan : "Not provided"}</p></section>
+                    <section className="offer-term-card"><h3>Cancellation terms</h3><p>{structured ? bid.cancellationTerms : "Not provided"}</p></section>
+                  </div>
                   {auction.status === "closed" && ["submitted", "shortlisted"].includes(bid.status) && (
                     <div className="live-offer__actions">
                       <button className="button button--small button--outline" type="button" disabled={busy} onClick={() => onDecision(bid.id, bid.status === "shortlisted" ? "reject" : "shortlist")}>{bid.status === "shortlisted" ? "Decline" : "Shortlist"}</button>
-                      <button className="button button--small button--primary" type="button" disabled={busy} onClick={() => onDecision(bid.id, "accept")}>{busy ? "Saving…" : "Accept offer"}</button>
+                      <button className="button button--small button--primary" type="button" disabled={busy} onClick={() => onRequestAward(bid)}><ShieldCheck size={15} /> Review and award</button>
                     </div>
                   )}
                 </article>
@@ -337,7 +481,7 @@ function LiveOffers({ auction, bids, loading, error, decidingId, closing, onDeci
   );
 }
 
-function LiveDashboard({ user, auctions, selectedAuction, onSelect, bids, bidsLoading, bidsError, decidingId, closingOfferWindow, onDecision, onRequestClose, active, setActive }) {
+function LiveDashboard({ user, auctions, selectedAuction, onSelect, bids, bidsLoading, bidsError, decidingId, closingOfferWindow, onDecision, onRequestClose, onRequestAward, active, setActive }) {
   const totalOffers = auctions.reduce((sum, auction) => sum + Number(auction.bidCount || 0), 0);
   return (
     <>
@@ -350,7 +494,7 @@ function LiveDashboard({ user, auctions, selectedAuction, onSelect, bids, bidsLo
           <>
             <DashboardNav active={active} setActive={setActive} offersCount={totalOffers} />
             {active === "overview" && <div className="live-dashboard-grid"><RequestSelector auctions={auctions} selectedId={selectedAuction?.id} onSelect={onSelect} /><LiveRequestSummary auction={selectedAuction} /></div>}
-            {active === "offers" && <><RequestSelector auctions={auctions} selectedId={selectedAuction?.id} onSelect={onSelect} /><LiveOffers auction={selectedAuction} bids={bids} loading={bidsLoading} error={bidsError} decidingId={decidingId} closing={closingOfferWindow} onDecision={onDecision} onRequestClose={onRequestClose} /></>}
+            {active === "offers" && <><RequestSelector auctions={auctions} selectedId={selectedAuction?.id} onSelect={onSelect} /><LiveOffers auction={selectedAuction} bids={bids} loading={bidsLoading} error={bidsError} decidingId={decidingId} closing={closingOfferWindow} onDecision={onDecision} onRequestClose={onRequestClose} onRequestAward={onRequestAward} /></>}
             {active === "tasks" && <div className="dashboard-card dashboard-empty"><span><ClipboardCheck size={27} /></span><h2>No task list yet</h2><p>Request and offer decisions are live. Personal task management is the next workspace module.</p></div>}
             {active === "messages" && <MessagesEmpty />}
           </>
@@ -374,6 +518,7 @@ export function DashboardPage({ notify, onOpenAuth }) {
   const [bidsLoading, setBidsLoading] = useState(false);
   const [bidsError, setBidsError] = useState("");
   const [decidingId, setDecidingId] = useState(null);
+  const [awardDialog, setAwardDialog] = useState(null);
   const [closeDialogAuctionId, setCloseDialogAuctionId] = useState(null);
   const [closingOfferWindow, setClosingOfferWindow] = useState(false);
   const [refreshKey, setRefreshKey] = useState(0);
@@ -461,10 +606,9 @@ export function DashboardPage({ notify, onOpenAuth }) {
     return key;
   }
 
-  async function decideOnBid(bidId, action) {
-    if (!selectedId || bidsAuctionId !== selectedId) return;
-    if (action === "accept" && !window.confirm("Accept this offer? This awards the request and closes the other open offers.")) return;
-    const auctionId = selectedId;
+  async function decideOnBid(bidId, action, targetAuctionId = selectedId) {
+    if (!targetAuctionId || bidsAuctionId !== targetAuctionId) return;
+    const auctionId = targetAuctionId;
     const decisionKey = `${auctionId}:${bidId}`;
     setDecidingId(decisionKey);
     try {
@@ -485,7 +629,8 @@ export function DashboardPage({ notify, onOpenAuth }) {
         }));
       }
       if (action === "accept") setAuctions((current) => current.map((auction) => auction.id === auctionId ? { ...auction, status: "awarded" } : auction));
-      notify({ title: action === "accept" ? "Offer accepted" : action === "shortlist" ? "Offer shortlisted" : "Offer removed from shortlist", message: "Your live planning space is up to date." });
+      if (action === "accept") setAwardDialog(null);
+      notify({ title: action === "accept" ? "Offer awarded" : action === "shortlist" ? "Offer shortlisted" : "Offer removed from shortlist", message: action === "accept" ? "The request is awarded and the other open offers are now closed." : "Your live planning space is up to date." });
     } catch (error) {
       notify({ type: "error", title: "Decision not saved", message: error.message || "Please refresh and try again." });
     } finally {
@@ -535,7 +680,10 @@ export function DashboardPage({ notify, onOpenAuth }) {
     const dialogAuction = auctions.find((auction) => auction.id === closeDialogAuctionId) || null;
     const visibleBids = bidsAuctionId === selectedId ? bids : [];
     const visibleBidsLoading = selectedAuction?.status !== "open" && (bidsAuctionId !== selectedId || bidsLoading);
-    return <div className="dashboard-page page-surface"><LiveDashboard user={user} auctions={auctions} selectedAuction={selectedAuction} onSelect={setSelectedId} bids={visibleBids} bidsLoading={visibleBidsLoading} bidsError={bidsAuctionId === selectedId ? bidsError : ""} decidingId={decidingId} closingOfferWindow={closingOfferWindow} onDecision={decideOnBid} onRequestClose={setCloseDialogAuctionId} active={active} setActive={setActive} /><CloseOfferWindowDialog auction={dialogAuction} open={Boolean(dialogAuction)} closing={closingOfferWindow} onClose={() => !closingOfferWindow && setCloseDialogAuctionId(null)} onConfirm={closeOfferWindow} /></div>;
+    const awardAuction = awardDialog ? auctions.find((auction) => auction.id === awardDialog.auctionId) || null : null;
+    const awardBid = awardDialog && bidsAuctionId === awardDialog.auctionId ? bids.find((bid) => bid.id === awardDialog.bidId) || null : null;
+    const awardBusy = Boolean(awardDialog && decidingId === `${awardDialog.auctionId}:${awardDialog.bidId}`);
+    return <div className="dashboard-page page-surface"><LiveDashboard user={user} auctions={auctions} selectedAuction={selectedAuction} onSelect={setSelectedId} bids={visibleBids} bidsLoading={visibleBidsLoading} bidsError={bidsAuctionId === selectedId ? bidsError : ""} decidingId={decidingId} closingOfferWindow={closingOfferWindow} onDecision={decideOnBid} onRequestClose={setCloseDialogAuctionId} onRequestAward={(bid) => selectedAuction && setAwardDialog({ auctionId: selectedAuction.id, bidId: bid.id })} active={active} setActive={setActive} /><CloseOfferWindowDialog auction={dialogAuction} open={Boolean(dialogAuction)} closing={closingOfferWindow} onClose={() => !closingOfferWindow && setCloseDialogAuctionId(null)} onConfirm={closeOfferWindow} /><AwardOfferDialog auction={awardAuction} bid={awardBid} open={Boolean(awardAuction && awardBid)} busy={awardBusy} onClose={() => !awardBusy && setAwardDialog(null)} onConfirm={() => awardDialog && decideOnBid(awardDialog.bidId, "accept", awardDialog.auctionId)} /></div>;
   }
 
   return (

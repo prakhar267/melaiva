@@ -27,6 +27,7 @@ This shape is intentional for the free launch tier: it preserves relational cons
 - A preferred vendor is attached only when the vendor remains approved and matches the brief's category and city at the atomic create boundary. Other matched vendors cannot see that preference.
 - Suspending or rejecting a vendor withdraws open proposals and makes unanswered direct invitations unavailable; award selection rechecks current vendor approval.
 - Submitted offers stay sealed while an auction is open. Customer contact data remains private.
+- Owner-initiated status changes update the auction and append their audit event in one transaction. Replayed or concurrent requests converge on the same status without duplicating the audit record.
 - Production storage failures fail closed; demo state is never substituted for a write.
 
 ## Product modules
@@ -44,7 +45,7 @@ This shape is intentional for the free launch tier: it preserves relational cons
 - `/health` and `/api/v1/health`
 - `/api/v1/auth/*`
 - `/api/v1/vendors` and `/api/v1/vendors/onboarding`
-- `/api/v1/auctions` and `/api/v1/auctions/:id/bids`
+- `/api/v1/auctions`, `/api/v1/auctions/:id/status`, and `/api/v1/auctions/:id/bids`
 - `/api/v1/ai/plan`
 - `/api/v1/admin/*`
 

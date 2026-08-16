@@ -19,6 +19,7 @@ class SqliteStatement {
   }
 
   async first() {
+    await this.database.beforeFirst?.(this.sql, this.args);
     return this.database.sqlite.prepare(this.sql).get(...this.args) || null;
   }
 
@@ -39,6 +40,7 @@ class SqliteStatement {
 class SqliteD1 {
   constructor(schema) {
     this.sqlite = new DatabaseSync(":memory:");
+    this.beforeFirst = null;
     this.sqlite.exec(`CREATE TABLE IF NOT EXISTS _sql_schema_migrations (
       id INTEGER PRIMARY KEY,
       applied_at TEXT NOT NULL DEFAULT (datetime('now'))
@@ -338,12 +340,73 @@ test("marketplace authorization and state transitions remain private, atomic, an
   assert.equal(sealedPayload.error.code, "bids_sealed");
   assert.doesNotMatch(JSON.stringify(sealedPayload), /Vendor One|Vendor Two|275000|300000/);
 
-  const closed = await requestJson(app, env, `/auctions/${auction.id}/status`, {
+  const unrelatedClose = await requestJson(app, env, `/auctions/${auction.id}/status`, {
     method: "PATCH",
-    cookie: couple.cookie,
+    cookie: otherCouple.cookie,
     body: { status: "closed" },
   });
-  assert.equal(closed.status, 200, await closed.clone().text());
+  assert.equal(unrelatedClose.status, 404);
+  assert.equal(db.sqlite.prepare("SELECT status FROM auctions WHERE id = ?").get(auction.id).status, "open");
+
+  db.sqlite.exec(`CREATE TRIGGER fail_status_audit
+    BEFORE INSERT ON audit_events
+    WHEN NEW.action = 'auction.status_changed'
+    BEGIN SELECT RAISE(ABORT, 'forced audit failure'); END`);
+  const originalConsoleError = console.error;
+  let failedClose;
+  try {
+    console.error = () => {};
+    failedClose = await requestJson(app, env, `/auctions/${auction.id}/status`, {
+      method: "PATCH",
+      cookie: couple.cookie,
+      body: { status: "closed" },
+    });
+  } finally {
+    console.error = originalConsoleError;
+  }
+  assert.equal(failedClose.status, 500);
+  assert.equal((await failedClose.json()).error.code, "internal_error");
+  assert.equal(db.sqlite.prepare("SELECT status FROM auctions WHERE id = ?").get(auction.id).status, "open");
+  assert.equal(
+    db.sqlite.prepare("SELECT COUNT(*) AS count FROM audit_events WHERE action = 'auction.status_changed' AND entity_id = ?").get(auction.id).count,
+    0,
+  );
+  db.sqlite.exec("DROP TRIGGER fail_status_audit");
+
+  let initialStatusReads = 0;
+  let staleStatusRereads = 0;
+  let releaseInitialReads;
+  const bothInitialReads = new Promise((resolve) => { releaseInitialReads = resolve; });
+  db.beforeFirst = async (sql, args) => {
+    if (sql === "SELECT id, couple_user_id, status FROM auctions WHERE id = ? LIMIT 1" && args[0] === auction.id) {
+      initialStatusReads += 1;
+      if (initialStatusReads === 2) releaseInitialReads();
+      await bothInitialReads;
+    }
+    if (sql === "SELECT status FROM auctions WHERE id = ? LIMIT 1" && args[0] === auction.id) staleStatusRereads += 1;
+  };
+  let closeResponses;
+  try {
+    closeResponses = await Promise.all(
+      ["first", "concurrent"].map(() => requestJson(app, env, `/auctions/${auction.id}/status`, {
+        method: "PATCH",
+        cookie: couple.cookie,
+        body: { status: "closed" },
+      })),
+    );
+  } finally {
+    db.beforeFirst = null;
+  }
+  assert.equal(initialStatusReads, 2);
+  assert.equal(staleStatusRereads, 1);
+  for (const response of closeResponses) assert.equal(response.status, 200, await response.clone().text());
+  const closePayloads = await Promise.all(closeResponses.map((response) => response.json()));
+  assert.ok(closePayloads.every((payload) => payload.data.status === "closed" && payload.data.bidCount === 2));
+  assert.equal(closePayloads.filter((payload) => payload.meta?.unchanged).length, 1);
+  assert.equal(
+    db.sqlite.prepare("SELECT COUNT(*) AS count FROM audit_events WHERE action = 'auction.status_changed' AND entity_id = ?").get(auction.id).count,
+    1,
+  );
 
   const ownerBids = await requestJson(app, env, `/auctions/${auction.id}/bids`, { cookie: couple.cookie });
   assert.equal(ownerBids.status, 200);
@@ -426,6 +489,31 @@ test("marketplace authorization and state transitions remain private, atomic, an
   );
   assert.equal(
     db.sqlite.prepare("SELECT COUNT(*) AS count FROM idempotency_keys WHERE scope = ?").get(`bid-accept:${genericAuction.id}:${retriedBidId}`).count,
+    1,
+  );
+
+  const cancellableCreated = await requestJson(app, env, "/auctions", {
+    cookie: couple.cookie,
+    headers: { "idempotency-key": "auction-create-cancel-replay-0001" },
+    body: { ...genericAuctionBody, title: "A cancellable Jaipur photography brief" },
+  });
+  assert.equal(cancellableCreated.status, 201, await cancellableCreated.clone().text());
+  const cancellableAuction = (await cancellableCreated.json()).data;
+  const cancelRequest = () => requestJson(app, env, `/auctions/${cancellableAuction.id}/status`, {
+    method: "PATCH",
+    cookie: couple.cookie,
+    body: { status: "cancelled" },
+  });
+  const firstCancel = await cancelRequest();
+  assert.equal(firstCancel.status, 200, await firstCancel.clone().text());
+  assert.equal((await firstCancel.json()).data.status, "cancelled");
+  const replayedCancel = await cancelRequest();
+  assert.equal(replayedCancel.status, 200, await replayedCancel.clone().text());
+  const replayedCancelPayload = await replayedCancel.json();
+  assert.equal(replayedCancelPayload.data.status, "cancelled");
+  assert.equal(replayedCancelPayload.meta.unchanged, true);
+  assert.equal(
+    db.sqlite.prepare("SELECT COUNT(*) AS count FROM audit_events WHERE action = 'auction.status_changed' AND entity_id = ?").get(cancellableAuction.id).count,
     1,
   );
 

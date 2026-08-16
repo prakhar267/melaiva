@@ -1,4 +1,4 @@
-import { useMemo, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import { Link, useSearchParams } from "react-router-dom";
 import {
   ArrowLeft,
@@ -8,16 +8,18 @@ import {
   CheckCircle2,
   ChevronDown,
   BadgeIndianRupee,
+  CircleAlert,
   Clock3,
   FileCheck2,
   MapPin,
+  LoaderCircle,
   PartyPopper,
   Send,
   ShieldCheck,
   Sparkles,
   Users,
 } from "lucide-react";
-import { categories, cities, formatCurrency, vendors } from "../data.js";
+import { categories, cities, formatCurrency } from "../data.js";
 import { createIdempotencyKey, isServiceUnavailable, readApiResponse } from "../api.js";
 
 const eventTypes = ["Wedding", "Engagement", "Reception", "Anniversary", "Family celebration", "Other"];
@@ -38,7 +40,73 @@ function FieldError({ children }) {
   return children ? <small className="field-error" role="alert">{children}</small> : null;
 }
 
-function CelebrationStep({ data, update, errors }) {
+function normalizePreferredVendor(vendor) {
+  const vendorCategories = [...new Set([vendor.category, ...(vendor.categories || [])].filter(Boolean))];
+  const name = vendor.businessName || "Selected partner";
+  return {
+    id: vendor.id,
+    slug: vendor.slug,
+    name,
+    categories: vendorCategories,
+    serviceAreas: [...new Set([vendor.city, ...(vendor.serviceAreas || [])].filter(Boolean))],
+    categoryLabel: categories.find((item) => item.id === vendorCategories[0])?.name || "Wedding partner",
+    city: vendor.city || "",
+    initials: name.split(" ").map((word) => word[0]).join("").slice(0, 2).toUpperCase(),
+    tone: ["marigold", "rose", "teal", "aubergine"][String(vendor.id || vendor.slug || "x").length % 4],
+  };
+}
+
+function PreferredVendorContext({ resolution, vendorSlug, onContinueWithout, onRetry }) {
+  if (resolution.status === "none") return null;
+
+  if (resolution.status === "resolved") {
+    const vendor = resolution.vendor;
+    return (
+      <div className="preferred-vendor-context" aria-live="polite">
+        <div className={`preferred-vendor-context__monogram tone--${vendor.tone}`}>{vendor.initials}</div>
+        <div className="preferred-vendor-context__copy">
+          <small>Preferred partner</small>
+          <strong>{vendor.name}</strong>
+          <span>{[vendor.categoryLabel, vendor.city].filter(Boolean).join(" · ")}</span>
+        </div>
+        <div className="preferred-vendor-context__actions">
+          <div className="preferred-vendor-context__status"><CheckCircle2 size={16} /><span>Will receive a direct invitation</span></div>
+          <button className="text-button" type="button" onClick={onContinueWithout}>Continue without this partner</button>
+        </div>
+      </div>
+    );
+  }
+
+  if (resolution.status === "skipped") {
+    return (
+      <div className="preferred-vendor-context preferred-vendor-context--skipped" aria-live="polite">
+        <Sparkles size={19} />
+        <div className="preferred-vendor-context__copy"><small>Open matching</small><strong>Continuing without a specific partner</strong><span>No preferred vendor will be attached to this request.</span></div>
+        <button className="text-button" type="button" onClick={onRetry}>Restore partner</button>
+      </div>
+    );
+  }
+
+  const loading = resolution.status === "loading";
+  const incompatible = resolution.status === "incompatible";
+  return (
+    <div className={`preferred-vendor-context preferred-vendor-context--${loading ? "loading" : "unavailable"}`} role={loading ? "status" : "alert"} aria-live="polite">
+      {loading ? <LoaderCircle className="spin-icon" size={20} /> : <CircleAlert size={20} />}
+      <div className="preferred-vendor-context__copy">
+        <small>{loading ? "Confirming preferred partner" : incompatible ? "Partner does not match this brief" : "Preferred partner unavailable"}</small>
+        <strong>{loading ? "Checking the live partner record…" : incompatible ? "Align the brief or continue with open matching" : "We could not safely attach this partner"}</strong>
+        <span>{loading ? `Verifying ${vendorSlug} before this request can continue.` : resolution.message}</span>
+      </div>
+      <div className="preferred-vendor-context__actions">
+        {!loading && !incompatible && <button className="button button--small button--outline" type="button" onClick={onRetry}>Try again</button>}
+        <button className="text-button" type="button" onClick={onContinueWithout}>Continue without this partner</button>
+      </div>
+    </div>
+  );
+}
+
+function CelebrationStep({ data, update, errors, selectedVendor }) {
+  const cityOptions = [...new Set([...cities, data.city, selectedVendor?.city].filter(Boolean))];
   return (
     <div className="wizard-panel">
       <div className="wizard-panel__heading"><span>01</span><div><div className="eyebrow">The essentials</div><h2>Tell us about the celebration</h2><p>Approximate details are enough to find the right first matches.</p></div></div>
@@ -46,18 +114,17 @@ function CelebrationStep({ data, update, errors }) {
         <label className="field field--span-2"><span>Give this request a name</span><input value={data.title} onChange={(event) => update("title", event.target.value)} placeholder="Aarav & Meera — Jaipur celebration" /><FieldError>{errors.title}</FieldError></label>
         <label className="field"><span>Celebration type</span><div className="input-wrap input-wrap--select"><select value={data.eventType} onChange={(event) => update("eventType", event.target.value)}>{eventTypes.map((type) => <option key={type}>{type}</option>)}</select><ChevronDown size={15} /></div></label>
         <label className="field"><span>Primary date</span><div className="input-wrap"><CalendarDays size={17} /><input type="date" value={data.eventDate} onChange={(event) => update("eventDate", event.target.value)} /></div><FieldError>{errors.eventDate}</FieldError></label>
-        <label className="field"><span>City or destination</span><div className="input-wrap input-wrap--select"><MapPin size={17} /><select value={data.city} onChange={(event) => update("city", event.target.value)}><option value="">Choose a city</option>{cities.map((city) => <option key={city}>{city}</option>)}</select><ChevronDown size={15} /></div><FieldError>{errors.city}</FieldError></label>
+        <label className="field"><span>City or destination</span><div className="input-wrap input-wrap--select"><MapPin size={17} /><select value={data.city} onChange={(event) => update("city", event.target.value)}><option value="">Choose a city</option>{cityOptions.map((city) => <option key={city}>{city}</option>)}</select><ChevronDown size={15} /></div><FieldError>{errors.city}</FieldError></label>
         <label className="field"><span>Estimated guests</span><div className="input-wrap"><Users size={17} /><input type="number" min="20" max="5000" inputMode="numeric" value={data.guestCount} onChange={(event) => update("guestCount", event.target.value)} /></div><FieldError>{errors.guestCount}</FieldError></label>
       </div>
     </div>
   );
 }
 
-function ServicesStep({ data, toggle, errors, selectedVendor }) {
+function ServicesStep({ data, toggle, errors }) {
   return (
     <div className="wizard-panel">
       <div className="wizard-panel__heading"><span>02</span><div><div className="eyebrow">The team</div><h2>What do you need help finding?</h2><p>Choose one or several. Each category receives only the relevant part of your brief.</p></div></div>
-      {selectedVendor && <div className="selected-vendor-note"><div className={`vendor-card__monogram tone--${selectedVendor.tone}`}>{selectedVendor.initials}</div><p><strong>{selectedVendor.name} is included</strong><span>Your request will be routed to this partner first, subject to availability.</span></p><CheckCircle2 size={20} /></div>}
       <div className="service-choice-grid">
         {categories.map((category) => {
           const selected = data.categories.includes(category.id);
@@ -121,7 +188,6 @@ export function RequestPage({ notify, onOpenAuth }) {
   const [params] = useSearchParams();
   const categoryParam = params.get("category");
   const vendorParam = params.get("vendor");
-  const selectedVendor = vendors.find((vendor) => vendor.id === vendorParam);
   const defaultEnd = useMemo(() => {
     const date = new Date(Date.now() + 72 * 60 * 60 * 1000);
     date.setMinutes(0, 0, 0);
@@ -136,11 +202,15 @@ export function RequestPage({ notify, onOpenAuth }) {
   const [submitting, setSubmitting] = useState(false);
   const [result, setResult] = useState(null);
   const [idempotencyKey] = useState(() => createIdempotencyKey("request"));
+  const [dismissedVendorParam, setDismissedVendorParam] = useState(null);
+  const [vendorRetryKey, setVendorRetryKey] = useState(0);
+  const [vendorResolution, setVendorResolution] = useState(() => ({ status: vendorParam ? "loading" : "none", vendor: null, message: "" }));
+  const touchedFields = useRef({ city: false, categories: false });
   const [data, setData] = useState({
     title: "",
     eventType: "Wedding",
     eventDate: defaultEventDate,
-    city: selectedVendor?.city || "",
+    city: "",
     guestCount: "250",
     categories: categoryParam && categories.some((item) => item.id === categoryParam) ? [categoryParam] : [],
     budgetMin: "200000",
@@ -149,12 +219,74 @@ export function RequestPage({ notify, onOpenAuth }) {
     requirements: "",
   });
 
+  useEffect(() => {
+    if (!vendorParam) {
+      setVendorResolution({ status: "none", vendor: null, message: "" });
+      return undefined;
+    }
+    if (dismissedVendorParam === vendorParam) {
+      setVendorResolution({ status: "skipped", vendor: null, message: "" });
+      return undefined;
+    }
+
+    const controller = new AbortController();
+    async function resolveVendor() {
+      setVendorResolution({ status: "loading", vendor: null, message: "" });
+      try {
+        const response = await fetch(`/api/v1/catalog/vendors/${encodeURIComponent(vendorParam)}`, { credentials: "include", signal: controller.signal });
+        const payload = await readApiResponse(response, "The selected partner could not be verified.");
+        if (payload.meta?.source === "demo" || !payload.data?.id || payload.data?.slug?.toLowerCase() !== vendorParam.toLowerCase()) {
+          if (!controller.signal.aborted) {
+            setVendorResolution({ status: "unavailable", vendor: null, message: "The live catalog could not confirm this exact partner. Try again or explicitly continue with open matching." });
+          }
+          return;
+        }
+        const vendor = normalizePreferredVendor(payload.data);
+        if (controller.signal.aborted) return;
+        setVendorResolution({ status: "resolved", vendor, message: "" });
+        const compatibleCategory = vendor.categories.find((id) => categories.some((item) => item.id === id));
+        setData((current) => ({
+          ...current,
+          city: !touchedFields.current.city && !current.city && vendor.city ? vendor.city : current.city,
+          categories: !touchedFields.current.categories && !current.categories.length && compatibleCategory ? [compatibleCategory] : current.categories,
+        }));
+      } catch (requestError) {
+        if (requestError?.name === "AbortError" || controller.signal.aborted) return;
+        const message = requestError?.status === 404
+          ? "This partner is no longer available in the public catalog. Choose open matching or return to the marketplace."
+          : "We could not verify the live partner record. Nothing will be substituted unless you choose to continue without this partner.";
+        setVendorResolution({ status: "unavailable", vendor: null, message });
+      }
+    }
+    resolveVendor();
+    return () => controller.abort();
+  }, [dismissedVendorParam, vendorParam, vendorRetryKey]);
+
+  const resolvedVendor = vendorResolution.status === "resolved" ? vendorResolution.vendor : null;
+  const vendorMismatch = useMemo(() => {
+    if (!resolvedVendor) return "";
+    const normalize = (value) => String(value || "").trim().toLowerCase();
+    const categoryMatches = data.categories.some((category) => resolvedVendor.categories.map(normalize).includes(normalize(category)));
+    const cityMatches = resolvedVendor.serviceAreas.map(normalize).includes(normalize(data.city));
+    if (!categoryMatches && !cityMatches) return "The chosen services and city are outside this partner’s approved profile.";
+    if (!categoryMatches) return "None of the chosen services match this partner’s approved categories.";
+    if (!cityMatches) return "This city is outside the partner’s approved service areas.";
+    return "";
+  }, [data.categories, data.city, resolvedVendor]);
+  const displayedVendorResolution = vendorMismatch
+    ? { status: "incompatible", vendor: resolvedVendor, message: `${vendorMismatch} Update the brief or explicitly continue without this partner.` }
+    : vendorResolution;
+  const selectedVendor = resolvedVendor && !vendorMismatch ? resolvedVendor : null;
+  const vendorBlocking = Boolean(vendorParam) && (["loading", "unavailable"].includes(vendorResolution.status) || Boolean(vendorMismatch));
+
   function update(key, value) {
     if (key === "requirements" && value.length > 1500) return;
+    if (key === "city") touchedFields.current.city = true;
     setData((current) => ({ ...current, [key]: value }));
     setErrors((current) => ({ ...current, [key]: "" }));
   }
   function toggleCategory(id) {
+    touchedFields.current.categories = true;
     setData((current) => ({ ...current, categories: current.categories.includes(id) ? current.categories.filter((item) => item !== id) : [...current.categories, id] }));
     setErrors((current) => ({ ...current, categories: "" }));
   }
@@ -179,18 +311,21 @@ export function RequestPage({ notify, onOpenAuth }) {
     return !Object.keys(next).length;
   }
   function next() {
+    if (vendorBlocking) return;
     if (!validate(step)) return;
     setStep((current) => Math.min(4, current + 1));
     window.scrollTo({ top: 0, behavior: "smooth" });
   }
 
   async function submit() {
+    if (vendorBlocking) return;
     setSubmitting(true);
     const payload = {
       title: data.title.trim(), eventType: data.eventType.toLowerCase().replaceAll(" ", "_"), eventDate: data.eventDate, city: data.city,
       guestCount: Number(data.guestCount), budgetMin: Number(data.budgetMin), budgetMax: Number(data.budgetMax), currency: "INR",
-      categories: data.categories, requirements: `${data.requirements}${selectedVendor ? `\nPreferred partner: ${selectedVendor.name}` : ""}`,
+      categories: data.categories, requirements: data.requirements,
       biddingEndsAt: new Date(data.biddingEndsAt).toISOString(),
+      ...(selectedVendor?.id ? { preferredVendorId: selectedVendor.id } : {}),
     };
     try {
       const response = await fetch("/api/v1/auctions", { method: "POST", headers: { "Content-Type": "application/json", "Idempotency-Key": idempotencyKey }, credentials: "include", body: JSON.stringify(payload) });
@@ -220,13 +355,19 @@ export function RequestPage({ notify, onOpenAuth }) {
       <div className="shell request-layout">
         <div className="wizard-card">
           <Stepper step={step} />
-          {step === 1 && <CelebrationStep data={data} update={update} errors={errors} />}
-          {step === 2 && <ServicesStep data={data} toggle={toggleCategory} errors={errors} selectedVendor={selectedVendor} />}
+          <PreferredVendorContext
+            resolution={displayedVendorResolution}
+            vendorSlug={vendorParam}
+            onContinueWithout={() => setDismissedVendorParam(vendorParam)}
+            onRetry={() => { setDismissedVendorParam(null); setVendorRetryKey((value) => value + 1); }}
+          />
+          {step === 1 && <CelebrationStep data={data} update={update} errors={errors} selectedVendor={selectedVendor} />}
+          {step === 2 && <ServicesStep data={data} toggle={toggleCategory} errors={errors} />}
           {step === 3 && <BudgetStep data={data} update={update} errors={errors} />}
           {step === 4 && <ReviewStep data={data} selectedVendor={selectedVendor} />}
           <div className="wizard-actions">
             {step > 1 ? <button className="button button--ghost" onClick={() => setStep((current) => current - 1)}><ArrowLeft size={17} /> Back</button> : <Link className="button button--ghost" to="/marketplace"><ArrowLeft size={17} /> Marketplace</Link>}
-            {step < 4 ? <button className="button button--primary" onClick={next}>Continue <ArrowRight size={17} /></button> : <button className="button button--primary" onClick={submit} disabled={submitting}>{submitting ? <span className="button-loader" /> : <Send size={17} />}{submitting ? "Publishing…" : "Publish sealed request"}</button>}
+            {step < 4 ? <button className="button button--primary" onClick={next} disabled={vendorBlocking}>{vendorResolution.status === "loading" ? "Confirming partner…" : "Continue"} {!vendorBlocking && <ArrowRight size={17} />}</button> : <button className="button button--primary" onClick={submit} disabled={submitting || vendorBlocking}>{submitting ? <span className="button-loader" /> : <Send size={17} />}{submitting ? "Publishing…" : "Publish sealed request"}</button>}
           </div>
         </div>
         <aside className="request-aside">

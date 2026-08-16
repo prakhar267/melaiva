@@ -18,12 +18,14 @@ This shape is intentional for the free launch tier: it preserves relational cons
 
 ## Storage and invariants
 
-- `MelaivaStore` is the authoritative store for users, revocable sessions, vendor applications, auctions, bids, AI quota usage, idempotency results, and rate-limit buckets.
+- `MelaivaStore` is the authoritative store for users, revocable sessions, vendor applications, auctions, preferred-vendor invitations, bids, AI quota usage, idempotency results, and rate-limit buckets.
 - The Durable Object uses SQLite tables, constraints, indexes, and transactions. Its schema is initialized and versioned in `workers/app/src/store.js`.
 - All money values are integer **whole INR rupees** in this MVP. Payments are not implemented, so no code represents the platform as holding funds or escrow.
 - A partial unique index allows at most one accepted bid per auction.
 - Accepting a bid atomically awards it, closes the auction, and rejects remaining open bids.
 - Auction creation and bid acceptance require/replay an `Idempotency-Key` result.
+- A preferred vendor is attached only when the vendor remains approved and matches the brief's category and city at the atomic create boundary. Other matched vendors cannot see that preference.
+- Suspending or rejecting a vendor withdraws open proposals and makes unanswered direct invitations unavailable; award selection rechecks current vendor approval.
 - Submitted offers stay sealed while an auction is open. Customer contact data remains private.
 - Production storage failures fail closed; demo state is never substituted for a write.
 
@@ -32,7 +34,7 @@ This shape is intentional for the free launch tier: it preserves relational cons
 - Identity: registration, client-derived password verifiers, server peppering, session issuance/revocation, role authorization.
 - Catalog: public vendor discovery with honest empty/example states.
 - Planning: deterministic brief rules plus optional Gemini planning.
-- Requests: private structured briefs and date-bounded auctions.
+- Requests: private structured briefs, optional explicit preferred-partner invitations, and date-bounded auctions.
 - Offers: vendor bids and customer shortlist/reject/accept decisions.
 - Partners: vendor onboarding and manual approval state.
 - Reliability: rate limits, quotas, idempotency, fail-closed health checks, cleanup alarm, request IDs, safe telemetry.
@@ -84,11 +86,12 @@ Initial internal objectives:
 - oldest expired-but-open auction below two alarm intervals;
 - AI provider failure never blocks deterministic planning.
 
-Use an external synthetic monitor for `/health` because a Worker cannot reliably detect a Cloudflare-wide outage from inside Cloudflare. Cloudflare observability is enabled with full launch sampling; reduce success sampling after traffic and error baselines are understood.
+Use an external synthetic monitor for `/health` because a Worker cannot reliably detect a Cloudflare-wide outage from inside Cloudflare. The scheduled GitHub readiness workflow checks health, database-backed catalog reads, security headers, and the application shell without creating data. Cloudflare observability is enabled with full launch sampling; reduce success sampling after traffic and error baselines are understood.
 
 ## Delivery policy
 
-- CI gates frozen installs, frontend build, SPA fallback tests, syntax checks, SQLite integration/security tests, and a Wrangler bundle dry run.
+- CI gates frozen installs, frontend build, SPA fallback tests, syntax checks, SQLite integration/security tests, and a Wrangler bundle dry run. The protected default branch also requires CodeQL security analysis.
 - Production deployment is manual through the GitHub environment until a least-privilege Cloudflare API token is installed as a repository secret.
-- `wrangler deploy` provisions the SQLite Durable Object via the `v1` migration and uploads the built Static Assets bundle.
+- Staging targets the separate `melaiva-staging` Worker and Durable Object namespace with production-strength runtime posture but AI, demo data, and Turnstile disabled until their integrations are ready.
+- `wrangler deploy` provisions the Durable Object class via Cloudflare migration `v1`; the class then applies its resumable internal SQLite schema migrations through schema version 2.
 - Free-plan limits are capacity limits, not an enterprise SLA. A custom domain, production support, transactional email, payments, legal/KYC, and model usage need explicit operating budgets and vendor contracts.

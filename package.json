@@ -1,12 +1,13 @@
 {
   "name": "melaiva",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "private": true,
   "type": "module",
   "scripts": {
     "dev": "vite",
     "build": "vite build && node scripts/prepare-sites-build.mjs",
     "preview": "vite preview",
+    "smoke:readiness": "node scripts/readiness-smoke.mjs",
     "smoke:production": "node scripts/production-smoke.mjs",
     "test:sites": "node --test tests/sites-worker.test.mjs",
     "test:api": "node --test workers/app/test/*.test.mjs",

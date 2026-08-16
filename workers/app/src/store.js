@@ -1,7 +1,7 @@
-const STORE_SCHEMA_VERSION = 1;
+const STORE_SCHEMA_VERSION = 2;
 const MAINTENANCE_INTERVAL_MS = 60 * 60 * 1000;
 
-const STORE_SCHEMA_SQL = `
+const STORE_SCHEMA_V1_SQL = `
 CREATE TABLE IF NOT EXISTS users (
   id TEXT PRIMARY KEY,
   name TEXT NOT NULL CHECK (length(name) BETWEEN 2 AND 100),
@@ -158,8 +158,33 @@ CREATE INDEX IF NOT EXISTS idx_audit_events_entity ON audit_events(entity_type, 
 CREATE INDEX IF NOT EXISTS idx_audit_events_actor ON audit_events(actor_user_id, created_at);
 
 PRAGMA optimize;
-INSERT OR IGNORE INTO _sql_schema_migrations (id) VALUES (${STORE_SCHEMA_VERSION});
+INSERT OR IGNORE INTO _sql_schema_migrations (id) VALUES (1);
 `;
+
+const STORE_SCHEMA_V2_FINALIZE_SQL = `
+CREATE TABLE IF NOT EXISTS auction_vendor_invites (
+  auction_id TEXT PRIMARY KEY REFERENCES auctions(id) ON DELETE CASCADE,
+  vendor_id TEXT NOT NULL REFERENCES vendors(id) ON DELETE RESTRICT,
+  invited_by_user_id TEXT NOT NULL REFERENCES users(id) ON DELETE RESTRICT,
+  status TEXT NOT NULL DEFAULT 'invited' CHECK (status IN ('invited', 'responded', 'unavailable')),
+  created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+  updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+);
+CREATE INDEX IF NOT EXISTS idx_auction_vendor_invites_vendor
+  ON auction_vendor_invites(vendor_id, status, created_at);
+CREATE INDEX IF NOT EXISTS idx_auction_vendor_invites_inviter
+  ON auction_vendor_invites(invited_by_user_id, created_at);
+
+INSERT OR IGNORE INTO _sql_schema_migrations (id) VALUES (2);
+PRAGMA optimize;
+`;
+
+const STORE_SCHEMA_V2_MIGRATION_SQL = `
+ALTER TABLE idempotency_keys ADD COLUMN request_hash TEXT;
+${STORE_SCHEMA_V2_FINALIZE_SQL}
+`;
+
+const STORE_SCHEMA_SQL = `${STORE_SCHEMA_V1_SQL}\n${STORE_SCHEMA_V2_MIGRATION_SQL}`;
 
 const DEMO_CATALOG_SQL = `
 INSERT OR IGNORE INTO vendors
@@ -213,7 +238,15 @@ export class MelaivaStore {
         .exec("SELECT COALESCE(MAX(id), 0) AS version FROM _sql_schema_migrations")
         .toArray()[0] || {};
       const version = Number(versionRow.version || 0);
-      if (version < STORE_SCHEMA_VERSION) this.sql.exec(STORE_SCHEMA_SQL).toArray();
+      if (version === 0) {
+        this.sql.exec(STORE_SCHEMA_SQL).toArray();
+      } else if (version < STORE_SCHEMA_VERSION) {
+        const idempotencyColumns = this.sql.exec("PRAGMA table_info(idempotency_keys)").toArray();
+        if (!idempotencyColumns.some((column) => column.name === "request_hash")) {
+          this.sql.exec("ALTER TABLE idempotency_keys ADD COLUMN request_hash TEXT").toArray();
+        }
+        this.sql.exec(STORE_SCHEMA_V2_FINALIZE_SQL).toArray();
+      }
       if (env?.ENABLE_DEMO_CATALOG === "true" && env?.ENVIRONMENT !== "production") {
         this.sql.exec(DEMO_CATALOG_SQL).toArray();
       }
@@ -263,7 +296,12 @@ export class MelaivaStore {
       }
       return jsonResponse({ error: "unsupported_operation" }, 400);
     } catch (error) {
-      return jsonResponse({ error: "storage_error", message: String(error?.message || error).slice(0, 500) }, 409);
+      const code = /unique constraint failed|SQLITE_CONSTRAINT_(?:UNIQUE|PRIMARYKEY)/i.test(
+        String(error?.message || error),
+      )
+        ? "unique_constraint"
+        : "storage_error";
+      return jsonResponse({ error: "storage_error", code }, 409);
     }
   }
 }
@@ -308,7 +346,11 @@ class DurableObjectDatabase {
       body: JSON.stringify(payload),
     });
     const body = await response.json();
-    if (!response.ok) throw new Error(body?.message || body?.error || "Durable Object storage request failed");
+    if (!response.ok) {
+      const error = new Error(body?.error || "Durable Object storage request failed");
+      error.code = body?.code || body?.error || "storage_error";
+      throw error;
+    }
     return body.data;
   }
 
@@ -332,4 +374,11 @@ export function createDurableDatabase(namespace) {
   return new DurableObjectDatabase(stub);
 }
 
-export { MAINTENANCE_INTERVAL_MS, STORE_SCHEMA_SQL, STORE_SCHEMA_VERSION, executeSql };
+export {
+  MAINTENANCE_INTERVAL_MS,
+  STORE_SCHEMA_SQL,
+  STORE_SCHEMA_V1_SQL,
+  STORE_SCHEMA_V2_MIGRATION_SQL,
+  STORE_SCHEMA_VERSION,
+  executeSql,
+};

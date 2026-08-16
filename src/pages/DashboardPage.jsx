@@ -1,4 +1,4 @@
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { Link } from "react-router-dom";
 import {
   ArrowRight,
@@ -25,7 +25,7 @@ import {
   Users,
 } from "lucide-react";
 import { dashboardTasks, formatCurrency, sampleOffers } from "../data.js";
-import { readApiResponse } from "../api.js";
+import { createIdempotencyKey, readApiResponse } from "../api.js";
 
 const budgetRows = [
   { name: "Venue & stay", allocated: 900000, committed: 710000, tone: "aubergine" },
@@ -51,6 +51,28 @@ function categoryName(value) {
     music: "Music & entertainment",
   };
   return labels[value] || value?.replaceAll("_", " ") || "Service";
+}
+
+function preferredVendorStatusLabel(status) {
+  if (status === "responded") return "Offer received";
+  if (status === "unavailable") return "Partner unavailable";
+  if (status === "invited") return "Invitation sent";
+  return "Preferred partner";
+}
+
+function PreferredVendorSummary({ vendor }) {
+  if (!vendor) return null;
+  const businessName = vendor.businessName || "Preferred partner";
+  const initials = businessName.split(" ").map((part) => part[0]).join("").slice(0, 2).toUpperCase();
+  const status = preferredVendorStatusLabel(vendor.inviteStatus);
+  return (
+    <div className="dashboard-preferred-vendor">
+      <span className="dashboard-preferred-vendor__monogram">{initials}</span>
+      <div><small>Preferred partner</small><strong>{businessName}</strong><span>{[categoryName(vendor.category), vendor.city].filter(Boolean).join(" · ")}</span></div>
+      {vendor.verified && <span className="dashboard-preferred-vendor__verified"><ShieldCheck size={14} /> Melaiva verified</span>}
+      <span className={`status-pill ${vendor.inviteStatus === "responded" ? "status-pill--teal" : vendor.inviteStatus === "unavailable" ? "status-pill--neutral" : "status-pill--direct"}`}><span /> {status}</span>
+    </div>
+  );
 }
 
 function DashboardNav({ active, setActive, offersCount = 0, tasksCount = 0 }) {
@@ -141,6 +163,7 @@ function RequestSelector({ auctions, selectedId, onSelect }) {
           <button type="button" key={auction.id} className={`live-request-card ${selectedId === auction.id ? "is-selected" : ""}`} onClick={() => onSelect(auction.id)} aria-pressed={selectedId === auction.id}>
             <span className={`status-pill status-pill--${auction.status === "open" ? "teal" : "neutral"}`}><span /> {auction.status}</span>
             <strong>{auction.title}</strong>
+            {auction.preferredVendor && <small className="live-request-card__preferred"><Sparkles size={13} /> Preferred · {auction.preferredVendor.businessName}</small>}
             <small><MapPin size={13} /> {auction.city} · {formatDate(auction.eventDate)}</small>
             <span>{auction.bidCount} offer{auction.bidCount === 1 ? "" : "s"} received <ArrowRight size={14} /></span>
           </button>
@@ -161,6 +184,7 @@ function LiveRequestSummary({ auction }) {
         <div><small>Guest estimate</small><strong>{auction.guestCount.toLocaleString("en-IN")}</strong></div>
         <div><small>Working range</small><strong>{formatCurrency(auction.budgetMin)} – {formatCurrency(auction.budgetMax)}</strong></div>
       </div>
+      <PreferredVendorSummary vendor={auction.preferredVendor} />
       <div className="live-request-summary__services"><small>Services requested</small><div>{auction.categories.map((category) => <span key={category}>{categoryName(category)}</span>)}</div></div>
       <div className="live-request-summary__brief"><small>Your brief</small><p>{auction.requirements}</p></div>
       <p className="live-request-summary__close"><Clock3 size={15} /> Offer window {auction.status === "open" ? `closes ${formatDate(auction.biddingEndsAt, { hour: "numeric", minute: "2-digit" })}` : `is ${auction.status}`}.</p>
@@ -187,7 +211,7 @@ function LiveOffers({ auction, bids, loading, error, decidingId, onDecision }) {
               <p>{bid.proposal}</p>
               <ul>{bid.deliverables.map((item) => <li key={item}><Check size={14} /> {item}</li>)}</ul>
               {bid.validUntil && <small className="live-offer__validity">Valid until {formatDate(bid.validUntil)}</small>}
-              {auction.status === "open" && ["submitted", "shortlisted"].includes(bid.status) && (
+              {auction.status === "closed" && ["submitted", "shortlisted"].includes(bid.status) && (
                 <div className="live-offer__actions">
                   <button className="button button--small button--outline" type="button" disabled={busy} onClick={() => onDecision(bid.id, bid.status === "shortlisted" ? "reject" : "shortlist")}>{bid.status === "shortlisted" ? "Decline" : "Shortlist"}</button>
                   <button className="button button--small button--primary" type="button" disabled={busy} onClick={() => onDecision(bid.id, "accept")}>{busy ? "Saving…" : "Accept offer"}</button>
@@ -238,6 +262,7 @@ export function DashboardPage({ notify, onOpenAuth }) {
   const [bidsError, setBidsError] = useState("");
   const [decidingId, setDecidingId] = useState(null);
   const [refreshKey, setRefreshKey] = useState(0);
+  const bidAcceptanceKeys = useRef(new Map());
 
   useEffect(() => {
     const controller = new AbortController();
@@ -294,13 +319,29 @@ export function DashboardPage({ notify, onOpenAuth }) {
 
   const selectedAuction = auctions.find((auction) => auction.id === selectedId) || null;
 
+  function acceptanceKeyFor(auctionId, bidId) {
+    const scope = `${auctionId}:${bidId}`;
+    if (bidAcceptanceKeys.current.has(scope)) return bidAcceptanceKeys.current.get(scope);
+    const storageKey = `melaiva:bid-accept:${scope}`;
+    let key;
+    try { key = globalThis.sessionStorage?.getItem(storageKey) || undefined; } catch { key = undefined; }
+    if (!key) {
+      key = createIdempotencyKey("bid-accept");
+      try { globalThis.sessionStorage?.setItem(storageKey, key); } catch { /* In-memory reuse still protects retries in this task. */ }
+    }
+    bidAcceptanceKeys.current.set(scope, key);
+    return key;
+  }
+
   async function decideOnBid(bidId, action) {
     if (action === "accept" && !window.confirm("Accept this offer? This awards the request and closes the other open offers.")) return;
     setDecidingId(bidId);
     try {
+      const headers = { "Content-Type": "application/json" };
+      if (action === "accept") headers["Idempotency-Key"] = acceptanceKeyFor(selectedId, bidId);
       const response = await fetch(`/api/v1/auctions/${selectedId}/bids/${bidId}`, {
         method: "PATCH",
-        headers: { "Content-Type": "application/json" },
+        headers,
         credentials: "include",
         body: JSON.stringify({ action }),
       });

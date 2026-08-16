@@ -62,8 +62,16 @@ function toOpportunity(auction) {
     budget: `${formatCurrency(auction.budgetMin)}–${formatCurrency(auction.budgetMax)}`,
     closes: closingLabel(auction.biddingEndsAt),
     notes: auction.requirements,
+    directInvite: Boolean(auction.directInvite),
+    directInviteStatus: auction.directInviteStatus || null,
     demo: false,
   };
+}
+
+function directInviteLabel(status) {
+  if (status === "responded") return "Direct invite · offer sent";
+  if (status === "unavailable") return "Direct invite unavailable";
+  return "Direct invitation";
 }
 
 function VendorWorkspaceNav({ active, setActive, opportunityCount, offerCount }) {
@@ -150,15 +158,18 @@ function BidForm({ opportunity, onClose, notify, onOpenAuth, onSubmitted }) {
 function OpportunityCard({ opportunity, notify, onOpenAuth, onSubmitted }) {
   const [open, setOpen] = useState(false);
   const [bidding, setBidding] = useState(false);
+  const alreadyResponded = opportunity.directInviteStatus === "responded";
+  const inviteUnavailable = opportunity.directInviteStatus === "unavailable";
+  const directInviteActive = opportunity.directInvite && opportunity.directInviteStatus !== "unavailable";
   return (
-    <article className={`opportunity-card ${open ? "is-open" : ""}`}>
+    <article className={`opportunity-card ${opportunity.directInvite ? "opportunity-card--direct" : ""} ${open ? "is-open" : ""}`}>
       <div className="opportunity-card__summary">
-        <div className={`opportunity-match ${opportunity.demo ? "opportunity-match--demo" : ""}`}>{opportunity.demo ? <><Sparkles size={20} /><small>example</small></> : <><BriefcaseBusiness size={20} /><small>live brief</small></>}</div>
-        <div className="opportunity-card__title"><div><span className={`status-pill ${opportunity.demo ? "" : "status-pill--teal"}`}><span /> {opportunity.demo ? "Example opportunity" : "Accepting offers"}</span><small>{opportunity.demo ? opportunity.id : opportunity.reference}</small></div><h3>{opportunity.service}</h3><div className="opportunity-facts"><span><MapPin size={14} /> {opportunity.city}</span><span><CalendarDays size={14} /> {opportunity.date}</span><span><Users size={14} /> {opportunity.guests} guests</span></div></div>
+        <div className={`opportunity-match ${opportunity.demo ? "opportunity-match--demo" : opportunity.directInvite ? "opportunity-match--direct" : ""}`}>{opportunity.demo ? <><Sparkles size={20} /><small>example</small></> : opportunity.directInvite ? <><Sparkles size={20} /><small>for you</small></> : <><BriefcaseBusiness size={20} /><small>live brief</small></>}</div>
+        <div className="opportunity-card__title"><div><span className={`status-pill ${opportunity.directInvite ? "status-pill--direct" : opportunity.demo ? "" : "status-pill--teal"}`}><span /> {opportunity.demo ? "Example opportunity" : opportunity.directInvite ? directInviteLabel(opportunity.directInviteStatus) : "Accepting offers"}</span><small>{opportunity.demo ? opportunity.id : opportunity.reference}</small></div><h3>{opportunity.service}</h3><div className="opportunity-facts"><span><MapPin size={14} /> {opportunity.city}</span><span><CalendarDays size={14} /> {opportunity.date}</span><span><Users size={14} /> {opportunity.guests} guests</span></div></div>
         <div className="opportunity-card__budget"><small>Stated range</small><strong>{opportunity.budget}</strong><span><Clock3 size={13} /> {opportunity.closes}</span></div>
         <button className="button button--small button--outline" type="button" onClick={() => setOpen((current) => !current)} aria-expanded={open}>{open ? "Hide brief" : "View brief"}<ChevronDown size={16} /></button>
       </div>
-      {open && <div className="opportunity-card__detail"><div className="brief-detail"><h4>{opportunity.demo ? "Example couple brief" : "Couple’s brief"}</h4><p>{opportunity.notes}</p><div><span><Check size={14} /> Scope shared</span><span><Check size={14} /> Working range shared</span><span><ShieldCheck size={14} /> Contact private</span></div></div>{bidding ? <BidForm opportunity={opportunity} onClose={() => setBidding(false)} notify={notify} onOpenAuth={onOpenAuth} onSubmitted={onSubmitted} /> : <div className="opportunity-card__cta"><div><BadgeIndianRupee size={20} /><p><strong>{opportunity.demo ? "Want to try the offer flow?" : "Good fit for your business?"}</strong><span>{opportunity.demo ? "Preview the form without sending anything." : "Send a complete offer before the window closes."}</span></p></div><button className="button button--primary" type="button" onClick={() => setBidding(true)}>{opportunity.demo ? "Preview offer" : "Build offer"} <ArrowRight size={16} /></button></div>}</div>}
+      {open && <div className="opportunity-card__detail"><div className="brief-detail"><h4>{opportunity.demo ? "Example couple brief" : "Couple’s brief"}</h4><p>{opportunity.notes}</p><div>{directInviteActive && <span className="direct-invite-signal"><Sparkles size={14} /> Sent directly to your business</span>}<span><Check size={14} /> Scope shared</span><span><Check size={14} /> Working range shared</span><span><ShieldCheck size={14} /> Contact private</span></div></div>{bidding ? <BidForm opportunity={opportunity} onClose={() => setBidding(false)} notify={notify} onOpenAuth={onOpenAuth} onSubmitted={onSubmitted} /> : <div className="opportunity-card__cta"><div><BadgeIndianRupee size={20} /><p><strong>{opportunity.demo ? "Want to try the offer flow?" : inviteUnavailable ? "This invitation is no longer available" : directInviteActive ? "Your business was invited directly" : "Good fit for your business?"}</strong><span>{opportunity.demo ? "Preview the form without sending anything." : inviteUnavailable ? "Contact support if your partner approval has since been restored." : alreadyResponded ? "Your sealed offer has already been sent for this request." : directInviteActive ? "Review the brief and respond before the offer window closes." : "Send a complete offer before the window closes."}</span></p></div><button className="button button--primary" type="button" disabled={alreadyResponded || inviteUnavailable} onClick={() => setBidding(true)}>{inviteUnavailable ? "Invite unavailable" : alreadyResponded ? "Offer sent" : opportunity.demo ? "Preview offer" : "Build offer"} {!alreadyResponded && !inviteUnavailable && <ArrowRight size={16} />}</button></div>}</div>}
     </article>
   );
 }
@@ -222,7 +233,9 @@ export function VendorPage({ notify, onOpenAuth }) {
   }, [refreshKey]);
 
   const exampleData = useMemo(() => exampleOpportunities.map((opportunity) => ({ ...opportunity, reference: opportunity.id, demo: true })), []);
-  const visibleOpportunities = mode === "demo" ? exampleData : opportunities;
+  const visibleOpportunities = mode === "demo"
+    ? exampleData
+    : [...opportunities].sort((first, second) => Number(second.directInvite) - Number(first.directInvite));
 
   if (mode === "loading") return <div className="vendor-page page-surface"><VendorAccessState icon={LoaderCircle} eyebrow="Loading partner workspace" title="Checking your business profile" message="Retrieving approval status, live opportunities and submitted offers." /></div>;
   if (mode === "guest") return <div className="vendor-page page-surface"><VendorAccessState icon={LockKeyhole} eyebrow="Private partner workspace" title="Sign in to see live opportunities" message="Only approved vendor accounts can read private briefs and submit offers."><button className="button button--primary" type="button" onClick={onOpenAuth}>Sign in</button><Link className="button button--outline" to="/vendor/onboarding">Apply to join</Link></VendorAccessState></div>;

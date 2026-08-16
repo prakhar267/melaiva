@@ -81,7 +81,8 @@ export function AuthPanel({ compact = false, onSuccess, initialMode = "login" })
           : payload.error?.details?.message;
         throw new Error(detail || payload.error?.message || "We couldn't complete that just yet.");
       }
-      onSuccess?.(mode);
+      const payload = await response.json().catch(() => ({}));
+      onSuccess?.(mode, payload.data?.user || null);
     } catch (requestError) {
       const isNetworkError = String(requestError?.message || "").toLowerCase().includes("fetch");
       setError(isNetworkError ? "We couldn’t reach Melaiva. Check your connection and try again." : requestError?.message || "Please check your details and try again.");
@@ -140,7 +141,7 @@ export function AuthPanel({ compact = false, onSuccess, initialMode = "login" })
   );
 }
 
-export function AuthModal({ open, onClose, notify }) {
+export function AuthModal({ open, onClose, notify, onAuthenticated }) {
   const dialogRef = useRef(null);
   const firstInputRef = useRef(null);
 
@@ -187,8 +188,9 @@ export function AuthModal({ open, onClose, notify }) {
         </button>
         <AuthPanel
           compact
-          onSuccess={(mode) => {
+          onSuccess={(mode, user) => {
             onClose();
+            onAuthenticated?.(mode, user);
             notify({ title: mode === "login" ? "You’re signed in" : "Your account is ready", message: "Welcome to your Melaiva planning space." });
           }}
         />
@@ -197,7 +199,7 @@ export function AuthModal({ open, onClose, notify }) {
   );
 }
 
-function Header({ onOpenAuth }) {
+function Header({ onOpenAuth, authenticated, accountPath }) {
   const [drawerOpen, setDrawerOpen] = useState(false);
   const location = useLocation();
   const drawerRef = useRef(null);
@@ -252,7 +254,9 @@ function Header({ onOpenAuth }) {
           </nav>
           <div className="site-header__actions">
             <NavLink className="vendor-link" to="/vendor">For vendors</NavLink>
-            <button className="button button--small button--outline header-login" onClick={onOpenAuth}>Sign in</button>
+            {authenticated
+              ? <Link className="button button--small button--outline header-login" to={accountPath}>My account</Link>
+              : <button className="button button--small button--outline header-login" onClick={onOpenAuth}>Sign in</button>}
             <button ref={menuButtonRef} className="icon-button menu-button" onClick={() => setDrawerOpen(true)} aria-label="Open menu" aria-expanded={drawerOpen}>
               <Menu size={22} />
             </button>
@@ -275,7 +279,9 @@ function Header({ onOpenAuth }) {
             <NavLink to="/vendor" tabIndex={drawerOpen ? 0 : -1}><span>05</span>For vendors<ArrowRight size={18} /></NavLink>
           </nav>
           <div className="mobile-drawer__footer">
-            <button className="button button--primary button--wide" onClick={() => { setDrawerOpen(false); onOpenAuth(); }} tabIndex={drawerOpen ? 0 : -1}>Sign in or join</button>
+            {authenticated
+              ? <Link className="button button--primary button--wide" to={accountPath} onClick={() => setDrawerOpen(false)} tabIndex={drawerOpen ? 0 : -1}>Open my account</Link>
+              : <button className="button button--primary button--wide" onClick={() => { setDrawerOpen(false); onOpenAuth(); }} tabIndex={drawerOpen ? 0 : -1}>Sign in or join</button>}
             <p>Plan with clarity. Celebrate with heart.</p>
           </div>
         </aside>
@@ -320,8 +326,22 @@ function Footer() {
   );
 }
 
-export function AppShell({ children, toast, dismissToast, openAuth, setOpenAuth, notify }) {
+export function AppShell({ children, toast, dismissToast, openAuth, setOpenAuth, notify, authRevision = 0, onAuthenticated }) {
   const location = useLocation();
+  const [authenticated, setAuthenticated] = useState(false);
+  const [accountPath, setAccountPath] = useState("/dashboard");
+  useEffect(() => {
+    const controller = new AbortController();
+    fetch("/api/v1/auth/me", { credentials: "include", signal: controller.signal })
+      .then(async (response) => {
+        const payload = response.ok ? await response.json().catch(() => ({})) : {};
+        if (controller.signal.aborted) return;
+        setAuthenticated(response.ok);
+        setAccountPath(payload.data?.vendor ? "/vendor" : "/dashboard");
+      })
+      .catch(() => { if (!controller.signal.aborted) setAuthenticated(false); });
+    return () => controller.abort();
+  }, [authRevision]);
   useEffect(() => {
     const titles = {
       "/": "Melaiva — A clearer celebration marketplace",
@@ -345,10 +365,10 @@ export function AppShell({ children, toast, dismissToast, openAuth, setOpenAuth,
 
   return (
     <>
-      <Header onOpenAuth={() => setOpenAuth(true)} />
+      <Header onOpenAuth={() => setOpenAuth(true)} authenticated={authenticated} accountPath={accountPath} />
       <main id="main-content">{children}</main>
       <Footer />
-      <AuthModal open={openAuth} onClose={() => setOpenAuth(false)} notify={notify} />
+      <AuthModal open={openAuth} onClose={() => setOpenAuth(false)} notify={notify} onAuthenticated={(mode, user) => { setAuthenticated(true); setAccountPath("/dashboard"); onAuthenticated?.(mode, user); }} />
       <ToastRegion toast={toast} onDismiss={dismissToast} />
     </>
   );

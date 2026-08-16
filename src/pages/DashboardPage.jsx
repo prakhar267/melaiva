@@ -29,6 +29,7 @@ import {
 } from "lucide-react";
 import { dashboardTasks, formatCurrency, sampleOffers } from "../data.js";
 import { createIdempotencyKey, readApiResponse } from "../api.js";
+import { BookingMessages } from "../components/BookingMessages.jsx";
 
 const budgetRows = [
   { name: "Venue & stay", allocated: 900000, committed: 710000, tone: "aubergine" },
@@ -109,12 +110,12 @@ function PreferredVendorSummary({ vendor }) {
   );
 }
 
-function DashboardNav({ active, setActive, offersCount = 0, tasksCount = 0 }) {
+function DashboardNav({ active, setActive, offersCount = 0, tasksCount = 0, conversationsCount = 0 }) {
   const items = [
     ["overview", LayoutDashboard, "Overview"],
     ["offers", FileText, "Offers", offersCount],
     ["tasks", ClipboardCheck, "Tasks", tasksCount],
-    ["messages", MessageSquareText, "Messages"],
+    ["messages", MessageSquareText, "Messages", conversationsCount],
   ];
   return (
     <nav className="dashboard-nav" aria-label="Celebration dashboard">
@@ -172,10 +173,6 @@ function OffersCard({ full = false, notify }) {
 
 function Overview({ tasks, toggleTask, notify }) {
   return <div className="dashboard-grid"><BudgetCard /><div className="dashboard-side-stack"><TasksCard tasks={tasks} toggleTask={toggleTask} /><OffersCard notify={notify} /></div><section className="dashboard-card dashboard-guidance"><div className="guidance-icon"><Sparkles size={22} /></div><div><div className="eyebrow">Example planner note</div><h2>Close the venue choice before expanding decor.</h2><p>This preview shows how connected planning guidance will appear after you create a live request.</p></div><button className="button button--outline" type="button" onClick={() => notify({ title: "Example guidance", message: "Live reasoning will be grounded in your own brief and offers." })}>See context <ArrowRight size={16} /></button></section></div>;
-}
-
-function MessagesEmpty() {
-  return <div className="dashboard-card dashboard-empty"><span><MessageSquareText size={27} /></span><h2>Your conversations will live here</h2><p>Once you choose to connect with a partner, messages and shared files stay organised by service.</p><Link className="button button--primary" to="/marketplace">Find a partner</Link></div>;
 }
 
 function AccountState({ icon: Icon, eyebrow, title, message, children }) {
@@ -426,7 +423,7 @@ function AwardOfferDialog({ auction, bid, open, busy, onClose, onConfirm }) {
   );
 }
 
-function AwardHandoff({ award }) {
+function AwardHandoff({ award, onMessage }) {
   if (!award) return null;
   const snapshot = award.snapshot || {};
   const request = snapshot.request || {};
@@ -446,7 +443,10 @@ function AwardHandoff({ award }) {
           <h2 id={`award-handoff-${award.id}`}>Your accepted scope is saved.</h2>
           <p>Melaiva froze the offer you awarded to <strong>{businessName}</strong>. You and the partner must arrange and review a written contract outside Melaiva before any signature or payment.</p>
         </div>
-        <span className="status-pill status-pill--direct"><span /> Contract pending</span>
+        <div className="award-handoff__hero-actions">
+          <span className="status-pill status-pill--direct"><span /> Contract pending</span>
+          <button className="button button--small button--outline" type="button" onClick={() => onMessage?.(award.id)}><MessageSquareText size={14} /> Message partner</button>
+        </div>
       </div>
       <ol className="award-handoff__steps" aria-label="Award handoff progress">
         <li className="is-complete"><span><Check size={15} /></span><div><small>Complete</small><strong>Award recorded</strong><p>Scope saved {award.awardedAt ? formatDate(award.awardedAt, { hour: "numeric", minute: "2-digit" }) : "securely"}.</p></div></li>
@@ -474,7 +474,7 @@ function AwardHandoff({ award }) {
   );
 }
 
-function LiveOffers({ auction, bids, loading, error, decidingId, closing, award, awardLoading, awardError, onRetryAward, onDecision, onRequestClose, onRequestAward }) {
+function LiveOffers({ auction, bids, loading, error, decidingId, closing, award, awardLoading, awardError, onRetryAward, onDecision, onRequestClose, onRequestAward, onMessage }) {
   if (!auction) return null;
   return (
     <div className="live-offers-focus" role="region" aria-label={`Offers for ${auction.title}`} aria-busy={loading || awardLoading} data-offers-focus-target="true" tabIndex="-1">
@@ -482,7 +482,7 @@ function LiveOffers({ auction, bids, loading, error, decidingId, closing, award,
         <div className="dashboard-card dashboard-empty dashboard-empty--compact award-handoff-state" role="status" aria-live="polite"><span><LoaderCircle className="spin-icon" size={27} /></span><h2>Loading your award record</h2><p>Retrieving the frozen scope and contract-pending handoff.</p></div>
       ) : awardError ? (
         <div className="dashboard-card dashboard-empty dashboard-empty--compact award-handoff-state" role="alert"><span><CircleAlert size={27} /></span><h2>Award record could not be loaded</h2><p>{awardError}</p><button className="button button--outline" type="button" onClick={onRetryAward}><RefreshCw size={15} /> Retry</button></div>
-      ) : <AwardHandoff award={award} />)}
+      ) : <AwardHandoff award={award} onMessage={onMessage} />)}
       {auction.status === "open" ? (
         <SealedOffersState auction={auction} closing={closing} onRequestClose={onRequestClose} />
       ) : loading ? (
@@ -536,8 +536,9 @@ function LiveOffers({ auction, bids, loading, error, decidingId, closing, award,
   );
 }
 
-function LiveDashboard({ user, auctions, selectedAuction, onSelect, bids, bidsLoading, bidsError, decidingId, closingOfferWindow, award, awardLoading, awardError, onRetryAward, onDecision, onRequestClose, onRequestAward, active, setActive }) {
+function LiveDashboard({ user, auctions, selectedAuction, onSelect, bids, bidsLoading, bidsError, decidingId, closingOfferWindow, award, awardLoading, awardError, onRetryAward, onDecision, onRequestClose, onRequestAward, active, setActive, preferredBookingId, onSelectMessage }) {
   const totalOffers = auctions.reduce((sum, auction) => sum + Number(auction.bidCount || 0), 0);
+  const conversationCount = auctions.filter((auction) => auction.status === "awarded").length;
   return (
     <>
       <section className="dashboard-topbar">
@@ -547,11 +548,11 @@ function LiveDashboard({ user, auctions, selectedAuction, onSelect, bids, bidsLo
         <div className="dashboard-welcome"><div><div className="eyebrow">Live planning space</div><h1>Good to see you, {user.name.split(" ")[0]}.</h1><p>{auctions.length ? `${auctions.length} active or past request${auctions.length === 1 ? "" : "s"}, with ${totalOffers} offer${totalOffers === 1 ? "" : "s"} received.` : "Your first brief will bring the planning space to life."}</p></div><Link className="button button--primary" to="/request"><Plus size={17} /> New request</Link></div>
         {auctions.length ? (
           <>
-            <DashboardNav active={active} setActive={setActive} offersCount={totalOffers} />
+            <DashboardNav active={active} setActive={setActive} offersCount={totalOffers} conversationsCount={conversationCount} />
             {active === "overview" && <div className="live-dashboard-grid"><RequestSelector auctions={auctions} selectedId={selectedAuction?.id} onSelect={onSelect} /><LiveRequestSummary auction={selectedAuction} /></div>}
-            {active === "offers" && <><RequestSelector auctions={auctions} selectedId={selectedAuction?.id} onSelect={onSelect} /><LiveOffers auction={selectedAuction} bids={bids} loading={bidsLoading} error={bidsError} decidingId={decidingId} closing={closingOfferWindow} award={award} awardLoading={awardLoading} awardError={awardError} onRetryAward={onRetryAward} onDecision={onDecision} onRequestClose={onRequestClose} onRequestAward={onRequestAward} /></>}
+            {active === "offers" && <><RequestSelector auctions={auctions} selectedId={selectedAuction?.id} onSelect={onSelect} /><LiveOffers auction={selectedAuction} bids={bids} loading={bidsLoading} error={bidsError} decidingId={decidingId} closing={closingOfferWindow} award={award} awardLoading={awardLoading} awardError={awardError} onRetryAward={onRetryAward} onDecision={onDecision} onRequestClose={onRequestClose} onRequestAward={onRequestAward} onMessage={(bookingId) => { onSelectMessage(bookingId); setActive("messages"); }} /></>}
             {active === "tasks" && <div className="dashboard-card dashboard-empty"><span><ClipboardCheck size={27} /></span><h2>No task list yet</h2><p>Request and offer decisions are live. Personal task management is the next workspace module.</p></div>}
-            {active === "messages" && <MessagesEmpty />}
+            {active === "messages" && <BookingMessages audience="owner" preferredBookingId={preferredBookingId} onViewScope={(thread) => { onSelect(thread.auctionId); setActive("offers"); }} emptyActionLabel="Review offers" onEmptyAction={() => setActive("offers")} />}
           </>
         ) : (
           <div className="dashboard-card dashboard-empty"><span><Sparkles size={28} /></span><h2>Start with one thoughtful brief</h2><p>Share the date, city, scope and range once. Your requests and real offers will appear here.</p><Link className="button button--primary" to="/request">Create my first request</Link></div>
@@ -561,7 +562,7 @@ function LiveDashboard({ user, auctions, selectedAuction, onSelect, bids, bidsLo
   );
 }
 
-export function DashboardPage({ notify, onOpenAuth }) {
+export function DashboardPage({ notify, onOpenAuth, authRevision = 0 }) {
   const [active, setActive] = useState("overview");
   const [tasks, setTasks] = useState(dashboardTasks);
   const [mode, setMode] = useState("loading");
@@ -582,6 +583,7 @@ export function DashboardPage({ notify, onOpenAuth }) {
   const [awardError, setAwardError] = useState("");
   const [awardRefreshKey, setAwardRefreshKey] = useState(0);
   const [refreshKey, setRefreshKey] = useState(0);
+  const [messageBookingId, setMessageBookingId] = useState(null);
   const bidAcceptanceKeys = useRef(new Map());
   const selectedIdRef = useRef(selectedId);
   const bidsAuctionIdRef = useRef(bidsAuctionId);
@@ -625,7 +627,7 @@ export function DashboardPage({ notify, onOpenAuth }) {
     }
     load();
     return () => controller.abort();
-  }, [refreshKey]);
+  }, [authRevision, refreshKey]);
 
   const selectedAuction = auctions.find((auction) => auction.id === selectedId) || null;
 
@@ -774,7 +776,7 @@ export function DashboardPage({ notify, onOpenAuth }) {
     const awardBusy = Boolean(awardDialog && decidingId === `${awardDialog.auctionId}:${awardDialog.bidId}`);
     const visibleAward = awardAuctionId === selectedId ? award : null;
     const visibleAwardLoading = selectedAuction?.status === "awarded" && (awardAuctionId !== selectedId || awardLoading);
-    return <div className="dashboard-page page-surface"><LiveDashboard user={user} auctions={auctions} selectedAuction={selectedAuction} onSelect={setSelectedId} bids={visibleBids} bidsLoading={visibleBidsLoading} bidsError={bidsAuctionId === selectedId ? bidsError : ""} decidingId={decidingId} closingOfferWindow={closingOfferWindow} award={visibleAward} awardLoading={visibleAwardLoading} awardError={awardAuctionId === selectedId ? awardError : ""} onRetryAward={() => setAwardRefreshKey((value) => value + 1)} onDecision={decideOnBid} onRequestClose={setCloseDialogAuctionId} onRequestAward={(bid) => selectedAuction && setAwardDialog({ auctionId: selectedAuction.id, bidId: bid.id })} active={active} setActive={setActive} /><CloseOfferWindowDialog auction={dialogAuction} open={Boolean(dialogAuction)} closing={closingOfferWindow} onClose={() => !closingOfferWindow && setCloseDialogAuctionId(null)} onConfirm={closeOfferWindow} /><AwardOfferDialog auction={awardAuction} bid={awardBid} open={Boolean(awardAuction && awardBid)} busy={awardBusy} onClose={() => !awardBusy && setAwardDialog(null)} onConfirm={() => awardDialog && decideOnBid(awardDialog.bidId, "accept", awardDialog.auctionId)} /></div>;
+    return <div className="dashboard-page page-surface"><LiveDashboard user={user} auctions={auctions} selectedAuction={selectedAuction} onSelect={setSelectedId} bids={visibleBids} bidsLoading={visibleBidsLoading} bidsError={bidsAuctionId === selectedId ? bidsError : ""} decidingId={decidingId} closingOfferWindow={closingOfferWindow} award={visibleAward} awardLoading={visibleAwardLoading} awardError={awardAuctionId === selectedId ? awardError : ""} onRetryAward={() => setAwardRefreshKey((value) => value + 1)} onDecision={decideOnBid} onRequestClose={setCloseDialogAuctionId} onRequestAward={(bid) => selectedAuction && setAwardDialog({ auctionId: selectedAuction.id, bidId: bid.id })} active={active} setActive={setActive} preferredBookingId={messageBookingId} onSelectMessage={setMessageBookingId} /><CloseOfferWindowDialog auction={dialogAuction} open={Boolean(dialogAuction)} closing={closingOfferWindow} onClose={() => !closingOfferWindow && setCloseDialogAuctionId(null)} onConfirm={closeOfferWindow} /><AwardOfferDialog auction={awardAuction} bid={awardBid} open={Boolean(awardAuction && awardBid)} busy={awardBusy} onClose={() => !awardBusy && setAwardDialog(null)} onConfirm={() => awardDialog && decideOnBid(awardDialog.bidId, "accept", awardDialog.auctionId)} /></div>;
   }
 
   return (
@@ -789,7 +791,7 @@ export function DashboardPage({ notify, onOpenAuth }) {
         {active === "overview" && <Overview tasks={tasks} toggleTask={toggleTask} notify={notify} />}
         {active === "offers" && <OffersCard full notify={notify} />}
         {active === "tasks" && <TasksCard full tasks={tasks} toggleTask={toggleTask} />}
-        {active === "messages" && <MessagesEmpty />}
+        {active === "messages" && <div className="dashboard-card dashboard-empty"><span><MessageSquareText size={27} /></span><h2>Live conversations are unavailable in preview</h2><p>Sign in to read messages connected to an awarded offer. No example conversations are fabricated.</p><button className="button button--primary" type="button" onClick={onOpenAuth}>Sign in</button></div>}
         <p className="demo-disclaimer"><ShieldCheck size={14} /> This dashboard uses labelled example data only because the live account service is unavailable.</p>
       </div>
     </div>

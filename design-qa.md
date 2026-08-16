@@ -22,6 +22,7 @@ The reference and implementation were judged together in the combined input. Mel
 | Marketplace | desktop, empty production catalog | Honest zero-result state rendered; no example listing was presented as a verified production vendor. |
 | Request builder | desktop, steps 1–4 | Required-field errors, service selection, budget/brief validation, review, auth/network handling, and no fake publish success passed. |
 | Customer dashboard | signed out / API unavailable / authenticated contract | Explicit auth, empty, unavailable, and live-data states exist; no unrelated customer data is presented as real. |
+| Offer-window decision | 1440 × 900 and 390 × 844, authenticated | Sealed-state explanation, exact count, irreversible confirmation, focus trap/restore, zero-offer result, and no horizontal overflow passed. |
 | Vendor workspace | signed out / API unavailable / approved-vendor contract | Approval gate, live opportunity contract, example-only fallback, sealed-offer form, and date format passed. |
 | Legal and errors | privacy, terms, unknown route | Every route has a single descriptive H1 and a recoverable navigation path. |
 
@@ -42,6 +43,8 @@ The reference and implementation were judged together in the combined input. Mel
 - **P1 — free Cloudflare Cron Trigger capacity was exhausted: fixed.** Bounded hourly cleanup moved to the SQLite Durable Object’s alarm, with a unit test.
 - **P1 — Gemini output was slow or structurally variable: fixed.** Minimal thinking, bounded retry/timeout, provider-side JSON Schema, server-side schema validation, semantic date clamping, and a clearly labelled deterministic fallback are in place.
 - **P2 — modal/drawer focus could escape: fixed.** Both overlays now trap focus, restore the prior trigger, close on Escape, and expose modal semantics.
+- **P2 — an open request surfaced a generic offer-load failure: fixed.** The dashboard now explains that proposals remain sealed, lets the owner close early with a count-aware warning, and reveals or truthfully empties the comparison only after closure.
+- **P2 — cross-request bid updates and reveal focus could race: fixed.** Async decisions are scoped to their originating request, while a persistent offers region preserves focus as loading becomes the final comparison.
 - **P2 — font build emitted unnecessary language subsets: fixed.** The launch bundle now includes only the Latin font files used by the English interface.
 
 ## Known launch gates, not visual defects

@@ -74,6 +74,23 @@ async function runSmoke() {
       throw new Error("Created request was not visible to its owner.");
     }
 
+    const closed = await request(`/api/v1/auctions/${auctionId}/status`, {
+      method: "PATCH",
+      cookie,
+      body: { status: "closed" },
+    });
+    if (closed.payload?.data?.status !== "closed" || closed.payload?.data?.bidCount !== 0) {
+      throw new Error("Closing the zero-offer window did not return the expected closed state and exact offer count.");
+    }
+    const closedReplay = await request(`/api/v1/auctions/${auctionId}/status`, {
+      method: "PATCH",
+      cookie,
+      body: { status: "closed" },
+    });
+    if (closedReplay.payload?.meta?.unchanged !== true) {
+      throw new Error("Replaying the close-window transition was not idempotent.");
+    }
+
     const planner = process.env.MELAIVA_SMOKE_SKIP_PLANNER === "1"
       ? { payload: { meta: { source: "skipped", degraded: false, reason: "disabled_for_environment" } } }
       : await request("/api/v1/planner/generate", {
@@ -95,7 +112,9 @@ async function runSmoke() {
     return {
       health: health.payload?.data?.status,
       role: identity.payload?.data?.user?.role,
-      requestLifecycle: "created-listed-cancelled",
+      requestLifecycle: "created-listed-closed-replayed-cancelled",
+      closedOfferCount: closed.payload.data.bidCount,
+      closeReplayUnchanged: closedReplay.payload.meta.unchanged,
       plannerSource: planner.payload?.meta?.source,
       plannerDegraded: planner.payload?.meta?.degraded,
       plannerReason: planner.payload?.meta?.reason || null,

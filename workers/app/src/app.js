@@ -1725,27 +1725,44 @@ function buildApp() {
     if (!auction || (auction.couple_user_id !== user.id && user.role !== "admin")) {
       throw new ApiError(404, "auction_not_found", "Request not found");
     }
+    if (auction.status === input.status) {
+      const countRow = await db
+        .prepare("SELECT COUNT(*) AS bid_count FROM bids WHERE auction_id = ? AND status != 'withdrawn'")
+        .bind(auction.id)
+        .first();
+      return c.json({ data: { id: auction.id, status: input.status, bidCount: Number(countRow?.bid_count || 0) }, meta: { unchanged: true } });
+    }
     if (!["draft", "open", "closed"].includes(auction.status)) {
       throw new ApiError(409, "invalid_status_transition", "This request can no longer be changed");
     }
-    const update = await db
-      .prepare(
-        `UPDATE auctions SET status = ?, updated_at = CURRENT_TIMESTAMP
-         WHERE id = ? AND status IN ('draft', 'open', 'closed')`,
-      )
-      .bind(input.status, auction.id)
-      .run();
-    if (Number(update?.meta?.changes || 0) !== 1) {
-      throw new ApiError(409, "invalid_status_transition", "This request changed before your update; refresh and try again");
+    const results = await db.batch([
+      db
+        .prepare(
+          `UPDATE auctions SET status = ?, updated_at = CURRENT_TIMESTAMP
+           WHERE id = ? AND status = ?`,
+        )
+        .bind(input.status, auction.id, auction.status),
+      db
+        .prepare(
+          `INSERT INTO audit_events (actor_user_id, action, entity_type, entity_id, metadata_json)
+           SELECT ?, 'auction.status_changed', 'auction', ?, ? WHERE changes() = 1`,
+        )
+        .bind(user.id, auction.id, JSON.stringify({ from: auction.status, to: input.status })),
+    ]);
+    if (Number(results?.[0]?.meta?.changes || 0) !== 1) {
+      const latest = await db.prepare("SELECT status FROM auctions WHERE id = ? LIMIT 1").bind(auction.id).first();
+      if (latest?.status !== input.status) {
+        throw new ApiError(409, "invalid_status_transition", "This request changed before your update; refresh and try again");
+      }
     }
-    await db
-      .prepare(
-        `INSERT INTO audit_events (actor_user_id, action, entity_type, entity_id, metadata_json)
-         VALUES (?, 'auction.status_changed', 'auction', ?, ?)`,
-      )
-      .bind(user.id, auction.id, JSON.stringify({ from: auction.status, to: input.status }))
-      .run();
-    return c.json({ data: { id: auction.id, status: input.status } });
+    const countRow = await db
+      .prepare("SELECT COUNT(*) AS bid_count FROM bids WHERE auction_id = ? AND status != 'withdrawn'")
+      .bind(auction.id)
+      .first();
+    return c.json({
+      data: { id: auction.id, status: input.status, bidCount: Number(countRow?.bid_count || 0) },
+      ...(Number(results?.[0]?.meta?.changes || 0) === 1 ? {} : { meta: { unchanged: true } }),
+    });
   });
 
   app.get(`${API_PREFIX}/auctions/:id/bids`, async (c) => {

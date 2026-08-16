@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState } from "react";
+import { useEffect, useId, useRef, useState } from "react";
 import { Link } from "react-router-dom";
 import {
   ArrowRight,
@@ -23,6 +23,7 @@ import {
   Sparkles,
   Star,
   Users,
+  X,
 } from "lucide-react";
 import { dashboardTasks, formatCurrency, sampleOffers } from "../data.js";
 import { createIdempotencyKey, readApiResponse } from "../api.js";
@@ -192,40 +193,151 @@ function LiveRequestSummary({ auction }) {
   );
 }
 
-function LiveOffers({ auction, bids, loading, error, decidingId, onDecision }) {
-  if (!auction) return null;
-  if (loading) return <div className="dashboard-card dashboard-empty dashboard-empty--compact"><span><LoaderCircle className="spin-icon" size={27} /></span><h2>Loading offers</h2><p>Retrieving the proposals connected to this brief.</p></div>;
-  if (error) return <div className="dashboard-card dashboard-empty dashboard-empty--compact"><span><CircleAlert size={27} /></span><h2>Offers could not be loaded</h2><p>{error}</p></div>;
-  if (!bids.length) return <div className="dashboard-card dashboard-empty dashboard-empty--compact"><span><FileText size={27} /></span><h2>No offers yet</h2><p>Approved partners can respond until {formatDate(auction.biddingEndsAt)}. You will see complete proposals here.</p></div>;
-
+function SealedOffersState({ auction, closing, onRequestClose }) {
+  const offerCount = Number(auction.bidCount || 0);
+  const hasOffers = offerCount > 0;
   return (
-    <section className="dashboard-card live-offers-card">
-      <div className="dashboard-card__heading"><div><span className="card-icon card-icon--marigold"><FileText size={18} /></span><div><h2>Offers for {auction.title}</h2><p>{bids.length} complete proposal{bids.length === 1 ? "" : "s"}</p></div></div><span className="trust-note"><LockKeyhole size={14} /> Private comparison</span></div>
-      <div className="live-offer-list">
-        {bids.map((bid) => {
-          const businessName = bid.vendor?.businessName || "Approved partner";
-          const busy = decidingId === bid.id;
-          return (
-            <article className="live-offer" key={bid.id}>
-              <div className="live-offer__top"><span className="offer-logo">{businessName.split(" ").map((word) => word[0]).join("").slice(0, 2)}</span><div><strong>{businessName}</strong><small>{bid.vendor?.verified ? "Melaiva verified" : "Partner proposal"}</small></div><div><small>Total offer</small><strong>{formatCurrency(bid.amount)}</strong></div><span className={`status-pill status-pill--${bid.status === "accepted" ? "teal" : "neutral"}`}><span /> {bid.status}</span></div>
-              <p>{bid.proposal}</p>
-              <ul>{bid.deliverables.map((item) => <li key={item}><Check size={14} /> {item}</li>)}</ul>
-              {bid.validUntil && <small className="live-offer__validity">Valid until {formatDate(bid.validUntil)}</small>}
-              {auction.status === "closed" && ["submitted", "shortlisted"].includes(bid.status) && (
-                <div className="live-offer__actions">
-                  <button className="button button--small button--outline" type="button" disabled={busy} onClick={() => onDecision(bid.id, bid.status === "shortlisted" ? "reject" : "shortlist")}>{bid.status === "shortlisted" ? "Decline" : "Shortlist"}</button>
-                  <button className="button button--small button--primary" type="button" disabled={busy} onClick={() => onDecision(bid.id, "accept")}>{busy ? "Saving…" : "Accept offer"}</button>
-                </div>
-              )}
-            </article>
-          );
-        })}
-      </div>
+    <section className="dashboard-card sealed-offers-state" aria-labelledby="sealed-offers-title">
+      <span className="sealed-offers-state__icon"><LockKeyhole size={28} /></span>
+      <div className="eyebrow">Private until you are ready</div>
+      <h2 id="sealed-offers-title">{hasOffers ? `${offerCount} sealed offer${offerCount === 1 ? " is" : "s are"} waiting` : "Your offer window is open"}</h2>
+      <p>
+        {hasOffers
+          ? "Partner names, pricing and proposals stay hidden from everyone else until you close the window and compare them together."
+          : "Approved partners can still respond. Their names, pricing and proposals remain private until this window closes."}
+      </p>
+      <dl className="sealed-offers-state__facts">
+        <div><dt>Offers received</dt><dd>{offerCount}</dd></div>
+        <div><dt>Scheduled close</dt><dd>{formatDate(auction.biddingEndsAt, { hour: "numeric", minute: "2-digit" })}</dd></div>
+      </dl>
+      <button className={`button ${hasOffers ? "button--primary" : "button--outline"}`} type="button" aria-haspopup="dialog" disabled={closing} onClick={() => onRequestClose(auction.id)}>
+        {closing ? <span className="button-loader" aria-hidden="true" /> : <FileText size={17} />}
+        {closing ? "Closing securely…" : hasOffers ? `Close window and compare ${offerCount}` : "Close offer window early"}
+      </button>
+      <small><ShieldCheck size={14} /> Closing stops new proposals and cannot be undone.</small>
     </section>
   );
 }
 
-function LiveDashboard({ user, auctions, selectedAuction, onSelect, bids, bidsLoading, bidsError, decidingId, onDecision, active, setActive }) {
+function CloseOfferWindowDialog({ auction, open, closing, onClose, onConfirm }) {
+  const dialogRef = useRef(null);
+  const onCloseRef = useRef(onClose);
+  const closingRef = useRef(closing);
+  const titleId = useId();
+  const offerCount = Number(auction?.bidCount || 0);
+
+  useEffect(() => {
+    onCloseRef.current = onClose;
+    closingRef.current = closing;
+    if (closing) dialogRef.current?.focus();
+  }, [closing, onClose]);
+
+  useEffect(() => {
+    if (!open) return undefined;
+    const previous = document.activeElement;
+    document.body.classList.add("modal-open");
+    const timer = window.setTimeout(() => dialogRef.current?.querySelector('[data-dialog-initial-focus="true"]')?.focus(), 30);
+    function onKeyDown(event) {
+      if (event.key === "Escape" && !closingRef.current) onCloseRef.current();
+      if (event.key !== "Tab") return;
+      const focusable = dialogRef.current?.querySelectorAll(
+        'button:not([disabled]), a[href], [tabindex]:not([tabindex="-1"])',
+      );
+      if (!focusable?.length) {
+        event.preventDefault();
+        dialogRef.current?.focus();
+        return;
+      }
+      const first = focusable[0];
+      const last = focusable[focusable.length - 1];
+      if (event.shiftKey && document.activeElement === first) {
+        event.preventDefault();
+        last.focus();
+      } else if (!event.shiftKey && document.activeElement === last) {
+        event.preventDefault();
+        first.focus();
+      }
+    }
+    window.addEventListener("keydown", onKeyDown);
+    return () => {
+      window.clearTimeout(timer);
+      window.removeEventListener("keydown", onKeyDown);
+      document.body.classList.remove("modal-open");
+      if (previous?.isConnected) previous.focus?.();
+      else (document.querySelector('[data-offers-focus-target="true"]') || document.getElementById("main-content"))?.focus?.();
+    };
+  }, [open]);
+
+  if (!open || !auction) return null;
+  const hasOffers = offerCount > 0;
+  return (
+    <div className="modal-backdrop" onMouseDown={(event) => event.target === event.currentTarget && !closing && onClose()}>
+      <section className="modal-card close-offer-dialog" role="dialog" aria-modal="true" aria-labelledby={titleId} ref={dialogRef} tabIndex="-1">
+        <button className="icon-button modal-card__close" type="button" onClick={onClose} disabled={closing} aria-label="Keep offer window open" data-dialog-initial-focus="true"><X size={20} /></button>
+        <span className={`close-offer-dialog__icon ${hasOffers ? "" : "close-offer-dialog__icon--warning"}`}><LockKeyhole size={26} /></span>
+        <div className="eyebrow">Final window decision</div>
+        <h2 id={titleId}>{hasOffers ? `Reveal ${offerCount} sealed offer${offerCount === 1 ? "" : "s"}?` : "Close without any offers?"}</h2>
+        <p>
+          {hasOffers
+            ? "Closing now stops new proposals and reveals every partner, price and scope together for a private comparison."
+            : "No offers have arrived yet. Closing now stops every new proposal and leaves this request without options to compare."}
+        </p>
+        <dl>
+          <div><dt>Request</dt><dd>{auction.title}</dd></div>
+          <div><dt>Scheduled close</dt><dd>{formatDate(auction.biddingEndsAt, { hour: "numeric", minute: "2-digit" })}</dd></div>
+        </dl>
+        <div className="close-offer-dialog__warning"><CircleAlert size={17} /><span>This window cannot be reopened after you close it.</span></div>
+        <div className="close-offer-dialog__actions">
+          <button className="button button--outline" type="button" onClick={onClose} disabled={closing}>Keep window open</button>
+          <button className="button button--primary" type="button" onClick={onConfirm} disabled={closing}>{closing ? <span className="button-loader" aria-hidden="true" /> : <FileText size={17} />}{closing ? "Closing securely…" : hasOffers ? "Close and compare" : "Close without offers"}</button>
+        </div>
+      </section>
+    </div>
+  );
+}
+
+function LiveOffers({ auction, bids, loading, error, decidingId, closing, onDecision, onRequestClose }) {
+  if (!auction) return null;
+  return (
+    <div className="live-offers-focus" role="region" aria-label={`Offers for ${auction.title}`} aria-busy={loading} data-offers-focus-target="true" tabIndex="-1">
+      {auction.status === "open" ? (
+        <SealedOffersState auction={auction} closing={closing} onRequestClose={onRequestClose} />
+      ) : loading ? (
+        <div className="dashboard-card dashboard-empty dashboard-empty--compact"><span><LoaderCircle className="spin-icon" size={27} /></span><h2>Loading offers</h2><p>Retrieving the proposals connected to this brief.</p></div>
+      ) : error ? (
+        <div className="dashboard-card dashboard-empty dashboard-empty--compact"><span><CircleAlert size={27} /></span><h2>Offers could not be loaded</h2><p>{error}</p></div>
+      ) : !bids.length ? (
+        <div className="dashboard-card dashboard-empty dashboard-empty--compact"><span><FileText size={27} /></span><h2>No offers were received</h2><p>This request closed without a proposal. Create a revised brief or contact Melaiva support before making a vendor decision.</p><Link className="button button--primary" to="/request">Create a new brief</Link></div>
+      ) : (
+        <section className="dashboard-card live-offers-card">
+          <div className="dashboard-card__heading"><div><span className="card-icon card-icon--marigold"><FileText size={18} /></span><div><h2>Offers for {auction.title}</h2><p>{bids.length} complete proposal{bids.length === 1 ? "" : "s"}</p></div></div><span className="trust-note"><LockKeyhole size={14} /> Private comparison</span></div>
+          <div className="live-offer-list">
+            {bids.map((bid) => {
+              const businessName = bid.vendor?.businessName || "Approved partner";
+              const busy = decidingId === `${auction.id}:${bid.id}`;
+              return (
+                <article className="live-offer" key={bid.id}>
+                  <div className="live-offer__top"><span className="offer-logo">{businessName.split(" ").map((word) => word[0]).join("").slice(0, 2)}</span><div><strong>{businessName}</strong><small>{bid.vendor?.verified ? "Melaiva verified" : "Partner proposal"}</small></div><div><small>Total offer</small><strong>{formatCurrency(bid.amount)}</strong></div><span className={`status-pill status-pill--${bid.status === "accepted" ? "teal" : "neutral"}`}><span /> {bid.status}</span></div>
+                  <p>{bid.proposal}</p>
+                  <ul>{bid.deliverables.map((item) => <li key={item}><Check size={14} /> {item}</li>)}</ul>
+                  {bid.validUntil && <small className="live-offer__validity">Valid until {formatDate(bid.validUntil)}</small>}
+                  {auction.status === "closed" && ["submitted", "shortlisted"].includes(bid.status) && (
+                    <div className="live-offer__actions">
+                      <button className="button button--small button--outline" type="button" disabled={busy} onClick={() => onDecision(bid.id, bid.status === "shortlisted" ? "reject" : "shortlist")}>{bid.status === "shortlisted" ? "Decline" : "Shortlist"}</button>
+                      <button className="button button--small button--primary" type="button" disabled={busy} onClick={() => onDecision(bid.id, "accept")}>{busy ? "Saving…" : "Accept offer"}</button>
+                    </div>
+                  )}
+                </article>
+              );
+            })}
+          </div>
+        </section>
+      )}
+    </div>
+  );
+}
+
+function LiveDashboard({ user, auctions, selectedAuction, onSelect, bids, bidsLoading, bidsError, decidingId, closingOfferWindow, onDecision, onRequestClose, active, setActive }) {
   const totalOffers = auctions.reduce((sum, auction) => sum + Number(auction.bidCount || 0), 0);
   return (
     <>
@@ -238,7 +350,7 @@ function LiveDashboard({ user, auctions, selectedAuction, onSelect, bids, bidsLo
           <>
             <DashboardNav active={active} setActive={setActive} offersCount={totalOffers} />
             {active === "overview" && <div className="live-dashboard-grid"><RequestSelector auctions={auctions} selectedId={selectedAuction?.id} onSelect={onSelect} /><LiveRequestSummary auction={selectedAuction} /></div>}
-            {active === "offers" && <><RequestSelector auctions={auctions} selectedId={selectedAuction?.id} onSelect={onSelect} /><LiveOffers auction={selectedAuction} bids={bids} loading={bidsLoading} error={bidsError} decidingId={decidingId} onDecision={onDecision} /></>}
+            {active === "offers" && <><RequestSelector auctions={auctions} selectedId={selectedAuction?.id} onSelect={onSelect} /><LiveOffers auction={selectedAuction} bids={bids} loading={bidsLoading} error={bidsError} decidingId={decidingId} closing={closingOfferWindow} onDecision={onDecision} onRequestClose={onRequestClose} /></>}
             {active === "tasks" && <div className="dashboard-card dashboard-empty"><span><ClipboardCheck size={27} /></span><h2>No task list yet</h2><p>Request and offer decisions are live. Personal task management is the next workspace module.</p></div>}
             {active === "messages" && <MessagesEmpty />}
           </>
@@ -258,11 +370,18 @@ export function DashboardPage({ notify, onOpenAuth }) {
   const [auctions, setAuctions] = useState([]);
   const [selectedId, setSelectedId] = useState(null);
   const [bids, setBids] = useState([]);
+  const [bidsAuctionId, setBidsAuctionId] = useState(null);
   const [bidsLoading, setBidsLoading] = useState(false);
   const [bidsError, setBidsError] = useState("");
   const [decidingId, setDecidingId] = useState(null);
+  const [closeDialogAuctionId, setCloseDialogAuctionId] = useState(null);
+  const [closingOfferWindow, setClosingOfferWindow] = useState(false);
   const [refreshKey, setRefreshKey] = useState(0);
   const bidAcceptanceKeys = useRef(new Map());
+  const selectedIdRef = useRef(selectedId);
+  const bidsAuctionIdRef = useRef(bidsAuctionId);
+  selectedIdRef.current = selectedId;
+  bidsAuctionIdRef.current = bidsAuctionId;
 
   useEffect(() => {
     const controller = new AbortController();
@@ -286,6 +405,9 @@ export function DashboardPage({ notify, onOpenAuth }) {
         if (controller.signal.aborted) return;
         setUser(nextUser);
         setAuctions(nextAuctions);
+        setBids([]);
+        setBidsAuctionId(null);
+        setBidsError("");
         setSelectedId((current) => nextAuctions.some((auction) => auction.id === current) ? current : nextAuctions[0]?.id || null);
         setMode("live");
       } catch (error) {
@@ -297,11 +419,19 @@ export function DashboardPage({ notify, onOpenAuth }) {
     return () => controller.abort();
   }, [refreshKey]);
 
+  const selectedAuction = auctions.find((auction) => auction.id === selectedId) || null;
+
   useEffect(() => {
-    if (mode !== "live" || !selectedId) { setBids([]); return undefined; }
+    if (mode !== "live" || !selectedId || selectedAuction?.status === "open" || Number(selectedAuction?.bidCount || 0) === 0) {
+      setBids([]);
+      setBidsAuctionId(selectedId || null);
+      setBidsError("");
+      setBidsLoading(false);
+      return undefined;
+    }
     const controller = new AbortController();
     async function loadBids() {
-      setBidsLoading(true); setBidsError("");
+      setBids([]); setBidsAuctionId(selectedId); setBidsLoading(true); setBidsError("");
       try {
         const response = await fetch(`/api/v1/auctions/${selectedId}/bids`, { credentials: "include", signal: controller.signal });
         const payload = await readApiResponse(response, "Offers could not be loaded.");
@@ -315,9 +445,7 @@ export function DashboardPage({ notify, onOpenAuth }) {
     }
     loadBids();
     return () => controller.abort();
-  }, [mode, selectedId]);
-
-  const selectedAuction = auctions.find((auction) => auction.id === selectedId) || null;
+  }, [mode, selectedAuction?.bidCount, selectedAuction?.status, selectedId]);
 
   function acceptanceKeyFor(auctionId, bidId) {
     const scope = `${auctionId}:${bidId}`;
@@ -334,29 +462,63 @@ export function DashboardPage({ notify, onOpenAuth }) {
   }
 
   async function decideOnBid(bidId, action) {
+    if (!selectedId || bidsAuctionId !== selectedId) return;
     if (action === "accept" && !window.confirm("Accept this offer? This awards the request and closes the other open offers.")) return;
-    setDecidingId(bidId);
+    const auctionId = selectedId;
+    const decisionKey = `${auctionId}:${bidId}`;
+    setDecidingId(decisionKey);
     try {
       const headers = { "Content-Type": "application/json" };
-      if (action === "accept") headers["Idempotency-Key"] = acceptanceKeyFor(selectedId, bidId);
-      const response = await fetch(`/api/v1/auctions/${selectedId}/bids/${bidId}`, {
+      if (action === "accept") headers["Idempotency-Key"] = acceptanceKeyFor(auctionId, bidId);
+      const response = await fetch(`/api/v1/auctions/${auctionId}/bids/${bidId}`, {
         method: "PATCH",
         headers,
         credentials: "include",
         body: JSON.stringify({ action }),
       });
       await readApiResponse(response, "The offer decision could not be saved.");
-      setBids((current) => current.map((bid) => {
-        if (action === "accept") return { ...bid, status: bid.id === bidId ? "accepted" : ["submitted", "shortlisted"].includes(bid.status) ? "rejected" : bid.status };
-        if (bid.id !== bidId) return bid;
-        return { ...bid, status: action === "shortlist" ? "shortlisted" : "rejected" };
-      }));
-      if (action === "accept") setAuctions((current) => current.map((auction) => auction.id === selectedId ? { ...auction, status: "awarded" } : auction));
+      if (selectedIdRef.current === auctionId && bidsAuctionIdRef.current === auctionId) {
+        setBids((current) => current.map((bid) => {
+          if (action === "accept") return { ...bid, status: bid.id === bidId ? "accepted" : ["submitted", "shortlisted"].includes(bid.status) ? "rejected" : bid.status };
+          if (bid.id !== bidId) return bid;
+          return { ...bid, status: action === "shortlist" ? "shortlisted" : "rejected" };
+        }));
+      }
+      if (action === "accept") setAuctions((current) => current.map((auction) => auction.id === auctionId ? { ...auction, status: "awarded" } : auction));
       notify({ title: action === "accept" ? "Offer accepted" : action === "shortlist" ? "Offer shortlisted" : "Offer removed from shortlist", message: "Your live planning space is up to date." });
     } catch (error) {
       notify({ type: "error", title: "Decision not saved", message: error.message || "Please refresh and try again." });
     } finally {
-      setDecidingId(null);
+      setDecidingId((current) => current === decisionKey ? null : current);
+    }
+  }
+
+  async function closeOfferWindow() {
+    const auction = auctions.find((item) => item.id === closeDialogAuctionId);
+    if (!auction || auction.status !== "open" || closingOfferWindow) return;
+    setClosingOfferWindow(true);
+    try {
+      const response = await fetch(`/api/v1/auctions/${auction.id}/status`, {
+        method: "PATCH",
+        headers: { "Content-Type": "application/json" },
+        credentials: "include",
+        body: JSON.stringify({ status: "closed" }),
+      });
+      const payload = await readApiResponse(response, "The offer window could not be closed.");
+      const bidCount = Number(payload.data?.bidCount ?? auction.bidCount ?? 0);
+      setBidsLoading(bidCount > 0);
+      setBidsAuctionId(auction.id);
+      setAuctions((current) => current.map((item) => item.id === auction.id ? { ...item, status: "closed", bidCount } : item));
+      setCloseDialogAuctionId(null);
+      setBidsError("");
+      notify({
+        title: bidCount ? "Offers ready to compare" : "Offer window closed",
+        message: bidCount ? `${bidCount} sealed offer${bidCount === 1 ? " is" : "s are"} now visible only in your planning space.` : "No new proposals can be submitted to this request.",
+      });
+    } catch (error) {
+      notify({ type: "error", title: "Window still open", message: error.message || "Please refresh and try again." });
+    } finally {
+      setClosingOfferWindow(false);
     }
   }
 
@@ -370,7 +532,10 @@ export function DashboardPage({ notify, onOpenAuth }) {
   if (mode === "wrong-role") return <div className="dashboard-page page-surface"><AccountState icon={ShieldCheck} eyebrow="Account workspace" title="This is the couple planning space" message="Vendor accounts manage matched opportunities and proposals from the partner workspace."><Link className="button button--primary" to="/vendor">Open vendor workspace</Link></AccountState></div>;
 
   if (mode === "live") {
-    return <div className="dashboard-page page-surface"><LiveDashboard user={user} auctions={auctions} selectedAuction={selectedAuction} onSelect={setSelectedId} bids={bids} bidsLoading={bidsLoading} bidsError={bidsError} decidingId={decidingId} onDecision={decideOnBid} active={active} setActive={setActive} /></div>;
+    const dialogAuction = auctions.find((auction) => auction.id === closeDialogAuctionId) || null;
+    const visibleBids = bidsAuctionId === selectedId ? bids : [];
+    const visibleBidsLoading = selectedAuction?.status !== "open" && (bidsAuctionId !== selectedId || bidsLoading);
+    return <div className="dashboard-page page-surface"><LiveDashboard user={user} auctions={auctions} selectedAuction={selectedAuction} onSelect={setSelectedId} bids={visibleBids} bidsLoading={visibleBidsLoading} bidsError={bidsAuctionId === selectedId ? bidsError : ""} decidingId={decidingId} closingOfferWindow={closingOfferWindow} onDecision={decideOnBid} onRequestClose={setCloseDialogAuctionId} active={active} setActive={setActive} /><CloseOfferWindowDialog auction={dialogAuction} open={Boolean(dialogAuction)} closing={closingOfferWindow} onClose={() => !closingOfferWindow && setCloseDialogAuctionId(null)} onConfirm={closeOfferWindow} /></div>;
   }
 
   return (

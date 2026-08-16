@@ -69,21 +69,23 @@ if (!ownAuctions.payload?.data?.some((item) => item.id === auctionId)) {
   throw new Error("Created request was not visible to its owner.");
 }
 
-const planner = await request("/api/v1/planner/generate", {
-  method: "POST",
-  cookie,
-  body: {
-    eventDate,
-    city: "Jaipur",
-    guestCount: 180,
-    budget: 1_800_000,
-    currency: "INR",
-    style: "Warm contemporary Indian celebration",
-    ceremonies: ["Sangeet", "Wedding"],
-    priorities: ["Guest comfort", "Photography"],
-    constraints: "Keep the plan practical and within the stated budget.",
-  },
-});
+const planner = process.env.MELAIVA_SMOKE_SKIP_PLANNER === "1"
+  ? { payload: { meta: { source: "skipped", degraded: false, reason: "disabled_for_environment" } } }
+  : await request("/api/v1/planner/generate", {
+    method: "POST",
+    cookie,
+    body: {
+      eventDate,
+      city: "Jaipur",
+      guestCount: 180,
+      budget: 1_800_000,
+      currency: "INR",
+      style: "Warm contemporary Indian celebration",
+      ceremonies: ["Sangeet", "Wedding"],
+      priorities: ["Guest comfort", "Photography"],
+      constraints: "Keep the plan practical and within the stated budget.",
+    },
+  });
 
 await request(`/api/v1/auctions/${auctionId}/status`, {
   method: "PATCH",

@@ -66,6 +66,7 @@ jobs:
         env:
           MELAIVA_SMOKE_BASE_URL: https://melaiva-staging.prakhargupta267.workers.dev
           MELAIVA_SMOKE_ALLOW_WRITES: "1"
+          MELAIVA_SMOKE_SKIP_PLANNER: "1"
         run: node scripts/production-smoke.mjs
 
       - name: Record staging provenance

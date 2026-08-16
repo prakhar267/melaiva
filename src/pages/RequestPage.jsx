@@ -121,29 +121,34 @@ function CelebrationStep({ data, update, errors, selectedVendor }) {
   );
 }
 
-function ServicesStep({ data, toggle, errors }) {
+function ServicesStep({ data, select, errors }) {
   return (
     <div className="wizard-panel">
-      <div className="wizard-panel__heading"><span>02</span><div><div className="eyebrow">The team</div><h2>What do you need help finding?</h2><p>Choose one or several. Each category receives only the relevant part of your brief.</p></div></div>
-      <div className="service-choice-grid">
-        {categories.map((category) => {
-          const selected = data.categories.includes(category.id);
-          return <label className={selected ? "is-selected" : ""} key={category.id}><input type="checkbox" checked={selected} onChange={() => toggle(category.id)} /><span className="service-choice__check"><Check size={15} /></span><div><strong>{category.name}</strong><small>{category.short}</small></div></label>;
-        })}
-      </div>
+      <div className="wizard-panel__heading"><span>02</span><div><div className="eyebrow">One comparable pool</div><h2 id="service-choice-title">Which service should this request cover?</h2><p id="service-choice-help">Choose one service. Separate requests keep every offer focused on the same scope, budget and decision.</p></div></div>
+      <fieldset className="service-choice-fieldset" aria-labelledby="service-choice-title" aria-describedby="service-choice-help">
+        <legend>Choose one service for this request</legend>
+        <div className="service-choice-grid">
+          {categories.map((category) => {
+            const selected = data.categories[0] === category.id;
+            return <label className={selected ? "is-selected" : ""} key={category.id}><input type="radio" name="service-category" value={category.id} checked={selected} onChange={() => select(category.id)} /><span className="service-choice__check" aria-hidden="true"><Check size={15} /></span><div><strong>{category.name}</strong><small>{category.short}</small></div></label>;
+          })}
+        </div>
+      </fieldset>
       <FieldError>{errors.categories}</FieldError>
-      <div className="wizard-assurance"><ShieldCheck size={18} /><p><strong>Relevant, not relentless.</strong> We limit each request to suitable partners so you receive fewer, more considered offers.</p></div>
+      <div className="wizard-assurance"><ShieldCheck size={18} /><p><strong>Comparable by design.</strong> Need another service? Create a separate request so one award never closes an unrelated offer.</p></div>
     </div>
   );
 }
 
 function BudgetStep({ data, update, errors }) {
+  const selectedCategory = categories.find((category) => category.id === data.categories[0]);
+  const categoryLabel = selectedCategory?.name || "this service";
   return (
     <div className="wizard-panel">
-      <div className="wizard-panel__heading"><span>03</span><div><div className="eyebrow">Useful context</div><h2>Set a range, then add the nuance</h2><p>A realistic range helps partners build an offer that can actually work.</p></div></div>
+      <div className="wizard-panel__heading"><span>03</span><div><div className="eyebrow">Useful context</div><h2>Set the working range for {categoryLabel}</h2><p>A service-specific range helps partners build an offer that can actually work.</p></div></div>
       <div className="form-grid">
-        <label className="field"><span>Budget from</span><div className="input-wrap"><BadgeIndianRupee size={17} /><input type="number" inputMode="numeric" min="10000" step="10000" value={data.budgetMin} onChange={(event) => update("budgetMin", event.target.value)} /></div><small className="field-hint">{formatCurrency(Number(data.budgetMin || 0))}</small><FieldError>{errors.budgetMin}</FieldError></label>
-        <label className="field"><span>Budget up to</span><div className="input-wrap"><BadgeIndianRupee size={17} /><input type="number" inputMode="numeric" min="10000" step="10000" value={data.budgetMax} onChange={(event) => update("budgetMax", event.target.value)} /></div><small className="field-hint">{formatCurrency(Number(data.budgetMax || 0))}</small><FieldError>{errors.budgetMax}</FieldError></label>
+        <label className="field"><span>{categoryLabel} budget from</span><div className="input-wrap"><BadgeIndianRupee size={17} /><input type="number" inputMode="numeric" min="10000" step="10000" value={data.budgetMin} onChange={(event) => update("budgetMin", event.target.value)} /></div><small className="field-hint">{formatCurrency(Number(data.budgetMin || 0))}</small><FieldError>{errors.budgetMin}</FieldError></label>
+        <label className="field"><span>{categoryLabel} budget up to</span><div className="input-wrap"><BadgeIndianRupee size={17} /><input type="number" inputMode="numeric" min="10000" step="10000" value={data.budgetMax} onChange={(event) => update("budgetMax", event.target.value)} /></div><small className="field-hint">{formatCurrency(Number(data.budgetMax || 0))}</small><FieldError>{errors.budgetMax}</FieldError></label>
         <label className="field field--span-2"><span>Offer window closes</span><div className="input-wrap"><Clock3 size={17} /><input type="datetime-local" value={data.biddingEndsAt} onChange={(event) => update("biddingEndsAt", event.target.value)} /></div><small className="field-hint">Partners will not see anyone else’s offer.</small><FieldError>{errors.biddingEndsAt}</FieldError></label>
         <label className="field field--span-2"><span>Describe what a great fit looks like</span><textarea rows="6" value={data.requirements} onChange={(event) => update("requirements", event.target.value)} placeholder="Share the events, overall feel, must-have deliverables, venue constraints and anything you definitely do or don’t want…" /><div className="field-counter"><FieldError>{errors.requirements}</FieldError><span>{data.requirements.length} / 1,500</span></div></label>
       </div>
@@ -159,7 +164,7 @@ function ReviewStep({ data, selectedVendor }) {
       <div className="review-card">
         <div className="review-card__header"><div><small>{data.eventType}</small><h3>{data.title}</h3><p><MapPin size={14} /> {data.city}<span /> <CalendarDays size={14} /> {new Date(`${data.eventDate}T00:00:00`).toLocaleDateString("en-IN", { day: "numeric", month: "long", year: "numeric" })}<span /> <Users size={14} /> {data.guestCount} guests</p></div><span className="status-pill"><span /> Draft</span></div>
         <dl className="review-details">
-          <div><dt>Services</dt><dd>{data.categories.map((id) => categories.find((item) => item.id === id)?.name).join(", ")}</dd></div>
+          <div><dt>Service</dt><dd>{categories.find((item) => item.id === data.categories[0])?.name || "Not selected"}</dd></div>
           <div><dt>Working range</dt><dd>{formatCurrency(Number(data.budgetMin))} – {formatCurrency(Number(data.budgetMax))}</dd></div>
           <div><dt>Offer window</dt><dd>Until {new Date(data.biddingEndsAt).toLocaleString("en-IN", { day: "numeric", month: "short", hour: "numeric", minute: "2-digit" })}</dd></div>
           {selectedVendor && <div><dt>Requested partner</dt><dd>{selectedVendor.name}</dd></div>}
@@ -268,8 +273,8 @@ export function RequestPage({ notify, onOpenAuth }) {
     const normalize = (value) => String(value || "").trim().toLowerCase();
     const categoryMatches = data.categories.some((category) => resolvedVendor.categories.map(normalize).includes(normalize(category)));
     const cityMatches = resolvedVendor.serviceAreas.map(normalize).includes(normalize(data.city));
-    if (!categoryMatches && !cityMatches) return "The chosen services and city are outside this partner’s approved profile.";
-    if (!categoryMatches) return "None of the chosen services match this partner’s approved categories.";
+    if (!categoryMatches && !cityMatches) return "The chosen service and city are outside this partner’s approved profile.";
+    if (!categoryMatches) return "The chosen service does not match this partner’s approved categories.";
     if (!cityMatches) return "This city is outside the partner’s approved service areas.";
     return "";
   }, [data.categories, data.city, resolvedVendor]);
@@ -285,9 +290,9 @@ export function RequestPage({ notify, onOpenAuth }) {
     setData((current) => ({ ...current, [key]: value }));
     setErrors((current) => ({ ...current, [key]: "" }));
   }
-  function toggleCategory(id) {
+  function selectCategory(id) {
     touchedFields.current.categories = true;
-    setData((current) => ({ ...current, categories: current.categories.includes(id) ? current.categories.filter((item) => item !== id) : [...current.categories, id] }));
+    setData((current) => ({ ...current, categories: [id] }));
     setErrors((current) => ({ ...current, categories: "" }));
   }
   function validate(targetStep) {
@@ -299,7 +304,7 @@ export function RequestPage({ notify, onOpenAuth }) {
       if (!data.city) next.city = "Choose a city.";
       if (Number(data.guestCount) < 20) next.guestCount = "Enter at least 20 guests.";
     }
-    if (targetStep === 2 && !data.categories.length) next.categories = "Choose at least one service.";
+    if (targetStep === 2 && data.categories.length !== 1) next.categories = "Choose one service for this request.";
     if (targetStep === 3) {
       if (Number(data.budgetMin) < 10000) next.budgetMin = "Enter a starting budget.";
       if (Number(data.budgetMax) <= Number(data.budgetMin)) next.budgetMax = "Maximum must be higher than the minimum.";
@@ -362,7 +367,7 @@ export function RequestPage({ notify, onOpenAuth }) {
             onRetry={() => { setDismissedVendorParam(null); setVendorRetryKey((value) => value + 1); }}
           />
           {step === 1 && <CelebrationStep data={data} update={update} errors={errors} selectedVendor={selectedVendor} />}
-          {step === 2 && <ServicesStep data={data} toggle={toggleCategory} errors={errors} />}
+          {step === 2 && <ServicesStep data={data} select={selectCategory} errors={errors} />}
           {step === 3 && <BudgetStep data={data} update={update} errors={errors} />}
           {step === 4 && <ReviewStep data={data} selectedVendor={selectedVendor} />}
           <div className="wizard-actions">

@@ -864,8 +864,7 @@ async function conditionalIdempotencyStatement(db, scope, key, userId, requestHa
     );
 }
 
-async function approvedVendorForUser(db, user) {
-  if (user.role !== "vendor") return null;
+async function vendorForUser(db, user) {
   return db
     .prepare(
       `SELECT id, status, category, categories_json, city, service_areas_json
@@ -1088,6 +1087,83 @@ function mapBid(row) {
     status: row.status,
     createdAt: row.created_at,
     updatedAt: row.updated_at,
+  };
+}
+
+function endOfIndiaDate(value) {
+  return new Date(`${value}T18:29:59.999Z`).getTime();
+}
+
+function buildAcceptedScope(auction, bid, awardedAt) {
+  return {
+    request: {
+      id: auction.id,
+      title: auction.title,
+      eventType: auction.event_type,
+      eventDate: auction.event_date,
+      city: auction.city,
+      guestCount: Number(auction.guest_count),
+      budgetMin: Number(auction.budget_min),
+      budgetMax: Number(auction.budget_max),
+      currency: auction.currency,
+      categories: safeJsonArray(auction.categories_json),
+      requirements: auction.requirements,
+      status: "awarded",
+      biddingEndsAt: auction.bidding_ends_at,
+      bidCount: Number(auction.bid_count || 0),
+      createdAt: auction.created_at,
+    },
+    offer: {
+      id: bid.id,
+      auctionId: bid.auction_id,
+      amount: Number(bid.amount),
+      currency: bid.currency,
+      proposal: bid.proposal,
+      deliverables: safeJsonArray(bid.deliverables_json),
+      exclusions: safeJsonArray(bid.exclusions_json),
+      gstIncluded: Boolean(bid.gst_included),
+      gstRate: Number(bid.gst_rate || 0),
+      travelPolicy: bid.travel_policy || "not_applicable",
+      travelFee: Number(bid.travel_fee || 0),
+      addOns: safeJsonArray(bid.add_ons_json),
+      cancellationTerms: bid.cancellation_terms || "",
+      deliveryPlan: bid.delivery_plan || "",
+      structuredTermsProvided: Boolean(bid.structured_terms_provided),
+      validUntil: bid.valid_until || null,
+      status: "accepted",
+      createdAt: bid.created_at,
+      updatedAt: awardedAt,
+    },
+    vendor: {
+      id: bid.vendor_id,
+      slug: bid.vendor_slug || null,
+      businessName: bid.business_name || null,
+      verified: Boolean(bid.vendor_verified),
+      rating: Number(bid.vendor_rating || 0),
+    },
+  };
+}
+
+function mapAward(row, user) {
+  let snapshot;
+  try {
+    snapshot = JSON.parse(row.accepted_scope_json);
+  } catch {
+    throw new ApiError(503, "award_unavailable", "The award record is temporarily unavailable");
+  }
+  const audienceRole = user.role === "admin"
+    ? "admin"
+    : row.couple_user_id === user.id
+      ? "owner"
+      : "vendor";
+  return {
+    id: row.id,
+    auctionId: row.auction_id,
+    acceptedBidId: row.accepted_bid_id,
+    status: row.status,
+    awardedAt: row.awarded_at,
+    audienceRole,
+    snapshot,
   };
 }
 
@@ -1413,13 +1489,11 @@ function buildApp() {
   app.get(`${API_PREFIX}/auth/me`, async (c) => {
     const user = await currentUser(c);
     let vendor = null;
-    if (user.role === "vendor") {
-      const row = await requireDatabase(c.env)
-        .prepare("SELECT id, slug, business_name, status FROM vendors WHERE user_id = ? LIMIT 1")
-        .bind(user.id)
-        .first();
-      if (row) vendor = { id: row.id, slug: row.slug, businessName: row.business_name, status: row.status };
-    }
+    const row = await requireDatabase(c.env)
+      .prepare("SELECT id, slug, business_name, status FROM vendors WHERE user_id = ? LIMIT 1")
+      .bind(user.id)
+      .first();
+    if (row) vendor = { id: row.id, slug: row.slug, businessName: row.business_name, status: row.status };
     return c.json({ data: { user, vendor } });
   });
 
@@ -1536,8 +1610,8 @@ function buildApp() {
 
   app.post(`${API_PREFIX}/auctions`, async (c) => {
     const user = await currentUser(c);
-    if (user.role !== "couple" && user.role !== "admin") {
-      throw new ApiError(403, "role_not_allowed", "Only couple accounts can create requests");
+    if (!["couple", "vendor", "admin"].includes(user.role)) {
+      throw new ApiError(403, "role_not_allowed", "This account cannot create requests");
     }
     const requestKey = idempotencyKey(c, { required: true });
     const input = await parseJson(c, auctionSchema);
@@ -1553,6 +1627,9 @@ function buildApp() {
     const scope = "auction-create";
     const replay = await findIdempotentResult(db, scope, requestKey, user.id, requestHash);
     if (replay) return c.json({ data: replay.value, meta: { replayed: true } }, replay.status);
+    if (canonicalCategories.length !== 1) {
+      throw new ApiError(422, "single_category_required", "Choose exactly one service category for each request");
+    }
     await enforceRateLimit(c, `auction-create:${user.id}`, 12, 60 * 60);
     const eventTime = new Date(`${input.eventDate}T23:59:59Z`).getTime();
     const biddingTime = new Date(normalizedBiddingEndsAt).getTime();
@@ -1715,18 +1792,20 @@ function buildApp() {
     let selectExtras = "";
     let order = "a.created_at DESC";
     let mapOptions = {};
-    if (user.role === "vendor") {
-      const vendor = await approvedVendorForUser(db, user);
+    const vendor = !mine && user.role !== "admin" ? await vendorForUser(db, user) : null;
+    if (!mine && vendor) {
       if (!vendor || vendor.status !== "approved") throw new ApiError(403, "vendor_not_approved", "Vendor approval is required");
       joins = `LEFT JOIN auction_vendor_invites avi
                  ON avi.auction_id = a.id AND avi.vendor_id = ?`;
       selectExtras = `,
         CASE WHEN avi.vendor_id IS NULL THEN 0 ELSE 1 END AS direct_invite,
         avi.status AS direct_invite_status`;
-      where = `a.status = 'open' AND a.bidding_ends_at > ? AND ${VENDOR_AUCTION_MATCH_SQL}`;
-      binds = [vendor.id, new Date().toISOString(), vendor.id];
+      where = `a.status = 'open' AND a.bidding_ends_at > ? AND a.couple_user_id != ? AND ${VENDOR_AUCTION_MATCH_SQL}`;
+      binds = [vendor.id, new Date().toISOString(), user.id, vendor.id];
       order = "CASE WHEN avi.vendor_id IS NULL THEN 1 ELSE 0 END, a.created_at DESC";
       mapOptions = { vendorView: true };
+    } else if (!mine && user.role === "vendor") {
+      throw new ApiError(403, "vendor_not_approved", "Vendor approval is required");
     } else if (user.role === "admin" && !mine) {
       where = "a.status = 'open' AND a.bidding_ends_at > ?";
       binds = [new Date().toISOString()];
@@ -1758,6 +1837,50 @@ function buildApp() {
     return c.json({ data: auctions, meta: { page, limit, hasMore: auctions.length === limit } });
   });
 
+  app.get(`${API_PREFIX}/bookings`, async (c) => {
+    const user = await currentUser(c);
+    const page = parsePositiveInt(c.req.query("page"), 1, 10_000);
+    const limit = parsePositiveInt(c.req.query("limit"), 20, 50);
+    const db = requireDatabase(c.env);
+    const where = user.role === "admin" ? "1 = 1" : "(booking.couple_user_id = ? OR vendor.user_id = ?)";
+    const binds = user.role === "admin" ? [] : [user.id, user.id];
+    const result = await db
+      .prepare(
+        `SELECT booking.*, vendor.user_id AS vendor_user_id
+         FROM bookings booking
+         JOIN vendors vendor ON vendor.id = booking.vendor_id
+         WHERE ${where}
+         ORDER BY booking.awarded_at DESC, booking.id DESC
+         LIMIT ? OFFSET ?`,
+      )
+      .bind(...binds, limit, (page - 1) * limit)
+      .all();
+    const awards = (result.results || []).map((row) => mapAward(row, user));
+    return c.json({ data: awards, meta: { page, limit, hasMore: awards.length === limit } });
+  });
+
+  app.get(`${API_PREFIX}/auctions/:id/award`, async (c) => {
+    const user = await currentUser(c);
+    const auctionId = c.req.param("id");
+    if (!/^[0-9a-f-]{36}$/i.test(auctionId)) throw new ApiError(404, "award_not_found", "Award record not found");
+    const row = await requireDatabase(c.env)
+      .prepare(
+        `SELECT booking.*, vendor.user_id AS vendor_user_id
+         FROM bookings booking
+         JOIN vendors vendor ON vendor.id = booking.vendor_id
+         WHERE booking.auction_id = ? LIMIT 1`,
+      )
+      .bind(auctionId)
+      .first();
+    if (
+      !row
+      || (user.role !== "admin" && row.couple_user_id !== user.id && row.vendor_user_id !== user.id)
+    ) {
+      throw new ApiError(404, "award_not_found", "Award record not found");
+    }
+    return c.json({ data: mapAward(row, user) });
+  });
+
   app.get(`${API_PREFIX}/auctions/:id`, async (c) => {
     const user = await currentUser(c);
     const id = c.req.param("id");
@@ -1773,7 +1896,7 @@ function buildApp() {
     if (!row) throw new ApiError(404, "auction_not_found", "Request not found");
     const isOwner = user.id === row.couple_user_id;
     if (!isOwner && user.role !== "admin") {
-      const vendor = await approvedVendorForUser(db, user);
+      const vendor = await vendorForUser(db, user);
       if (!vendor || row.status !== "open" || !vendorMatchesAuction(vendor, row)) {
         throw new ApiError(404, "auction_not_found", "Request not found");
       }
@@ -1887,7 +2010,11 @@ function buildApp() {
     const input = await parseJson(c, bidDecisionSchema);
     const db = requireDatabase(c.env);
     const auction = await db
-      .prepare("SELECT id, couple_user_id, status FROM auctions WHERE id = ? LIMIT 1")
+      .prepare(
+        `SELECT a.*, (SELECT COUNT(*) FROM bids counted_bid
+                      WHERE counted_bid.auction_id = a.id AND counted_bid.status != 'withdrawn') AS bid_count
+         FROM auctions a WHERE a.id = ? LIMIT 1`,
+      )
       .bind(c.req.param("auctionId"))
       .first();
     if (!auction || (auction.couple_user_id !== user.id && user.role !== "admin")) {
@@ -1895,7 +2022,8 @@ function buildApp() {
     }
     const bid = await db
       .prepare(
-        `SELECT b.id, b.status, b.valid_until, b.vendor_id, v.status AS vendor_status
+        `SELECT b.*, v.status AS vendor_status, v.slug AS vendor_slug, v.business_name,
+                v.verified AS vendor_verified, v.rating AS vendor_rating
          FROM bids b JOIN vendors v ON v.id = b.vendor_id
          WHERE b.id = ? AND b.auction_id = ? LIMIT 1`,
       )
@@ -1906,9 +2034,26 @@ function buildApp() {
     const requestHash = requestKey ? await canonicalRequestHash(input) : null;
     const scope = `bid-accept:${auction.id}:${bid.id}`;
     const replay = await findIdempotentResult(db, scope, requestKey, user.id, requestHash);
-    if (replay) return c.json({ data: replay.value, meta: { replayed: true } }, replay.status);
+    if (replay) {
+      let replayValue = replay.value;
+      if (input.action === "accept" && !replayValue?.awardId) {
+        const booking = await db
+          .prepare("SELECT id, status FROM bookings WHERE auction_id = ? AND accepted_bid_id = ? LIMIT 1")
+          .bind(auction.id, bid.id)
+          .first();
+        if (booking) replayValue = { ...replayValue, awardId: booking.id, awardStatus: booking.status };
+      }
+      return c.json({ data: replayValue, meta: { replayed: true } }, replay.status);
+    }
     if (auction.status === "open") {
       throw new ApiError(409, "bids_sealed", "Offers remain sealed until this request closes");
+    }
+    if (["shortlist", "accept"].includes(input.action) && safeJsonArray(auction.categories_json).length !== 1) {
+      throw new ApiError(
+        409,
+        "legacy_multi_category_request",
+        "This legacy request contains multiple service categories and cannot be shortlisted or awarded",
+      );
     }
     if (["shortlist", "accept"].includes(input.action) && bid.vendor_status !== "approved") {
       throw new ApiError(409, "vendor_not_approved", "This vendor is no longer eligible for selection");
@@ -1916,13 +2061,27 @@ function buildApp() {
     if (!["submitted", "shortlisted"].includes(bid.status) || auction.status !== "closed") {
       throw new ApiError(409, "invalid_status_transition", "This proposal can no longer be changed");
     }
-    if (input.action === "accept" && bid.valid_until && new Date(`${bid.valid_until}T23:59:59Z`).getTime() < Date.now()) {
+    if (input.action === "shortlist" && bid.status === "shortlisted") {
+      return c.json(
+        { data: { id: bid.id, auctionId: auction.id, status: "shortlisted", auctionStatus: auction.status }, meta: { unchanged: true } },
+      );
+    }
+    if (input.action === "accept" && bid.valid_until && endOfIndiaDate(bid.valid_until) < Date.now()) {
       throw new ApiError(409, "bid_expired", "This proposal has expired");
     }
     const status = input.action === "shortlist" ? "shortlisted" : input.action === "reject" ? "rejected" : "accepted";
-    const responseValue = { id: bid.id, auctionId: auction.id, status, auctionStatus: status === "accepted" ? "awarded" : auction.status };
+    const bookingId = status === "accepted" ? crypto.randomUUID() : null;
+    const awardedAt = status === "accepted" ? new Date().toISOString() : null;
+    const responseValue = {
+      id: bid.id,
+      auctionId: auction.id,
+      status,
+      auctionStatus: status === "accepted" ? "awarded" : auction.status,
+      ...(bookingId ? { awardId: bookingId, awardStatus: "contract_pending" } : {}),
+    };
     if (status === "accepted") {
       let results;
+      const acceptedScope = buildAcceptedScope(auction, bid, awardedAt);
       const statements = [
         db
           .prepare(
@@ -1935,6 +2094,21 @@ function buildApp() {
                )`,
           )
           .bind(bid.id, auction.id, auction.id),
+        db
+          .prepare(
+            `INSERT INTO bookings
+             (id, auction_id, accepted_bid_id, couple_user_id, vendor_id, status, accepted_scope_json, awarded_at)
+             SELECT ?, ?, ?, ?, ?, 'contract_pending', ?, ? WHERE changes() = 1`,
+          )
+          .bind(
+            bookingId,
+            auction.id,
+            bid.id,
+            auction.couple_user_id,
+            bid.vendor_id,
+            JSON.stringify(acceptedScope),
+            awardedAt,
+          ),
       ];
       const idem = await conditionalIdempotencyStatement(
         db,
@@ -1946,7 +2120,7 @@ function buildApp() {
         responseValue,
       );
       if (idem) statements.push(idem);
-      const awardResultIndex = idem ? 3 : 2;
+      const awardResultIndex = idem ? 4 : 3;
       statements.push(
         db
           .prepare(
@@ -1969,7 +2143,7 @@ function buildApp() {
              WHERE changes() = 1
                AND EXISTS (SELECT 1 FROM bids WHERE id = ? AND status = 'accepted')`,
           )
-          .bind(user.id, bid.id, JSON.stringify({ auctionId: auction.id }), bid.id),
+          .bind(user.id, bid.id, JSON.stringify({ auctionId: auction.id, bookingId }), bid.id),
       );
       try {
         results = await db.batch(statements);
@@ -1983,7 +2157,11 @@ function buildApp() {
         }
         throw error;
       }
-      if (Number(results?.[0]?.meta?.changes || 0) !== 1 || Number(results?.[awardResultIndex]?.meta?.changes || 0) !== 1) {
+      if (
+        Number(results?.[0]?.meta?.changes || 0) !== 1
+        || Number(results?.[1]?.meta?.changes || 0) !== 1
+        || Number(results?.[awardResultIndex]?.meta?.changes || 0) !== 1
+      ) {
         const concurrentReplay = await findIdempotentResult(db, scope, requestKey, user.id, requestHash);
         if (concurrentReplay) {
           return c.json({ data: concurrentReplay.value, meta: { replayed: true } }, concurrentReplay.status);
@@ -2022,13 +2200,10 @@ function buildApp() {
 
   app.post(`${API_PREFIX}/auctions/:id/bids`, async (c) => {
     const user = await currentUser(c);
-    if (user.role !== "vendor" && user.role !== "admin") {
-      throw new ApiError(403, "role_not_allowed", "Only approved vendors can submit proposals");
-    }
     await enforceRateLimit(c, `bid-submit:${user.id}`, 30, 60 * 60);
     const input = await parseJson(c, bidSchema, MAX_BID_JSON_BYTES);
     const db = requireDatabase(c.env);
-    const vendor = await approvedVendorForUser(db, user);
+    const vendor = await vendorForUser(db, user);
     if (!vendor || vendor.status !== "approved") {
       throw new ApiError(403, "vendor_not_approved", "Vendor approval is required before bidding");
     }
@@ -2048,7 +2223,7 @@ function buildApp() {
     if (input.currency !== auction.currency) throw new ApiError(422, "currency_mismatch", `Bid currency must be ${auction.currency}`);
     if (
       input.validUntil
-      && new Date(`${input.validUntil}T23:59:59.999Z`).getTime() <= new Date(auction.bidding_ends_at).getTime()
+      && endOfIndiaDate(input.validUntil) <= new Date(auction.bidding_ends_at).getTime()
     ) {
       throw new ApiError(422, "invalid_valid_until", "Proposal validity must end after bidding closes");
     }
@@ -2074,6 +2249,7 @@ function buildApp() {
              SELECT ?, a.id, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'submitted'
              FROM auctions a
              WHERE a.id = ? AND a.status = 'open' AND a.bidding_ends_at > ?
+               AND a.couple_user_id != ?
                AND ${VENDOR_AUCTION_MATCH_SQL}`,
           )
           .bind(
@@ -2095,6 +2271,7 @@ function buildApp() {
             input.validUntil || null,
             auction.id,
             new Date().toISOString(),
+            user.id,
             vendor.id,
           ),
         db
@@ -2144,9 +2321,6 @@ function buildApp() {
 
   app.get(`${API_PREFIX}/bids/mine`, async (c) => {
     const user = await currentUser(c);
-    if (user.role !== "vendor" && user.role !== "admin") {
-      throw new ApiError(403, "role_not_allowed", "Only vendors can view submitted proposals");
-    }
     const db = requireDatabase(c.env);
     const vendor = await db.prepare("SELECT id FROM vendors WHERE user_id = ? LIMIT 1").bind(user.id).first();
     if (!vendor) return c.json({ data: [] });
@@ -2210,7 +2384,6 @@ function buildApp() {
           input.websiteUrl || null,
           input.instagramHandle || null,
         ),
-      db.prepare("UPDATE users SET role = 'vendor', updated_at = CURRENT_TIMESTAMP WHERE id = ?").bind(user.id),
     ]);
     return c.json({ data: { id, slug, businessName: input.businessName, status: "pending" } }, 201);
   });

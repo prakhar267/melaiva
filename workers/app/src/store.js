@@ -1,4 +1,4 @@
-const STORE_SCHEMA_VERSION = 3;
+const STORE_SCHEMA_VERSION = 4;
 const MAINTENANCE_INTERVAL_MS = 60 * 60 * 1000;
 
 const STORE_SCHEMA_V1_SQL = `
@@ -250,7 +250,123 @@ const STORE_SCHEMA_V3_MIGRATION_SQL = `${STORE_SCHEMA_V3_COLUMN_MIGRATIONS
   .map(([, sql]) => `${sql};`)
   .join("\n")}\n${STORE_SCHEMA_V3_FINALIZE_SQL}`;
 
-const STORE_SCHEMA_SQL = `${STORE_SCHEMA_V1_SQL}\n${STORE_SCHEMA_V2_MIGRATION_SQL}\n${STORE_SCHEMA_V3_MIGRATION_SQL}`;
+const STORE_SCHEMA_V4_MIGRATION_SQL = `
+CREATE TABLE IF NOT EXISTS bookings (
+  id TEXT PRIMARY KEY,
+  auction_id TEXT NOT NULL UNIQUE REFERENCES auctions(id) ON DELETE RESTRICT,
+  accepted_bid_id TEXT NOT NULL UNIQUE REFERENCES bids(id) ON DELETE RESTRICT,
+  couple_user_id TEXT NOT NULL REFERENCES users(id) ON DELETE RESTRICT,
+  vendor_id TEXT NOT NULL REFERENCES vendors(id) ON DELETE RESTRICT,
+  status TEXT NOT NULL DEFAULT 'contract_pending' CHECK (status = 'contract_pending'),
+  accepted_scope_json TEXT NOT NULL
+    CHECK (json_valid(accepted_scope_json) AND json_type(accepted_scope_json) = 'object' AND length(accepted_scope_json) <= 100000),
+  awarded_at TEXT NOT NULL,
+  created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+);
+CREATE INDEX IF NOT EXISTS idx_bookings_couple ON bookings(couple_user_id, awarded_at);
+CREATE INDEX IF NOT EXISTS idx_bookings_vendor ON bookings(vendor_id, awarded_at);
+
+INSERT INTO bookings
+  (id, auction_id, accepted_bid_id, couple_user_id, vendor_id, status, accepted_scope_json, awarded_at)
+SELECT
+  'booking-' || b.id,
+  a.id,
+  b.id,
+  a.couple_user_id,
+  b.vendor_id,
+  'contract_pending',
+  json_object(
+    'request', json_object(
+      'id', a.id,
+      'title', a.title,
+      'eventType', a.event_type,
+      'eventDate', a.event_date,
+      'city', a.city,
+      'guestCount', a.guest_count,
+      'budgetMin', a.budget_min,
+      'budgetMax', a.budget_max,
+      'currency', a.currency,
+      'categories', json(a.categories_json),
+      'requirements', a.requirements,
+      'status', 'awarded',
+      'biddingEndsAt', a.bidding_ends_at,
+      'bidCount', (SELECT COUNT(*) FROM bids counted_bid WHERE counted_bid.auction_id = a.id AND counted_bid.status != 'withdrawn'),
+      'createdAt', a.created_at
+    ),
+    'offer', json_object(
+      'id', b.id,
+      'auctionId', b.auction_id,
+      'amount', b.amount,
+      'currency', b.currency,
+      'proposal', b.proposal,
+      'deliverables', json(b.deliverables_json),
+      'exclusions', json(b.exclusions_json),
+      'gstIncluded', json(CASE WHEN b.gst_included = 1 THEN 'true' ELSE 'false' END),
+      'gstRate', b.gst_rate,
+      'travelPolicy', b.travel_policy,
+      'travelFee', b.travel_fee,
+      'addOns', json(b.add_ons_json),
+      'cancellationTerms', b.cancellation_terms,
+      'deliveryPlan', b.delivery_plan,
+      'structuredTermsProvided', json(CASE WHEN b.structured_terms_provided = 1 THEN 'true' ELSE 'false' END),
+      'validUntil', b.valid_until,
+      'status', 'accepted',
+      'createdAt', b.created_at,
+      'updatedAt', COALESCE(
+        strftime('%Y-%m-%dT%H:%M:%fZ', (
+          SELECT accepted_event.created_at FROM audit_events accepted_event
+          WHERE accepted_event.action = 'bid.accepted' AND accepted_event.entity_id = b.id
+          ORDER BY accepted_event.created_at ASC LIMIT 1
+        )),
+        strftime('%Y-%m-%dT%H:%M:%fZ', b.updated_at),
+        strftime('%Y-%m-%dT%H:%M:%fZ', b.created_at)
+      )
+    ),
+    'vendor', json_object(
+      'id', v.id,
+      'slug', v.slug,
+      'businessName', v.business_name,
+      'verified', json(CASE WHEN v.verified = 1 THEN 'true' ELSE 'false' END),
+      'rating', v.rating
+    )
+  ),
+  COALESCE(
+    strftime('%Y-%m-%dT%H:%M:%fZ', (
+      SELECT accepted_event.created_at FROM audit_events accepted_event
+      WHERE accepted_event.action = 'bid.accepted' AND accepted_event.entity_id = b.id
+      ORDER BY accepted_event.created_at ASC LIMIT 1
+    )),
+    strftime('%Y-%m-%dT%H:%M:%fZ', b.updated_at),
+    strftime('%Y-%m-%dT%H:%M:%fZ', b.created_at)
+  )
+FROM bids b
+JOIN auctions a ON a.id = b.auction_id
+JOIN vendors v ON v.id = b.vendor_id
+WHERE b.status = 'accepted'
+  AND NOT EXISTS (
+    SELECT 1 FROM bookings existing
+    WHERE existing.id = 'booking-' || b.id
+      AND existing.auction_id = a.id
+      AND existing.accepted_bid_id = b.id
+  );
+
+CREATE TRIGGER IF NOT EXISTS bookings_immutable_update
+BEFORE UPDATE ON bookings
+BEGIN
+  SELECT RAISE(ABORT, 'booking records are immutable');
+END;
+
+CREATE TRIGGER IF NOT EXISTS bookings_immutable_delete
+BEFORE DELETE ON bookings
+BEGIN
+  SELECT RAISE(ABORT, 'booking records are immutable');
+END;
+
+INSERT OR IGNORE INTO _sql_schema_migrations (id) VALUES (4);
+PRAGMA optimize;
+`;
+
+const STORE_SCHEMA_SQL = `${STORE_SCHEMA_V1_SQL}\n${STORE_SCHEMA_V2_MIGRATION_SQL}\n${STORE_SCHEMA_V3_MIGRATION_SQL}\n${STORE_SCHEMA_V4_MIGRATION_SQL}`;
 
 const DEMO_CATALOG_SQL = `
 INSERT OR IGNORE INTO vendors
@@ -319,6 +435,9 @@ export class MelaivaStore {
           if (!bidColumns.has(name)) this.sql.exec(sql).toArray();
         }
         this.sql.exec(STORE_SCHEMA_V3_FINALIZE_SQL).toArray();
+      }
+      if (version > 0 && version < 4) {
+        this.sql.exec(STORE_SCHEMA_V4_MIGRATION_SQL).toArray();
       }
       if (env?.ENABLE_DEMO_CATALOG === "true" && env?.ENVIRONMENT !== "production") {
         this.sql.exec(DEMO_CATALOG_SQL).toArray();
@@ -453,6 +572,7 @@ export {
   STORE_SCHEMA_V1_SQL,
   STORE_SCHEMA_V2_MIGRATION_SQL,
   STORE_SCHEMA_V3_MIGRATION_SQL,
+  STORE_SCHEMA_V4_MIGRATION_SQL,
   STORE_SCHEMA_VERSION,
   executeSql,
 };

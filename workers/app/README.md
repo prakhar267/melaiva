@@ -68,9 +68,13 @@ The Durable Object maintains an hourly alarm that deletes expired sessions, rate
 - Money fields are integer whole rupees for this INR-only MVP (`moneyUnit: "whole_rupees"`), not paise. Change the schema/API together before adding payments or another currency.
 - Bidding timestamps are normalized to UTC. Conditional writes prevent submit-versus-close races.
 - Offers are sealed while a request is open. Couples can list, shortlist, reject, or accept proposals only after the request closes; administrators retain moderation access.
+- New requests require exactly one service category. Existing multi-service requests remain readable, but shortlist and award decisions are blocked because one accepted offer cannot safely represent unrelated services.
 - New offers use a normalized commercial-terms contract: `deliverables` (inclusions), `exclusions`, `gstIncluded`, `gstRate`, `travelPolicy`, conditional `travelFee`, optional priced `addOns`, `cancellationTerms`, `deliveryPlan`, and optional `validUntil`. Arrays, text, rates, and whole-rupee amounts are bounded server-side. `fixed_fee` travel requires a positive fee; `included` and `not_applicable` allow only an omitted or zero fee.
 - Schema-v3 preserves older offers without inventing disclosures. Legacy rows and backward-compatible v1 payloads return safe empty/zero defaults with `structuredTermsProvided: false`; the current product form submits the complete normalized contract and returns `structuredTermsProvided: true`.
-- A partial unique index permits at most one accepted bid per auction. Accepting a bid atomically awards the auction and rejects remaining open bids.
+- Schema-v4 adds an immutable award handoff containing the accepted request, offer, and vendor snapshot. The request owner, winning vendor, and administrators may read it through `/api/v1/auctions/:id/award` or `/api/v1/bookings`; update/delete triggers protect the record after creation.
+- A partial unique index permits at most one accepted bid per auction. Accepting a bid atomically awards the auction, rejects remaining open bids, and creates its `contract_pending` handoff in the same transaction.
+- Vendor access is capability-based: a customer account may retain its owned requests after completing vendor onboarding, while approved vendor capabilities authorize partner routes without rewriting the account's base role.
+- Offer validity dates expire at the end of the selected day in India Standard Time rather than at UTC midnight.
 - Auction creation and bid acceptance honor `Idempotency-Key` (8-128 safe characters) and replay the original result for retry-safe clients.
 - Gemini responses are schema-checked; amounts are recomputed server-side to total the requested budget, milestone dates are bounded by today/event date, calls time out, and safe telemetry excludes prompts and personal planning data.
 - Production writes fail closed if SQLite is unavailable. Security-sensitive routes never switch to mock state.

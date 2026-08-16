@@ -8,6 +8,7 @@ import {
   STORE_SCHEMA_V1_SQL,
   STORE_SCHEMA_V2_MIGRATION_SQL,
   STORE_SCHEMA_V3_MIGRATION_SQL,
+  STORE_SCHEMA_V4_MIGRATION_SQL,
   STORE_SCHEMA_VERSION,
   createDurableDatabase,
   executeSql,
@@ -180,7 +181,7 @@ test("schema v3 preserves legacy bids and supplies explicit normalized-offer def
 
   sqlite.exec(STORE_SCHEMA_V3_MIGRATION_SQL);
 
-  assert.equal(sqlite.prepare("SELECT MAX(id) AS version FROM _sql_schema_migrations").get().version, STORE_SCHEMA_VERSION);
+  assert.equal(sqlite.prepare("SELECT MAX(id) AS version FROM _sql_schema_migrations").get().version, 3);
   const columns = new Set(sqlite.prepare("PRAGMA table_info(bids)").all().map((column) => column.name));
   for (const name of [
     "exclusions_json",
@@ -246,7 +247,228 @@ test("schema v3 preserves legacy bids and supplies explicit normalized-offer def
   assert.equal(updatedTravel.travel_fee, 15000);
 });
 
-test("schema v3 resumes from an already-added column before recording the migration", async () => {
+test("schema v4 backfills exact accepted scope and makes booking records immutable", () => {
+  const sqlite = new DatabaseSync(":memory:");
+  sqlite.exec(`CREATE TABLE _sql_schema_migrations (
+    id INTEGER PRIMARY KEY,
+    applied_at TEXT NOT NULL DEFAULT (datetime('now'))
+  )`);
+  sqlite.exec(STORE_SCHEMA_V1_SQL);
+  sqlite.exec(STORE_SCHEMA_V2_MIGRATION_SQL);
+  sqlite.exec(STORE_SCHEMA_V3_MIGRATION_SQL);
+  sqlite.exec(`
+    INSERT INTO users
+      (id, name, email, password_hash, password_salt, password_iterations, role, status)
+    VALUES
+      ('couple-award', 'Award Couple', 'award-couple@example.com', 'hash', 'salt', 100000, 'couple', 'active'),
+      ('vendor-award-user', 'Award Vendor', 'award-vendor@example.com', 'hash', 'salt', 100000, 'vendor', 'active');
+    INSERT INTO vendors
+      (id, user_id, slug, business_name, status, category, categories_json, city, service_areas_json,
+       description, min_budget, max_budget, currency, verified, rating)
+    VALUES
+      ('vendor-award', 'vendor-award-user', 'award-studio', 'Award Studio', 'approved', 'photography',
+       '["photography"]', 'Jaipur', '["Jaipur"]',
+       'A complete approved vendor record used to verify immutable accepted-scope backfills.',
+       100000, 500000, 'INR', 1, 4.75);
+    INSERT INTO auctions
+      (id, couple_user_id, title, event_type, event_date, city, guest_count, budget_min, budget_max,
+       currency, categories_json, requirements, status, bidding_ends_at, created_at, updated_at)
+    VALUES
+      ('auction-award', 'couple-award', 'Awarded Jaipur photography', 'wedding', '2028-02-10', 'Jaipur', 180,
+       200000, 400000, 'INR', '["photography"]', 'Retain this exact private accepted request scope.',
+       'awarded', '2027-12-01T12:00:00.000Z', '2027-09-01T00:00:00.000Z', '2027-10-02T03:04:05.000Z');
+    INSERT INTO bids
+      (id, auction_id, vendor_id, amount, currency, proposal, deliverables_json, exclusions_json,
+       gst_included, gst_rate, travel_policy, travel_fee, add_ons_json, cancellation_terms,
+       delivery_plan, structured_terms_provided, valid_until, status, created_at, updated_at)
+    VALUES
+      ('bid-award', 'auction-award', 'vendor-award', 325000, 'INR',
+       'This exact accepted proposal must be copied without changing its commercial meaning.',
+       '["Two photographers","Edited gallery"]', '["Raw footage"]', 0, 18, 'fixed_fee', 15000,
+       '[{"name":"Album","amount":30000}]',
+       'Cancellation follows the signed milestone schedule after a non-refundable booking fee.',
+       'Previews arrive in seven days and the completed gallery arrives within twelve weeks.',
+       1, '2027-12-31', 'accepted', '2027-09-02T00:00:00.000Z', '2027-10-02T03:04:05.000Z');
+    INSERT INTO audit_events (actor_user_id, action, entity_type, entity_id, metadata_json, created_at)
+    VALUES ('couple-award', 'bid.accepted', 'bid', 'bid-award', '{"auctionId":"auction-award"}', '2027-10-02T03:04:05.000Z');
+    INSERT INTO auctions
+      (id, couple_user_id, title, event_type, event_date, city, guest_count, budget_min, budget_max,
+       currency, categories_json, requirements, status, bidding_ends_at)
+    VALUES
+      ('auction-legacy-award', 'couple-award', 'Legacy accepted photography', 'wedding', '2028-03-10',
+       'Jaipur', 90, 100000, 250000, 'INR', '["photography"]',
+       'Legacy accepted scope must stay explicitly incomplete after booking backfill.',
+       'awarded', '2028-01-01T00:00:00.000Z');
+    INSERT INTO bids
+      (id, auction_id, vendor_id, amount, currency, proposal, deliverables_json, status)
+    VALUES
+      ('bid-legacy-award', 'auction-legacy-award', 'vendor-award', 175000, 'INR',
+       'A legacy accepted proposal that predates normalized commercial disclosures.',
+       '["Photography coverage","Edited gallery"]', 'accepted');
+  `);
+
+  sqlite.exec(STORE_SCHEMA_V4_MIGRATION_SQL);
+  sqlite.exec(STORE_SCHEMA_V4_MIGRATION_SQL);
+
+  assert.equal(sqlite.prepare("SELECT MAX(id) AS version FROM _sql_schema_migrations").get().version, 4);
+  assert.equal(sqlite.prepare("SELECT COUNT(*) AS count FROM bookings").get().count, 2);
+  const booking = sqlite.prepare("SELECT * FROM bookings WHERE accepted_bid_id = 'bid-award'").get();
+  assert.equal(booking.id, "booking-bid-award");
+  assert.equal(booking.status, "contract_pending");
+  assert.equal(booking.awarded_at, "2027-10-02T03:04:05.000Z");
+  const snapshot = JSON.parse(booking.accepted_scope_json);
+  assert.deepEqual(snapshot.request.categories, ["photography"]);
+  assert.equal(snapshot.request.requirements, "Retain this exact private accepted request scope.");
+  assert.equal(snapshot.offer.amount, 325000);
+  assert.deepEqual(snapshot.offer.deliverables, ["Two photographers", "Edited gallery"]);
+  assert.deepEqual(snapshot.offer.exclusions, ["Raw footage"]);
+  assert.equal(snapshot.offer.gstIncluded, false);
+  assert.equal(snapshot.offer.structuredTermsProvided, true);
+  assert.deepEqual(snapshot.offer.addOns, [{ name: "Album", amount: 30000 }]);
+  assert.deepEqual(snapshot.vendor, {
+    id: "vendor-award",
+    slug: "award-studio",
+    businessName: "Award Studio",
+    verified: true,
+    rating: 4.75,
+  });
+  const legacySnapshot = JSON.parse(
+    sqlite.prepare("SELECT accepted_scope_json FROM bookings WHERE accepted_bid_id = 'bid-legacy-award'").get().accepted_scope_json,
+  );
+  assert.equal(legacySnapshot.offer.structuredTermsProvided, false);
+  assert.deepEqual(legacySnapshot.offer.deliverables, ["Photography coverage", "Edited gallery"]);
+  assert.deepEqual(legacySnapshot.offer.exclusions, []);
+  assert.deepEqual(legacySnapshot.offer.addOns, []);
+  assert.equal(legacySnapshot.offer.cancellationTerms, "");
+  assert.equal(legacySnapshot.offer.deliveryPlan, "");
+  assert.throws(
+    () => sqlite.prepare("UPDATE bookings SET status = 'contract_pending' WHERE id = 'booking-bid-award'").run(),
+    /booking records are immutable/,
+  );
+  assert.throws(
+    () => sqlite.prepare("DELETE FROM bookings WHERE id = 'booking-bid-award'").run(),
+    /booking records are immutable/,
+  );
+});
+
+function createV3AwardDatabase() {
+  const sqlite = new DatabaseSync(":memory:");
+  sqlite.exec(`CREATE TABLE _sql_schema_migrations (
+    id INTEGER PRIMARY KEY,
+    applied_at TEXT NOT NULL DEFAULT (datetime('now'))
+  )`);
+  sqlite.exec(STORE_SCHEMA_V1_SQL);
+  sqlite.exec(STORE_SCHEMA_V2_MIGRATION_SQL);
+  sqlite.exec(STORE_SCHEMA_V3_MIGRATION_SQL);
+  sqlite.exec(`
+    INSERT INTO users
+      (id, name, email, password_hash, password_salt, password_iterations, role, status)
+    VALUES
+      ('migration-couple', 'Migration Couple', 'migration-couple@example.com', 'hash', 'salt', 100000, 'couple', 'active'),
+      ('migration-vendor-user', 'Migration Vendor', 'migration-vendor@example.com', 'hash', 'salt', 100000, 'vendor', 'active');
+    INSERT INTO vendors
+      (id, user_id, slug, business_name, status, category, categories_json, city, service_areas_json,
+       description, min_budget, max_budget, currency, verified, rating)
+    VALUES
+      ('migration-vendor', 'migration-vendor-user', 'migration-studio', 'Migration Studio', 'approved',
+       'photography', '["photography"]', 'Jaipur', '["Jaipur"]',
+       'A legacy vendor used to exercise restart-safe award migrations.', 100000, 500000, 'INR', 1, 4.5);
+  `);
+  return sqlite;
+}
+
+function seedAcceptedAward(
+  sqlite,
+  suffix,
+  {
+    requirements = "A legacy accepted request with a complete scope for migration testing.",
+    bidCreatedAt = "2027-09-01T01:02:03.000Z",
+    bidUpdatedAt = "2027-10-01T04:05:06.000Z",
+    auditCreatedAt,
+  } = {},
+) {
+  const auctionId = `migration-auction-${suffix}`;
+  const bidId = `migration-bid-${suffix}`;
+  sqlite
+    .prepare(
+      `INSERT INTO auctions
+       (id, couple_user_id, title, event_type, event_date, city, guest_count, budget_min, budget_max,
+        currency, categories_json, requirements, status, bidding_ends_at, created_at, updated_at)
+       VALUES (?, 'migration-couple', ?, 'wedding', '2028-02-10', 'Jaipur', 120, 150000, 350000,
+               'INR', '["photography"]', ?, 'awarded', '2027-12-01T12:00:00.000Z',
+               '2027-08-01T00:00:00.000Z', '2027-10-01T04:05:06.000Z')`,
+    )
+    .run(auctionId, `Migration award ${suffix}`, requirements);
+  sqlite
+    .prepare(
+      `INSERT INTO bids
+       (id, auction_id, vendor_id, amount, currency, proposal, deliverables_json, status, created_at, updated_at)
+       VALUES (?, ?, 'migration-vendor', 225000, 'INR',
+               'A legacy accepted proposal retained for restart-safe migration verification.',
+               '["Photography coverage","Edited gallery"]', 'accepted', ?, ?)`,
+    )
+    .run(bidId, auctionId, bidCreatedAt, bidUpdatedAt);
+  if (auditCreatedAt !== undefined) {
+    sqlite
+      .prepare(
+        `INSERT INTO audit_events
+         (actor_user_id, action, entity_type, entity_id, metadata_json, created_at)
+         VALUES ('migration-couple', 'bid.accepted', 'bid', ?, ?, ?)`,
+      )
+      .run(bidId, JSON.stringify({ auctionId }), auditCreatedAt);
+  }
+  return { auctionId, bidId };
+}
+
+test("schema v4 fails closed instead of marking an oversized accepted scope migrated", () => {
+  const sqlite = createV3AwardDatabase();
+  seedAcceptedAward(sqlite, "oversized", { requirements: "x".repeat(100_001) });
+
+  assert.throws(() => sqlite.exec(STORE_SCHEMA_V4_MIGRATION_SQL), /CHECK constraint failed/);
+  assert.equal(sqlite.prepare("SELECT MAX(id) AS version FROM _sql_schema_migrations").get().version, 3);
+  assert.equal(sqlite.prepare("SELECT COUNT(*) AS count FROM bookings").get().count, 0);
+  assert.equal(
+    sqlite.prepare("SELECT COUNT(*) AS count FROM sqlite_master WHERE type = 'trigger' AND name LIKE 'bookings_immutable_%'").get().count,
+    0,
+  );
+});
+
+test("schema v4 resumes a partial backfill and falls through malformed timestamps", () => {
+  const sqlite = createV3AwardDatabase();
+  const existing = seedAcceptedAward(sqlite, "existing", { auditCreatedAt: "2027-10-01T04:05:06.000Z" });
+  const triggerStart = STORE_SCHEMA_V4_MIGRATION_SQL.indexOf("CREATE TRIGGER IF NOT EXISTS bookings_immutable_update");
+  assert.ok(triggerStart > 0);
+  sqlite.exec(STORE_SCHEMA_V4_MIGRATION_SQL.slice(0, triggerStart));
+  assert.equal(sqlite.prepare("SELECT MAX(id) AS version FROM _sql_schema_migrations").get().version, 3);
+  assert.equal(sqlite.prepare("SELECT COUNT(*) AS count FROM bookings").get().count, 1);
+
+  const fallbackCreatedAt = "2027-11-02T03:04:05.000Z";
+  const remaining = seedAcceptedAward(sqlite, "remaining", {
+    bidCreatedAt: fallbackCreatedAt,
+    bidUpdatedAt: "not-a-timestamp",
+    auditCreatedAt: "also-not-a-timestamp",
+  });
+  sqlite.exec(STORE_SCHEMA_V4_MIGRATION_SQL);
+  sqlite.exec(STORE_SCHEMA_V4_MIGRATION_SQL);
+
+  assert.equal(sqlite.prepare("SELECT MAX(id) AS version FROM _sql_schema_migrations").get().version, 4);
+  assert.equal(sqlite.prepare("SELECT COUNT(*) AS count FROM bookings").get().count, 2);
+  assert.equal(
+    sqlite.prepare("SELECT COUNT(*) AS count FROM bookings WHERE accepted_bid_id = ?").get(existing.bidId).count,
+    1,
+  );
+  const fallbackBooking = sqlite
+    .prepare("SELECT awarded_at, accepted_scope_json FROM bookings WHERE accepted_bid_id = ?")
+    .get(remaining.bidId);
+  assert.equal(fallbackBooking.awarded_at, fallbackCreatedAt);
+  assert.equal(JSON.parse(fallbackBooking.accepted_scope_json).offer.updatedAt, fallbackCreatedAt);
+  assert.equal(
+    sqlite.prepare("SELECT COUNT(*) AS count FROM sqlite_master WHERE type = 'trigger' AND name LIKE 'bookings_immutable_%'").get().count,
+    2,
+  );
+});
+
+test("schema initialization resumes from an already-added v3 column through the latest migration", async () => {
   const sqlite = new DatabaseSync(":memory:");
   sqlite.exec(`CREATE TABLE _sql_schema_migrations (
     id INTEGER PRIMARY KEY,
@@ -283,7 +505,7 @@ test("schema v3 resumes from an already-added column before recording the migrat
   new MelaivaStore(ctx, { ENVIRONMENT: "production" });
   await initialized;
 
-  assert.equal(sqlite.prepare("SELECT MAX(id) AS version FROM _sql_schema_migrations").get().version, 3);
+  assert.equal(sqlite.prepare("SELECT MAX(id) AS version FROM _sql_schema_migrations").get().version, STORE_SCHEMA_VERSION);
   const columns = new Set(sqlite.prepare("PRAGMA table_info(bids)").all().map((column) => column.name));
   for (const name of [
     "exclusions_json",
@@ -298,4 +520,5 @@ test("schema v3 resumes from an already-added column before recording the migrat
   ]) {
     assert.ok(columns.has(name), `missing resumed bids.${name}`);
   }
+  assert.ok(sqlite.prepare("PRAGMA table_info(bookings)").all().some((column) => column.name === "accepted_scope_json"));
 });

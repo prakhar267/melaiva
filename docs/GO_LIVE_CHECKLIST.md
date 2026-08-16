@@ -4,7 +4,7 @@
 
 - [ ] One launch city and active categories are selected.
 - [ ] Each category has enough approved, responsive vendors to deliver the promised offer count.
-- [ ] At least 20 end-to-end sandbox requests have completed through acceptance.
+- [ ] At least 20 end-to-end sandbox requests have completed through the contract-pending award handoff.
 - [ ] Concierge ownership and support escalation are staffed.
 - [ ] All public proof points are real and auditable.
 - [ ] Pricing/commission experiments and refund handling are documented.

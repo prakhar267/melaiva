@@ -14,6 +14,7 @@ import {
   Clock3,
   FileCheck2,
   FileText,
+  Handshake,
   IndianRupee,
   LoaderCircle,
   LockKeyhole,
@@ -41,6 +42,37 @@ function formatDate(value) {
   if (!value) return "To be confirmed";
   const date = new Date(value.length === 10 ? `${value}T00:00:00` : value);
   return Number.isNaN(date.getTime()) ? "To be confirmed" : date.toLocaleDateString("en-IN", { day: "numeric", month: "short", year: "numeric" });
+}
+
+function hasStructuredAwardTerms(offer) {
+  if (offer?.structuredTermsProvided === false) return false;
+  return typeof offer?.cancellationTerms === "string" && offer.cancellationTerms.trim().length > 0
+    && typeof offer?.deliveryPlan === "string" && offer.deliveryPlan.trim().length > 0
+    && typeof offer?.gstIncluded === "boolean"
+    && Number.isInteger(Number(offer?.gstRate))
+    && ["included", "fixed_fee", "not_applicable"].includes(offer?.travelPolicy);
+}
+
+function awardGstSummary(offer) {
+  if (!hasStructuredAwardTerms(offer)) return "Not provided";
+  const rate = Number(offer.gstRate);
+  if (rate === 0) return "Not applicable (0%)";
+  return `${rate}% GST ${offer.gstIncluded ? "included" : "additional"}`;
+}
+
+function awardTravelSummary(offer) {
+  if (!hasStructuredAwardTerms(offer)) return "Not provided";
+  if (offer.travelPolicy === "included") return "Included in quoted amount";
+  if (offer.travelPolicy === "not_applicable") return "Not applicable";
+  return Number.isInteger(Number(offer.travelFee)) && Number(offer.travelFee) > 0
+    ? `${formatCurrency(offer.travelFee)} fixed fee`
+    : "Fixed fee not provided";
+}
+
+function VendorAwardTermList({ items, emptyLabel = "Not provided", tone = "included", formatItem = (item) => item }) {
+  if (!Array.isArray(items)) return <p className="offer-term-empty">{emptyLabel}</p>;
+  if (!items.length) return <p className="offer-term-empty">{tone === "excluded" ? "No exclusions declared" : emptyLabel}</p>;
+  return <ul className={`offer-term-list offer-term-list--${tone}`}>{items.map((item, index) => <li key={`${typeof item === "string" ? item : item?.name || "item"}-${index}`}>{tone === "excluded" ? <CircleAlert size={13} /> : <Check size={13} />}<span>{formatItem(item)}</span></li>)}</ul>;
 }
 
 function closingLabel(value) {
@@ -84,10 +116,11 @@ function createAddOn() {
   };
 }
 
-function VendorWorkspaceNav({ active, setActive, opportunityCount, offerCount }) {
+function VendorWorkspaceNav({ active, setActive, opportunityCount, offerCount, awardCount }) {
   const items = [
     ["opportunities", BriefcaseBusiness, "Opportunities", opportunityCount],
     ["offers", FileText, "My offers", offerCount],
+    ["awards", Handshake, "Award handoffs", awardCount],
     ["messages", MessageSquareText, "Messages"],
     ["profile", Store, "Business profile"],
   ];
@@ -259,6 +292,39 @@ function VendorOffers({ offers, demo }) {
   );
 }
 
+function VendorAwards({ awards, demo, loading, error, onRetry }) {
+  if (!demo && loading) return <div className="vendor-tab-panel"><div className="vendor-empty" role="status" aria-live="polite"><span><LoaderCircle className="spin-icon" size={28} /></span><h2>Loading award handoffs</h2><p>Retrieving the read-only records for work awarded to this business.</p></div></div>;
+  if (!demo && error) return <div className="vendor-tab-panel"><div className="vendor-empty" role="alert"><span><CircleAlert size={28} /></span><h2>Award handoffs could not be loaded</h2><p>{error} Your live opportunities and submitted offers remain available.</p><button className="button button--outline" type="button" onClick={onRetry}><RefreshCw size={15} /> Retry awards</button></div></div>;
+  if (!awards.length) return <div className="vendor-empty" role="status"><span><Handshake size={28} /></span><h2>{demo ? "Example awards are not live" : "No awarded work yet"}</h2><p>{demo ? "The live service is unavailable, so this preview does not invent award records." : "When a couple awards one of your offers, the frozen scope and contract-pending handoff will appear here."}</p></div>;
+  return (
+    <div className="vendor-tab-panel">
+      <div className="vendor-panel-heading"><div><h2>Award handoffs</h2><p>Read-only scope records shared with the couple after an offer is awarded.</p></div></div>
+      <div className="vendor-award-list">
+        {awards.map((award) => {
+          const snapshot = award.snapshot || {};
+          const request = snapshot.request || {};
+          const offer = snapshot.offer || {};
+          const structured = hasStructuredAwardTerms(offer);
+          const exclusions = structured && Array.isArray(offer.exclusions) ? offer.exclusions : null;
+          const addOns = structured && Array.isArray(offer.addOns) ? offer.addOns : null;
+          const proposal = typeof offer.proposal === "string" && offer.proposal.trim() ? offer.proposal : "Not provided";
+          return (
+            <article className="vendor-award-card" aria-labelledby={`vendor-award-${award.id}`} key={award.id}>
+              <div className="vendor-award-card__top"><span className="card-icon card-icon--teal"><Handshake size={18} /></span><div><small>Award reference {String(award.id).slice(0, 8).toUpperCase()}</small><h3 id={`vendor-award-${award.id}`}>{request.title || "Celebration request"}</h3><p>{[formatDate(request.eventDate), request.city].filter(Boolean).join(" · ")}</p></div><span className="status-pill status-pill--direct"><span /> Contract pending</span></div>
+              {!structured && <div className="offer-legacy-note vendor-award-card__legacy"><CircleAlert size={16} /><span>This legacy offer did not capture every normalized commercial term. Missing details remain explicitly marked “Not provided.”</span></div>}
+              <dl><div><dt>Accepted amount</dt><dd>{formatCurrency(offer.amount)}</dd></div><div><dt>GST</dt><dd>{awardGstSummary(offer)}</dd></div><div><dt>Travel</dt><dd>{awardTravelSummary(offer)}</dd></div><div><dt>Valid until</dt><dd>{offer.validUntil ? formatDate(offer.validUntil) : "Not provided"}</dd></div><div><dt>Awarded</dt><dd>{formatDate(award.awardedAt)}</dd></div><div><dt>Service</dt><dd>{Array.isArray(request.categories) && request.categories.length ? request.categories.map(categoryLabel).join(" · ") : "Not provided"}</dd></div></dl>
+              <section className="vendor-award-card__proposal"><h4>Accepted proposal</h4><p>{proposal}</p></section>
+              <div className="vendor-award-card__scope"><section className="offer-term-card"><h4>Accepted inclusions</h4><VendorAwardTermList items={Array.isArray(offer.deliverables) ? offer.deliverables : null} /></section><section className="offer-term-card"><h4>Accepted exclusions</h4><VendorAwardTermList items={exclusions} tone="excluded" /></section></div>
+              <div className="vendor-award-card__terms"><section className="offer-term-card"><h4>Priced add-ons</h4><VendorAwardTermList items={addOns} emptyLabel={structured ? "No priced add-ons" : "Not provided"} formatItem={(item) => `${item?.name || "Unnamed add-on"} · ${Number.isFinite(Number(item?.amount)) ? formatCurrency(item.amount) : "Price not provided"}`} /></section><section className="offer-term-card"><h4>Delivery plan</h4><p>{structured ? offer.deliveryPlan : "Not provided"}</p></section><section className="offer-term-card"><h4>Cancellation terms</h4><p>{structured ? offer.cancellationTerms : "Not provided"}</p></section></div>
+              <div className="vendor-award-card__next"><ShieldCheck size={17} /><p><strong>Arrange and review a written contract outside Melaiva.</strong><span>Before any signature or payment, agree it directly with the couple and confirm it mirrors every frozen term above. Melaiva does not provide signing or payment in this workspace.</span></p></div>
+            </article>
+          );
+        })}
+      </div>
+    </div>
+  );
+}
+
 function VendorEmpty({ type }) {
   const Icon = type === "profile" ? Store : MessageSquareText;
   return <div className="vendor-empty"><span><Icon size={28} /></span><h2>{type === "profile" ? "Your business profile" : "No open conversations"}</h2><p>{type === "profile" ? "Complete onboarding to manage portfolio details, service areas and starting budgets here." : "When a couple chooses to connect after reviewing an offer, the conversation will appear here."}</p>{type === "profile" && <Link className="button button--primary" to="/vendor/onboarding">Complete profile</Link>}</div>;
@@ -274,6 +340,10 @@ export function VendorPage({ notify, onOpenAuth }) {
   const [profile, setProfile] = useState(null);
   const [opportunities, setOpportunities] = useState([]);
   const [offers, setOffers] = useState([]);
+  const [awards, setAwards] = useState([]);
+  const [awardsLoading, setAwardsLoading] = useState(false);
+  const [awardsError, setAwardsError] = useState("");
+  const [awardsRefreshKey, setAwardsRefreshKey] = useState(0);
   const [refreshKey, setRefreshKey] = useState(0);
 
   useEffect(() => {
@@ -286,7 +356,7 @@ export function VendorPage({ notify, onOpenAuth }) {
         const mePayload = await readApiResponse(meResponse, "The partner workspace is temporarily unavailable.");
         const nextUser = mePayload.data?.user;
         const nextVendor = mePayload.data?.vendor;
-        if (nextUser?.role !== "vendor" || !nextVendor) { if (!controller.signal.aborted) { setProfile({ user: nextUser, vendor: nextVendor }); setMode("not-vendor"); } return; }
+        if (!nextVendor) { if (!controller.signal.aborted) { setProfile({ user: nextUser, vendor: nextVendor }); setMode("not-vendor"); } return; }
         if (nextVendor.status !== "approved") { if (!controller.signal.aborted) { setProfile({ user: nextUser, vendor: nextVendor }); setMode("pending"); } return; }
         const [auctionResponse, offerResponse] = await Promise.all([
           fetch("/api/v1/auctions?limit=50", { credentials: "include", signal: controller.signal }),
@@ -300,6 +370,8 @@ export function VendorPage({ notify, onOpenAuth }) {
         setProfile({ user: nextUser, vendor: nextVendor });
         setOpportunities((Array.isArray(auctionPayload.data) ? auctionPayload.data : []).map(toOpportunity));
         setOffers(Array.isArray(offerPayload.data) ? offerPayload.data : []);
+        setAwardsLoading(true);
+        setAwardsError("");
         setMode("live");
       } catch (error) {
         if (error?.name === "AbortError" || controller.signal.aborted) return;
@@ -309,6 +381,32 @@ export function VendorPage({ notify, onOpenAuth }) {
     load();
     return () => controller.abort();
   }, [refreshKey]);
+
+  useEffect(() => {
+    if (mode !== "live" || profile?.vendor?.status !== "approved") {
+      setAwards([]);
+      setAwardsError("");
+      setAwardsLoading(false);
+      return undefined;
+    }
+    const controller = new AbortController();
+    async function loadAwards() {
+      setAwardsLoading(true); setAwardsError("");
+      try {
+        const response = await fetch("/api/v1/bookings?limit=50", { credentials: "include", signal: controller.signal });
+        const payload = await readApiResponse(response, "Your award handoffs could not be loaded.");
+        if (!Array.isArray(payload.data)) throw new Error("Your award handoffs could not be loaded.");
+        if (!controller.signal.aborted) setAwards(payload.data.filter((award) => award.audienceRole === "vendor" || award.audienceRole === "admin"));
+      } catch (error) {
+        if (error?.name === "AbortError" || controller.signal.aborted) return;
+        setAwards([]); setAwardsError(error.message || "Your award handoffs could not be loaded.");
+      } finally {
+        if (!controller.signal.aborted) setAwardsLoading(false);
+      }
+    }
+    loadAwards();
+    return () => controller.abort();
+  }, [awardsRefreshKey, mode, profile?.vendor?.id, profile?.vendor?.status]);
 
   const exampleData = useMemo(() => exampleOpportunities.map((opportunity) => ({ ...opportunity, reference: opportunity.id, demo: true })), []);
   const visibleOpportunities = mode === "demo"
@@ -331,9 +429,10 @@ export function VendorPage({ notify, onOpenAuth }) {
         {mode === "demo" && <div className="demo-catalog-note vendor-preview-note"><CircleAlert size={16} /><p><strong>Preview workspace</strong> The live partner service could not be reached. Examples below never submit to real request IDs.</p><button className="text-button" type="button" onClick={() => setRefreshKey((value) => value + 1)}><RefreshCw size={14} /> Retry</button></div>}
         <div className="vendor-welcome"><div><div className="eyebrow">{mode === "demo" ? "Partner workspace preview" : "Partner workspace"}</div><h1>Good opportunities, clearly briefed.</h1><p>{mode === "demo" ? "Explore a clearly labelled example without changing live marketplace data." : "Focus on celebrations that fit your dates, services and working range."}</p></div>{mode === "demo" && <div className="vendor-demo-note"><ShieldCheck size={16} /><span>Example workspace data</span></div>}</div>
         <div className="vendor-metrics"><div><span className="card-icon"><BriefcaseBusiness size={18} /></span><p><small>{mode === "demo" ? "Example matches" : "Open opportunities"}</small><strong>{visibleOpportunities.length}</strong><em>{mode === "demo" ? "Preview" : "Live"}</em></p></div><div><span className="card-icon card-icon--teal"><FileCheck2 size={18} /></span><p><small>Offers under review</small><strong>{mode === "demo" ? "—" : underReview}</strong><em>{mode === "demo" ? "No live data" : "Live"}</em></p></div><div><span className="card-icon card-icon--marigold"><TrendingUp size={18} /></span><p><small>Profile status</small><strong>{mode === "demo" ? "Preview" : "Approved"}</strong><em>{mode === "demo" ? "Example" : "Verified"}</em></p></div><div><span className="card-icon card-icon--rose"><Star size={18} /></span><p><small>Review quality</small><strong>—</strong><em>No rating yet</em></p></div></div>
-        <VendorWorkspaceNav active={active} setActive={setActive} opportunityCount={visibleOpportunities.length} offerCount={mode === "demo" ? 0 : offers.length} />
+        <VendorWorkspaceNav active={active} setActive={setActive} opportunityCount={visibleOpportunities.length} offerCount={mode === "demo" ? 0 : offers.length} awardCount={mode === "demo" ? 0 : awards.length} />
         {active === "opportunities" && <div className="vendor-tab-panel"><div className="vendor-panel-heading"><div><h2>{mode === "demo" ? "Example opportunities" : "Open opportunities"}</h2><p>{mode === "demo" ? "Static examples for evaluating the workflow." : "Private briefs available to your approved business."}</p></div></div>{visibleOpportunities.length ? <div className="opportunity-list">{visibleOpportunities.map((opportunity) => <OpportunityCard opportunity={opportunity} notify={notify} onOpenAuth={onOpenAuth} onSubmitted={() => setRefreshKey((value) => value + 1)} key={opportunity.id} />)}</div> : <div className="vendor-empty"><span><BriefcaseBusiness size={28} /></span><h2>No suitable live briefs right now</h2><p>New approved requests will appear here when they match your partner account.</p></div>}</div>}
         {active === "offers" && <VendorOffers offers={mode === "demo" ? [] : offers} demo={mode === "demo"} />}
+        {active === "awards" && <VendorAwards awards={mode === "demo" ? [] : awards} demo={mode === "demo"} loading={awardsLoading} error={awardsError} onRetry={() => setAwardsRefreshKey((value) => value + 1)} />}
         {active === "messages" && <VendorEmpty type="messages" />}
         {active === "profile" && <VendorEmpty type="profile" />}
       </div>

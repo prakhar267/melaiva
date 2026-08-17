@@ -32,7 +32,9 @@ import { createIdempotencyKey, readApiResponse } from "../api.js";
 import { categories, formatCurrency } from "../data.js";
 import {
   ADMIN_VENDOR_STATUSES,
+  ADMIN_INFORMATION_REQUEST_FIELDS,
   adjustAdminStatusCounts,
+  classifyAdminVendorDecisionFailure,
   adminVendorDecisionAcknowledgement,
   adminVendorEvidenceState,
   adminVendorEvidenceSummaryLabel,
@@ -43,6 +45,8 @@ import {
   normalizeAdminStatusCounts,
   normalizeAdminVendorSummary,
   normalizeAdminVendorStatus,
+  informationRequestFieldLabel,
+  validateAdminInformationRequest,
   validateAdminReviewReason,
 } from "../components/adminVendors.js";
 import {
@@ -70,8 +74,11 @@ function formatDate(value, withTime = false) {
 }
 
 function normalizeVendorDetail(vendor) {
-  const revisionValue = vendor?.revision ?? vendor?.reviewRevision;
+  const revisionValue = vendor?.reviewRevision;
   const revision = revisionValue === null || revisionValue === undefined ? Number.NaN : Number(revisionValue);
+  const evidenceReviewedRevision = vendor?.evidenceReviewedRevision === null || vendor?.evidenceReviewedRevision === undefined
+    ? Number.NaN
+    : Number(vendor.evidenceReviewedRevision);
   const evidenceRevision = Number(vendor?.evidenceSummary?.revision);
   const evidenceSummary = vendor?.evidenceSummary && Number.isInteger(evidenceRevision) && evidenceRevision >= 1
     ? {
@@ -94,15 +101,68 @@ function normalizeVendorDetail(vendor) {
         attestedAt: vendor.evidence.attestedAt || null,
       }
     : null;
+  const evidenceHistory = Array.isArray(vendor?.evidenceHistory)
+    ? vendor.evidenceHistory.map((item) => {
+        const itemRevision = Number(item?.revision);
+        if (!Number.isInteger(itemRevision) || itemRevision < 1) return null;
+        return {
+          revision: itemRevision,
+          portfolioUrlCount: Math.max(0, Number(item.portfolioUrlCount) || 0),
+          referenceUrlCount: Math.max(0, Number(item.referenceUrlCount) || 0),
+          registrationType: item.registrationType || null,
+          declarationOnly: Boolean(item.declarationOnly),
+          attestedAt: typeof item.attestedAt === "string" ? item.attestedAt : null,
+          createdAt: typeof item.createdAt === "string" ? item.createdAt : null,
+        };
+      }).filter(Boolean).sort((a, b) => b.revision - a.revision)
+    : [];
+  const requestRevision = vendor?.currentInformationRequest?.revision === null || vendor?.currentInformationRequest?.revision === undefined
+    ? Number.NaN
+    : Number(vendor.currentInformationRequest.revision);
+  const requestEvidenceRevision = vendor?.currentInformationRequest?.evidenceRevision === null || vendor?.currentInformationRequest?.evidenceRevision === undefined
+    ? Number.NaN
+    : Number(vendor.currentInformationRequest.evidenceRevision);
+  const allowedRequestFields = new Set(ADMIN_INFORMATION_REQUEST_FIELDS.map((item) => item.id));
+  const requestFieldsValid = Array.isArray(vendor?.currentInformationRequest?.requestedFields)
+    && vendor.currentInformationRequest.requestedFields.length >= 1
+    && vendor.currentInformationRequest.requestedFields.length <= allowedRequestFields.size
+    && vendor.currentInformationRequest.requestedFields.every((field) => allowedRequestFields.has(field))
+    && new Set(vendor.currentInformationRequest.requestedFields).size
+      === vendor.currentInformationRequest.requestedFields.length;
+  const requestFields = requestFieldsValid ? [...vendor.currentInformationRequest.requestedFields] : [];
+  const requestMessage = typeof vendor?.currentInformationRequest?.applicantMessage === "string"
+    ? vendor.currentInformationRequest.applicantMessage.trim()
+    : "";
+  const currentInformationRequest = vendor?.currentInformationRequest
+    && Number.isInteger(requestRevision)
+    && requestRevision >= 1
+    && Number.isInteger(requestEvidenceRevision)
+    && requestEvidenceRevision >= 0
+    && requestFieldsValid
+    && requestMessage
+    ? {
+        revision: requestRevision,
+        evidenceRevision: requestEvidenceRevision,
+        requestedFields: requestFields,
+        applicantMessage: requestMessage,
+        requestedAt: typeof vendor.currentInformationRequest.requestedAt === "string" ? vendor.currentInformationRequest.requestedAt : null,
+      }
+    : null;
   return {
     ...vendor,
     categories: Array.isArray(vendor?.categories) ? vendor.categories : [],
     serviceAreas: Array.isArray(vendor?.serviceAreas) ? vendor.serviceAreas : [],
     owner: vendor?.owner || null,
+    status: ADMIN_VENDOR_STATUSES.some((item) => item.id === vendor?.status) ? vendor.status : null,
     revision: Number.isInteger(revision) && revision >= 0 ? revision : null,
+    evidenceReviewedRevision: Number.isInteger(evidenceReviewedRevision) && evidenceReviewedRevision >= 0
+      ? evidenceReviewedRevision
+      : null,
     evidenceRequired: vendor?.evidenceRequired === false ? false : true,
     evidenceSummary,
     evidence,
+    evidenceHistory,
+    currentInformationRequest,
   };
 }
 
@@ -158,23 +218,30 @@ function QueueSkeleton() {
   );
 }
 
-function DecisionDialog({ decision, busy, error, onClose, onSubmit }) {
+function DecisionDialog({ decision, busy, blocked = false, unconfirmed = false, error, onClose, onSubmit }) {
   const [reason, setReason] = useState("");
+  const [requestedFields, setRequestedFields] = useState([]);
+  const [applicantMessage, setApplicantMessage] = useState("");
   const [acknowledged, setAcknowledged] = useState(false);
   const [validationError, setValidationError] = useState("");
+  const [informationErrors, setInformationErrors] = useState({});
   const dialogRef = useRef(null);
   const onCloseRef = useRef(onClose);
+  const blockedRef = useRef(blocked);
   const headingId = useId();
   const descriptionId = useId();
   const reasonHintId = useId();
+  const requestedFieldsErrorId = useId();
+  const applicantMessageHintId = useId();
   onCloseRef.current = onClose;
+  blockedRef.current = blocked;
 
   useEffect(() => {
     const previous = document.activeElement;
     document.body.classList.add("modal-open");
-    const timer = window.setTimeout(() => dialogRef.current?.querySelector("textarea")?.focus(), 30);
+    const timer = window.setTimeout(() => dialogRef.current?.querySelector('[data-dialog-initial="true"]')?.focus(), 30);
     function onKeyDown(event) {
-      if (event.key === "Escape") onCloseRef.current?.();
+      if (event.key === "Escape" && !blockedRef.current) onCloseRef.current?.();
       if (event.key !== "Tab") return;
       const focusable = dialogRef.current?.querySelectorAll(
         'a[href], button:not([disabled]), input:not([disabled]), textarea:not([disabled]), [tabindex]:not([tabindex="-1"])',
@@ -204,16 +271,30 @@ function DecisionDialog({ decision, busy, error, onClose, onSubmit }) {
   function submit(event) {
     event.preventDefault();
     const nextError = validateAdminReviewReason(reason, decision.vendor);
+    const nextInformationErrors = decision.action.targetStatus === "needs_information"
+      ? validateAdminInformationRequest({ requestedFields, applicantMessage }, decision.vendor)
+      : {};
     setValidationError(nextError);
-    if (nextError || !acknowledged) return;
+    setInformationErrors(nextInformationErrors);
+    if (nextError || Object.keys(nextInformationErrors).length || !acknowledged) {
+      window.requestAnimationFrame(() => dialogRef.current?.querySelector('[aria-invalid="true"]')?.focus());
+      return;
+    }
     dialogRef.current?.focus();
-    onSubmit({ reason: reason.trim(), idempotencyKey: decision.idempotencyKey });
+    onSubmit({
+      reason: reason.trim(),
+      idempotencyKey: decision.idempotencyKey,
+      ...(decision.action.targetStatus === "needs_information"
+        ? { requestedFields, applicantMessage: applicantMessage.trim() }
+        : {}),
+    });
   }
 
-  const ActionIcon = decision.action.tone === "danger" ? ShieldAlert : decision.action.tone === "neutral" ? RotateCcw : BadgeCheck;
+  const informationAction = decision.action.targetStatus === "needs_information";
+  const ActionIcon = decision.action.tone === "danger" ? ShieldAlert : decision.action.tone === "neutral" ? RotateCcw : informationAction ? CircleAlert : BadgeCheck;
 
   return (
-    <div className="modal-backdrop" onMouseDown={(event) => event.target === event.currentTarget && onClose()}>
+    <div className="modal-backdrop" onMouseDown={(event) => !blocked && event.target === event.currentTarget && onClose()}>
       <form
         className={`modal-card admin-decision-dialog admin-decision-dialog--${decision.action.tone}`}
         role="dialog"
@@ -226,7 +307,7 @@ function DecisionDialog({ decision, busy, error, onClose, onSubmit }) {
         onSubmit={submit}
         noValidate
       >
-        <button className="icon-button modal-card__close" type="button" onClick={onClose} disabled={busy} aria-label="Close review decision"><X size={20} /></button>
+        <button className="icon-button modal-card__close" type="button" onClick={onClose} disabled={busy} aria-label={blocked || unconfirmed ? "Close decision draft and review latest application version" : "Close review decision"}><X size={20} /></button>
         <span className="admin-decision-dialog__icon"><ActionIcon size={24} /></span>
         <div className="eyebrow">Partner review decision</div>
         <h2 id={headingId}>{decision.action.title}</h2>
@@ -234,10 +315,29 @@ function DecisionDialog({ decision, busy, error, onClose, onSubmit }) {
         <dl className="admin-decision-dialog__summary">
           <div><dt>Business</dt><dd>{decision.vendor.businessName}</dd></div>
           <div><dt>Status change</dt><dd>{adminVendorStatusLabel(decision.vendor.status)} → {adminVendorStatusLabel(decision.action.targetStatus)}</dd></div>
-          {decision.vendor.evidence && <div><dt>Evidence snapshot</dt><dd>Revision {decision.vendor.evidence.revision} · {decision.vendor.evidence.portfolioUrls.length + decision.vendor.evidence.referenceUrls.length} submitted link{decision.vendor.evidence.portfolioUrls.length + decision.vendor.evidence.referenceUrls.length === 1 ? "" : "s"}</dd></div>}
+          <div><dt>Application version</dt><dd>{decision.vendor.revision}</dd></div>
+          {decision.vendor.evidence && <div><dt>Evidence revision</dt><dd>{decision.vendor.evidence.revision} · {decision.vendor.evidence.portfolioUrls.length + decision.vendor.evidence.referenceUrls.length} submitted link{decision.vendor.evidence.portfolioUrls.length + decision.vendor.evidence.referenceUrls.length === 1 ? "" : "s"}</dd></div>}
         </dl>
+        {informationAction && (
+          <section className="admin-information-request-form" aria-labelledby={`${headingId}-information`}>
+            <div><h3 id={`${headingId}-information`}>Applicant-visible request</h3><p>Choose the evidence areas to revise, then write safe instructions the applicant can act on. Do not include internal review notes or identifiers.</p></div>
+            <fieldset disabled={busy || unconfirmed} aria-describedby={informationErrors.requestedFields ? requestedFieldsErrorId : undefined} aria-invalid={Boolean(informationErrors.requestedFields)}>
+              <legend>Evidence areas to update</legend>
+              <div>{ADMIN_INFORMATION_REQUEST_FIELDS.map((field) => {
+                const checked = requestedFields.includes(field.id);
+                return <label key={field.id}><input type="checkbox" checked={checked} onChange={() => { setRequestedFields((current) => checked ? current.filter((item) => item !== field.id) : [...current, field.id]); setInformationErrors((current) => ({ ...current, requestedFields: "" })); }} disabled={busy || unconfirmed} data-dialog-initial={field.id === ADMIN_INFORMATION_REQUEST_FIELDS[0].id ? "true" : undefined} aria-invalid={field.id === ADMIN_INFORMATION_REQUEST_FIELDS[0].id && Boolean(informationErrors.requestedFields)} aria-describedby={field.id === ADMIN_INFORMATION_REQUEST_FIELDS[0].id && informationErrors.requestedFields ? requestedFieldsErrorId : undefined} /><span><Check size={13} /></span><strong>{field.label}</strong></label>;
+              })}</div>
+              {informationErrors.requestedFields && <small className="field-error" id={requestedFieldsErrorId} role="alert">{informationErrors.requestedFields}</small>}
+            </fieldset>
+            <label className="field">
+              <span>Instructions for the applicant</span>
+              <textarea rows="4" minLength="20" maxLength="1000" value={applicantMessage} onChange={(event) => { setApplicantMessage(event.target.value); setInformationErrors((current) => ({ ...current, applicantMessage: "" })); }} aria-invalid={Boolean(informationErrors.applicantMessage)} aria-describedby={applicantMessageHintId} placeholder="Explain what is missing or unclear and what a useful revision should include." disabled={busy || unconfirmed} required />
+              <span className="admin-decision-dialog__reason-meta" id={applicantMessageHintId}><small>{informationErrors.applicantMessage || "Visible to this applicant. Never include URLs, identity numbers, registration references or private staff notes."}</small><small>{applicantMessage.length} / 1,000</small></span>
+            </label>
+          </section>
+        )}
         <label className="field admin-decision-dialog__reason">
-          <span>Internal review reason</span>
+          <span>{informationAction ? "Private internal reason" : "Internal review reason"}</span>
           <textarea
             rows="5"
             minLength="10"
@@ -246,26 +346,27 @@ function DecisionDialog({ decision, busy, error, onClose, onSubmit }) {
             onChange={(event) => { setReason(event.target.value); setValidationError(""); }}
             aria-invalid={Boolean(validationError)}
             aria-describedby={reasonHintId}
-            placeholder="Record the evidence checked and why this status is appropriate."
-            disabled={busy}
+            placeholder={informationAction ? "Record privately why this follow-up is necessary." : "Record the evidence checked and why this status is appropriate."}
+            disabled={busy || unconfirmed}
+            data-dialog-initial={informationAction ? undefined : "true"}
             required
           />
           <span className="admin-decision-dialog__reason-meta" id={reasonHintId}>
-            <small>{validationError || "Visible only to authorised operations staff."}</small>
+            <small>{validationError || (informationAction ? "Private: never shown to the applicant." : "Visible only to authorised operations staff.")}</small>
             <small>{reason.length} / 1,000</small>
           </span>
         </label>
         <label className="admin-decision-dialog__acknowledgement">
-          <input type="checkbox" checked={acknowledged} onChange={(event) => setAcknowledged(event.target.checked)} disabled={busy} />
+          <input type="checkbox" checked={acknowledged} onChange={(event) => setAcknowledged(event.target.checked)} disabled={busy || unconfirmed} />
           <span><Check size={14} /></span>
           <strong>{adminVendorDecisionAcknowledgement(decision.action, decision.vendor)}</strong>
         </label>
-        {error && <p className="form-error admin-decision-dialog__error" role="alert">{error}</p>}
+        {error && <p className={`form-error admin-decision-dialog__error ${blocked ? "is-conflict" : ""}`} role="alert">{blocked && <CircleAlert size={16} />}{error}</p>}
         <div className="admin-decision-dialog__actions">
-          <button className="button button--outline" type="button" onClick={onClose} disabled={busy}>Keep reviewing</button>
-          <button className={`button ${decision.action.tone === "danger" ? "admin-button--danger" : "button--primary"}`} type="submit" disabled={busy || !acknowledged}>
+          <button className="button button--outline" type="button" onClick={onClose} disabled={busy}>{blocked || unconfirmed ? "Close and review latest version" : "Keep reviewing"}</button>
+          <button className={`button ${decision.action.tone === "danger" ? "admin-button--danger" : decision.action.tone === "information" ? "admin-button--information" : "button--primary"}`} type="submit" disabled={busy || blocked || !acknowledged}>
             {busy ? <LoaderCircle className="spin-icon" size={17} /> : <ActionIcon size={17} />}
-            {busy ? "Saving decision…" : decision.action.label}
+            {busy ? "Saving decision…" : unconfirmed ? "Retry same secure decision" : decision.action.label}
           </button>
         </div>
       </form>
@@ -297,7 +398,7 @@ function ReviewHistory({ reviews, truncated, loading, error, onRetry }) {
                     <time dateTime={review.createdAt || undefined}>{formatDate(review.createdAt, true)}</time>
                   </div>
                   {review.reason ? <p>{review.reason}</p> : review.legacy ? <p>Reason not recorded in this legacy review entry.</p> : null}
-                  <small>{actorName}{review.revision !== null ? ` · Revision ${review.revision}` : ""}{review.legacy ? " · Legacy record" : ""}</small>
+                  <small>{actorName}{review.revision !== null ? ` · Application version ${review.revision}` : ""}{review.legacy ? " · Legacy record" : ""}</small>
                 </div>
               </li>
             );
@@ -309,11 +410,41 @@ function ReviewHistory({ reviews, truncated, loading, error, onRetry }) {
   );
 }
 
+function CurrentInformationRequest({ request }) {
+  if (!request) return null;
+  return (
+    <section className="admin-current-information-request" aria-labelledby="admin-current-information-request-heading">
+      <div className="admin-detail-section__heading"><span><CircleAlert size={18} /></span><div><h3 id="admin-current-information-request-heading">Current information request</h3><p>Applicant-visible instructions, separate from private decision reasons.</p></div></div>
+      <dl>
+        <div><dt>Request</dt><dd>{request.revision}</dd></div>
+        <div><dt>Based on evidence revision</dt><dd>{request.evidenceRevision || "No prior evidence"}</dd></div>
+        <div><dt>Requested</dt><dd>{formatDate(request.requestedAt, true)}</dd></div>
+      </dl>
+      <div className="admin-current-information-request__fields"><strong>Evidence areas</strong><ul>{request.requestedFields.map((field) => <li key={field}><Check size={13} />{informationRequestFieldLabel(field)}</li>)}</ul></div>
+      <div className="admin-current-information-request__message"><strong>Message shown to applicant</strong><blockquote>{request.applicantMessage}</blockquote></div>
+    </section>
+  );
+}
+
+function EvidenceRevisionHistory({ revisions, latestRevision }) {
+  return (
+    <section className="admin-evidence-revisions" aria-labelledby="admin-evidence-revisions-heading">
+      <div className="admin-detail-section__heading"><span><History size={18} /></span><div><h3 id="admin-evidence-revisions-heading">Immutable evidence revisions</h3><p>The latest revision is shown in full above. Earlier revisions retain metadata only in this view.</p></div></div>
+      {revisions.length ? <ol>{revisions.map((item) => {
+        const latest = item.revision === latestRevision;
+        return <li className={latest ? "is-latest" : ""} key={item.revision}><span>{latest ? <Check size={13} /> : item.revision}</span><div><div><strong>Evidence revision {item.revision}</strong><small>{latest ? "Latest complete snapshot" : "Previous immutable snapshot"}</small></div><time dateTime={item.createdAt || item.attestedAt || undefined}>{formatDate(item.createdAt || item.attestedAt, true)}</time><p>{item.portfolioUrlCount} portfolio · {item.referenceUrlCount} reference · {registrationLabel(item.registrationType)}{item.declarationOnly ? " · declaration only" : ""}</p></div></li>;
+      })}</ol> : <div className="admin-history-state"><History size={18} /> Evidence revision history metadata is unavailable.</div>}
+    </section>
+  );
+}
+
 function VendorDetail({ vendor, history, historyTruncated, historyLoading, historyError, onRetryHistory, onDecision }) {
   const actions = adminVendorActions(vendor.status);
   const revisionReady = Number.isInteger(vendor.revision);
   const evidenceState = adminVendorEvidenceState(vendor);
   const evidenceBlocksApproval = evidenceState === "required";
+  const requestRecordReady = vendor.status !== "needs_information" || Boolean(vendor.currentInformationRequest);
+  const evidenceRecordReady = !vendor.evidenceSummary || vendor.evidence?.revision === vendor.evidenceSummary.revision;
   const instagramHandle = String(vendor.instagramHandle || "").replace(/^@/, "");
   const website = parsePublicWebsiteUrl(vendor.websiteUrl);
   const portfolioLinks = (vendor.evidence?.portfolioUrls || []).map(parsePublicWebsiteUrl).filter(Boolean);
@@ -327,10 +458,13 @@ function VendorDetail({ vendor, history, historyTruncated, historyLoading, histo
           <span>{String(vendor.businessName || "MV").split(" ").map((word) => word[0]).join("").slice(0, 2).toUpperCase()}</span>
           <div><small>Application {String(vendor.id).slice(0, 8).toUpperCase()}</small><h2 id={`admin-vendor-${vendor.id}`}>{vendor.businessName}</h2><p>{categoryLabel(vendor.category)} · {vendor.city}</p></div>
         </div>
-        <div className="admin-vendor-detail__status"><AdminStatus status={vendor.status} /><small>{revisionReady ? `Revision ${vendor.revision}` : "Version unavailable"}</small></div>
+        <div className="admin-vendor-detail__status"><AdminStatus status={vendor.status} /><small>{revisionReady ? `Application version ${vendor.revision}` : "Application version unavailable"}</small></div>
       </header>
 
-      {!revisionReady && <div className="admin-detail-warning" role="alert"><CircleAlert size={18} /><p><strong>This application cannot be changed safely.</strong><span>The server did not return a review revision. Refresh before making a decision.</span></p></div>}
+      {!revisionReady && <div className="admin-detail-warning" role="alert"><CircleAlert size={18} /><p><strong>This application cannot be changed safely.</strong><span>The server did not return an Application version. Refresh before making a decision.</span></p></div>}
+      {!requestRecordReady && <div className="admin-detail-warning" role="alert"><CircleAlert size={18} /><p><strong>This information request cannot be reviewed safely.</strong><span>The server did not return the current applicant-visible request. Refresh before making another decision.</span></p></div>}
+      {!evidenceRecordReady && <div className="admin-detail-warning" role="alert"><CircleAlert size={18} /><p><strong>This evidence record cannot be reviewed safely.</strong><span>The latest evidence summary and full snapshot do not match. Refresh before making a decision.</span></p></div>}
+      {vendor.evidence && Number.isInteger(vendor.evidenceReviewedRevision) && vendor.evidence.revision > vendor.evidenceReviewedRevision && <div className="admin-detail-revised" role="status"><RefreshCw size={18} /><p><strong>New evidence revision submitted</strong><span>{vendor.evidenceReviewedRevision > 0 ? `Evidence revision ${vendor.evidence.revision} replaces revision ${vendor.evidenceReviewedRevision} for the next review. Both remain immutable.` : `Evidence revision ${vendor.evidence.revision} is ready for its first evidence-backed review.`}</span></p></div>}
       {!vendor.evidence && evidenceState === "required" && <div className="admin-detail-warning" id="admin-evidence-required-warning" role="alert"><CircleAlert size={18} /><p><strong>Structured evidence is still required</strong><span>This application cannot be approved until the partner submits the required public work, reference and business evidence.</span></p></div>}
       {!vendor.evidence && evidenceState === "legacy" && <div className="admin-detail-warning admin-detail-warning--legacy" role="note"><CircleAlert size={18} /><p><strong>Legacy application without structured evidence</strong><span>This record predates evidence capture. Complete and document suitable work, reference and business checks before any approval; do not treat the missing snapshot as reviewed.</span></p></div>}
 
@@ -383,7 +517,7 @@ function VendorDetail({ vendor, history, historyTruncated, historyLoading, histo
           {vendor.evidence ? (
             <div className="admin-application-evidence">
               <dl className="admin-detail-list admin-application-evidence__summary">
-                <div><dt>Evidence snapshot</dt><dd>Revision {vendor.evidence.revision}</dd></div>
+                <div><dt>Evidence revision</dt><dd>{vendor.evidence.revision} · latest complete snapshot</dd></div>
                 <div><dt>Applicant attestation</dt><dd>{vendor.evidence.attested ? `Recorded ${formatDate(vendor.evidence.attestedAt, true)}` : "Not recorded"}</dd></div>
                 <div><dt>Business registration</dt><dd>{registrationLabel(vendor.evidence.registrationType)}</dd></div>
                 <div><dt>Submitted reference</dt><dd>{vendor.evidence.registrationReference || "Declaration only"}</dd></div>
@@ -399,18 +533,21 @@ function VendorDetail({ vendor, history, historyTruncated, historyLoading, histo
           ) : evidenceState === "legacy"
             ? <div className="admin-history-state"><CircleAlert size={18} /> No structured evidence snapshot is attached to this legacy application.</div>
             : <div className="admin-history-state admin-history-state--error"><CircleAlert size={18} /> Required structured evidence has not been submitted. Approval remains unavailable.</div>}
+          <EvidenceRevisionHistory revisions={vendor.evidenceHistory} latestRevision={vendor.evidence?.revision || null} />
         </section>
       </div>
+
+      <CurrentInformationRequest request={vendor.currentInformationRequest} />
 
       <ReviewHistory reviews={history} truncated={historyTruncated} loading={historyLoading} error={historyError} onRetry={onRetryHistory} />
 
       <section className="admin-decision-panel" aria-labelledby="admin-decision-panel-heading">
-        <div><div className="eyebrow">Current review decision</div><h3 id="admin-decision-panel-heading">Choose the next accountable state.</h3><p>Every decision requires a reason and is checked against the application revision you reviewed.</p>{evidenceBlocksApproval && <p className="admin-decision-panel__blocked" id="admin-evidence-approval-blocked"><CircleAlert size={14} /> Approval is unavailable until structured evidence is submitted.</p>}</div>
+        <div><div className="eyebrow">Current review decision</div><h3 id="admin-decision-panel-heading">Choose the next accountable state.</h3><p>Every decision requires a reason and is checked against the Application version and Evidence revision you reviewed.</p>{evidenceBlocksApproval && <p className="admin-decision-panel__blocked" id="admin-evidence-approval-blocked"><CircleAlert size={14} /> Approval is unavailable until structured evidence is submitted.</p>}</div>
         <div className="admin-decision-panel__actions">
           {actions.map((action) => {
-            const ActionIcon = action.tone === "danger" ? Ban : action.tone === "neutral" ? RotateCcw : ShieldCheck;
+            const ActionIcon = action.tone === "danger" ? Ban : action.tone === "neutral" ? RotateCcw : action.tone === "information" ? CircleAlert : ShieldCheck;
             const actionAllowed = isAdminVendorActionAllowed(action, vendor);
-            return <button key={action.id} className={`button ${action.tone === "danger" ? "admin-button--danger" : action.tone === "neutral" ? "button--outline" : "button--primary"}`} type="button" disabled={!revisionReady || !actionAllowed} aria-describedby={!actionAllowed ? "admin-evidence-approval-blocked" : undefined} onClick={() => onDecision(action)}><ActionIcon size={16} /> {action.label}</button>;
+            return <button key={action.id} className={`button ${action.tone === "danger" ? "admin-button--danger" : action.tone === "neutral" ? "button--outline" : action.tone === "information" ? "admin-button--information" : "button--primary"}`} type="button" disabled={!revisionReady || !requestRecordReady || !evidenceRecordReady || !actionAllowed} aria-describedby={!actionAllowed ? "admin-evidence-approval-blocked" : undefined} onClick={() => onDecision(action)}><ActionIcon size={16} /> {action.label}</button>;
           })}
         </div>
       </section>
@@ -449,9 +586,12 @@ export function AdminVendorsPage({ notify, onOpenAuth, authRevision = 0 }) {
   const [decision, setDecision] = useState(null);
   const [decisionBusy, setDecisionBusy] = useState(false);
   const [decisionError, setDecisionError] = useState("");
+  const [decisionConflict, setDecisionConflict] = useState(false);
+  const [decisionUnconfirmed, setDecisionUnconfirmed] = useState(false);
   const queueHeadingRef = useRef(null);
   const detailRef = useRef(null);
   const queueItemRefs = useRef(new Map());
+  const statusTabRefs = useRef(new Map());
   const loadMoreControllerRef = useRef(null);
   const activeStatusRef = useRef(status);
   activeStatusRef.current = status;
@@ -464,6 +604,8 @@ export function AdminVendorsPage({ notify, onOpenAuth, authRevision = 0 }) {
     setHistory([]);
     setHistoryTruncated(false);
     setDecision(null);
+    setDecisionConflict(false);
+    setDecisionUnconfirmed(false);
     setNextCursor(null);
     setTotal(0);
   }, []);
@@ -486,6 +628,17 @@ export function AdminVendorsPage({ notify, onOpenAuth, authRevision = 0 }) {
     params.set("status", status);
     setSearchParams(params, { replace: true });
   }, [requestedStatus, searchParams, setSearchParams, status]);
+
+  useEffect(() => {
+    if (access !== "ready") return undefined;
+    const behavior = window.matchMedia?.("(prefers-reduced-motion: reduce)")?.matches ? "auto" : "smooth";
+    const frame = window.requestAnimationFrame(() => statusTabRefs.current.get(status)?.scrollIntoView({
+      block: "nearest",
+      inline: "nearest",
+      behavior,
+    }));
+    return () => window.cancelAnimationFrame(frame);
+  }, [access, status]);
 
   useEffect(() => {
     const controller = new AbortController();
@@ -520,7 +673,7 @@ export function AdminVendorsPage({ notify, onOpenAuth, authRevision = 0 }) {
     loadMoreControllerRef.current?.abort();
     loadMoreControllerRef.current = null;
     const controller = new AbortController();
-    setLoadingMore(false); setQueueLoading(true); setQueueError(""); setVendors([]); setSelectedId(null); setDetailVendor(null); setDetailError(""); setHistory([]); setHistoryTruncated(false); setDecision(null); setDecisionError(""); setQuery(""); setNextCursor(null); setTotal(0);
+    setLoadingMore(false); setQueueLoading(true); setQueueError(""); setVendors([]); setSelectedId(null); setDetailVendor(null); setDetailError(""); setHistory([]); setHistoryTruncated(false); setDecision(null); setDecisionError(""); setDecisionConflict(false); setQuery(""); setNextCursor(null); setTotal(0);
     async function loadQueue() {
       try {
         const compatible = await checkVendorApplicationEvidenceCompatibility({ signal: controller.signal });
@@ -564,7 +717,15 @@ export function AdminVendorsPage({ notify, onOpenAuth, authRevision = 0 }) {
       try {
         const response = await fetch(`/api/v1/admin/vendors/${encodeURIComponent(selectedId)}`, { credentials: "include", signal: controller.signal });
         const payload = await readApiResponse(response, "Application detail could not be loaded.");
-        if (!controller.signal.aborted && payload.data?.id === selectedId) setDetailVendor(normalizeVendorDetail(payload.data));
+        if (!controller.signal.aborted && payload.data?.id === selectedId) {
+          const normalizedDetail = normalizeVendorDetail(payload.data);
+          const refreshedSummary = normalizeAdminVendorSummary({
+            ...payload.data,
+            informationRequestSummary: payload.data.currentInformationRequest,
+          });
+          setDetailVendor(normalizedDetail);
+          setVendors((current) => current.map((vendor) => vendor.id === selectedId ? refreshedSummary : vendor));
+        }
       } catch (error) {
         if (error?.name === "AbortError" || controller.signal.aborted) return;
         if (!applyAccessError(error)) setDetailError(error.message || "Application detail could not be loaded.");
@@ -658,18 +819,26 @@ export function AdminVendorsPage({ notify, onOpenAuth, authRevision = 0 }) {
   }
 
   function openDecision(action) {
-    if (!selectedVendor || !Number.isInteger(selectedVendor.revision) || !isAdminVendorActionAllowed(action, selectedVendor)) return;
+    if (!selectedVendor
+      || !Number.isInteger(selectedVendor.revision)
+      || (selectedVendor.status === "needs_information" && !selectedVendor.currentInformationRequest)
+      || (selectedVendor.evidenceSummary && selectedVendor.evidence?.revision !== selectedVendor.evidenceSummary.revision)
+      || !isAdminVendorActionAllowed(action, selectedVendor)) return;
     setDecisionError("");
+    setDecisionConflict(false);
+    setDecisionUnconfirmed(false);
     setDecision({ vendor: selectedVendor, action, idempotencyKey: createIdempotencyKey("vendor-review") });
   }
 
   const closeDecision = useCallback(() => {
     if (decisionBusy) return;
-    setDecision(null); setDecisionError("");
-  }, [decisionBusy]);
+    setDecision(null); setDecisionError(""); setDecisionConflict(false);
+    if (decisionUnconfirmed) setRefreshKey((value) => value + 1);
+    setDecisionUnconfirmed(false);
+  }, [decisionBusy, decisionUnconfirmed]);
 
-  async function submitDecision({ reason, idempotencyKey }) {
-    if (!decision || decisionBusy || !isAdminVendorActionAllowed(decision.action, decision.vendor)) return;
+  async function submitDecision({ reason, idempotencyKey, requestedFields, applicantMessage }) {
+    if (!decision || decisionBusy || decisionConflict || !isAdminVendorActionAllowed(decision.action, decision.vendor)) return;
     setDecisionBusy(true); setDecisionError("");
     const reviewedVendor = decision.vendor;
     const targetStatus = decision.action.targetStatus;
@@ -695,11 +864,20 @@ export function AdminVendorsPage({ notify, onOpenAuth, authRevision = 0 }) {
                 expectedEvidenceRevision: reviewedVendor.evidence.revision,
               }
             : {}),
+          ...(targetStatus === "needs_information"
+            ? {
+                expectedEvidenceRevision: reviewedVendor.evidence?.revision ?? reviewedVendor.evidenceSummary?.revision ?? 0,
+                requestedFields,
+                applicantMessage,
+              }
+            : {}),
         }),
       });
       const payload = await readApiResponse(response, "The review decision could not be saved.");
       if (activeStatusRef.current !== reviewedVendor.status) {
         setDecision(null);
+        setDecisionConflict(false);
+        setDecisionUnconfirmed(false);
         setRefreshKey((value) => value + 1);
         notify({
           title: "Partner decision saved",
@@ -720,21 +898,38 @@ export function AdminVendorsPage({ notify, onOpenAuth, authRevision = 0 }) {
       setHistory([]);
       setHistoryTruncated(false);
       setDecision(null);
+      setDecisionConflict(false);
+      setDecisionUnconfirmed(false);
       notify({
-        title: targetStatus === "approved" ? "Partner approval saved" : targetStatus === "pending" ? "Application returned to review" : targetStatus === "suspended" ? "Partner suspended" : "Application declined",
+        title: targetStatus === "approved" ? "Partner approval saved" : targetStatus === "needs_information" ? "Information request sent" : targetStatus === "pending" ? "Application returned to review" : targetStatus === "suspended" ? "Partner suspended" : "Application declined",
         message: `${reviewedVendor.businessName} is now ${adminVendorStatusLabel(targetStatus).toLowerCase()}.`,
       });
       window.setTimeout(() => (nextVendor ? queueItemRefs.current.get(nextVendor.id) : queueHeadingRef.current)?.focus?.(), 0);
     } catch (error) {
       if (!mutationStarted) {
-        setDecisionError("Secure review compatibility could not be confirmed. No decision was saved.");
+        setDecisionError(decisionUnconfirmed
+          ? "The secure service is still unavailable, so the earlier decision remains unconfirmed. The unchanged draft and secure submission key are preserved."
+          : "Secure review compatibility could not be confirmed. No decision was saved.");
         return;
       }
       if (applyAccessError(error)) return;
-      if ([409, 412].includes(Number(error?.status))) {
-        setDecision(null); setSelectedId(null); setDetailVendor(null); setRefreshKey((value) => value + 1);
-        notify({ type: "warning", title: "Application changed", message: "The queue is refreshing so you can review the latest version." });
+      const failureState = classifyAdminVendorDecisionFailure(error);
+      if (failureState === "idempotency_conflict") {
+        setDecisionUnconfirmed(false);
+        setDecisionConflict(true);
+        setDecisionError("This secure submission key was already used for a different decision payload. Close this draft and review the latest application version before taking another action.");
+      } else if (failureState === "application_changed") {
+        setDecisionUnconfirmed(false);
+        setDecisionConflict(true);
+        setDecisionError("Application changed while this dialog was open. Your reason, applicant message and secure submission key are preserved. Close this dialog when you are ready to review the refreshed application version; this decision cannot be resubmitted against stale evidence.");
+        setDetailRefreshKey((value) => value + 1);
+        setHistoryRefreshKey((value) => value + 1);
+        notify({ type: "warning", title: "Application changed", message: "The latest application detail is loading; your decision draft remains open and unchanged." });
+      } else if (failureState === "unconfirmed") {
+        setDecisionUnconfirmed(true);
+        setDecisionError("We could not confirm whether this decision was saved. The draft is now locked so retrying reuses the exact same secure submission key and payload; you can also close it to refresh the queue first.");
       } else {
+        setDecisionUnconfirmed(false);
         setDecisionError(error.message || "The review decision could not be saved.");
       }
     } finally { setDecisionBusy(false); }
@@ -761,7 +956,7 @@ export function AdminVendorsPage({ notify, onOpenAuth, authRevision = 0 }) {
         <nav className="admin-status-nav" aria-label="Vendor application status">
           {ADMIN_VENDOR_STATUSES.map((item) => {
             const count = statusCounts[item.id];
-            return <button key={item.id} className={status === item.id ? "is-active" : ""} type="button" aria-pressed={status === item.id} onClick={() => {
+            return <button key={item.id} ref={(node) => { if (node) statusTabRefs.current.set(item.id, node); else statusTabRefs.current.delete(item.id); }} className={status === item.id ? "is-active" : ""} type="button" aria-pressed={status === item.id} onClick={() => {
               activeStatusRef.current = item.id;
               loadMoreControllerRef.current?.abort();
               const params = new URLSearchParams(searchParams);
@@ -795,7 +990,10 @@ export function AdminVendorsPage({ notify, onOpenAuth, authRevision = 0 }) {
                     <span className="admin-queue-card__top"><AdminStatus status={vendor.status} /><small><CalendarDays size={13} /> {formatDate(vendor.createdAt)}</small></span>
                     <strong>{vendor.businessName}</strong>
                     <span className="admin-queue-card__meta"><span><Store size={14} /> {categoryLabel(vendor.category)}</span><span><MapPin size={14} /> {vendor.city}</span></span>
-                    <span className={`admin-queue-card__evidence ${vendor.evidenceSummary ? "is-ready" : "is-legacy"}`}><FileCheck2 size={14} />{vendor.evidenceSummary ? `${vendor.evidenceSummary.portfolioUrlCount + vendor.evidenceSummary.referenceUrlCount} submitted evidence link${vendor.evidenceSummary.portfolioUrlCount + vendor.evidenceSummary.referenceUrlCount === 1 ? "" : "s"} · Revision ${vendor.evidenceSummary.revision}` : "Legacy · no structured evidence"}</span>
+                    <span className="admin-queue-card__version">Application version {Number.isInteger(vendor.revision) ? vendor.revision : "unavailable"}</span>
+                    <span className={`admin-queue-card__evidence ${vendor.evidenceSummary ? "is-ready" : "is-incomplete"}`}><FileCheck2 size={14} />{adminVendorEvidenceSummaryLabel(vendor)}</span>
+                    {vendor.evidenceSummary && Number.isInteger(vendor.evidenceReviewedRevision) && vendor.evidenceSummary.revision > vendor.evidenceReviewedRevision && <span className="admin-queue-card__revision"><RefreshCw size={14} /> Revised since last review</span>}
+                    {vendor.informationRequestSummary && <span className="admin-queue-card__request"><CircleAlert size={14} /><span>Request {vendor.informationRequestSummary.revision} · {vendor.informationRequestSummary.requestedFields.map(informationRequestFieldLabel).join(" · ")}</span></span>}
                     <span className="admin-queue-card__action">Review application <ArrowRight size={15} /></span>
                   </button>
                 ))}
@@ -818,7 +1016,7 @@ export function AdminVendorsPage({ notify, onOpenAuth, authRevision = 0 }) {
         </div>
       </div>
 
-      {decision && <DecisionDialog key={`${decision.vendor.id}-${decision.action.id}`} decision={decision} busy={decisionBusy} error={decisionError} onClose={closeDecision} onSubmit={submitDecision} />}
+      {decision && <DecisionDialog key={`${decision.vendor.id}-${decision.action.id}`} decision={decision} busy={decisionBusy} blocked={decisionConflict} unconfirmed={decisionUnconfirmed} error={decisionError} onClose={closeDecision} onSubmit={submitDecision} />}
     </div>
   );
 }

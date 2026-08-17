@@ -1,10 +1,10 @@
 import { readApiResponse } from "../api.js";
 
-export const VENDOR_APPLICATION_EVIDENCE_REVISION = 1;
-export const ADMIN_VENDOR_SUMMARY_CONTRACT = "vendor-summary-v1";
+export const VENDOR_APPLICATION_EVIDENCE_REVISION = 2;
+export const ADMIN_VENDOR_SUMMARY_CONTRACT = "vendor-summary-v2";
 
 export const ADMIN_VENDOR_SUMMARY_HEADERS = Object.freeze({
-  "X-Melaiva-Admin-Vendor-Summary": "1",
+  "X-Melaiva-Admin-Vendor-Summary": "2",
 });
 
 export function supportsVendorApplicationEvidence(payload) {
@@ -12,7 +12,7 @@ export function supportsVendorApplicationEvidence(payload) {
 }
 
 export function supportsAdminVendorSummaryContract(payload, responseHeaderValue) {
-  return responseHeaderValue === "1" && payload?.meta?.contract === ADMIN_VENDOR_SUMMARY_CONTRACT;
+  return responseHeaderValue === "2" && payload?.meta?.contract === ADMIN_VENDOR_SUMMARY_CONTRACT;
 }
 
 export async function checkVendorApplicationEvidenceCompatibility({ signal } = {}) {

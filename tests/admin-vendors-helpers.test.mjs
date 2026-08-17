@@ -2,6 +2,7 @@ import test from "node:test";
 import assert from "node:assert/strict";
 import {
   adjustAdminStatusCounts,
+  classifyAdminVendorDecisionFailure,
   adminVendorDecisionAcknowledgement,
   adminVendorEvidenceState,
   adminVendorEvidenceSummaryLabel,
@@ -10,6 +11,7 @@ import {
   normalizeAdminStatusCounts,
   normalizeAdminVendorSummary,
   normalizeAdminVendorStatus,
+  validateAdminInformationRequest,
   validateAdminReviewReason,
 } from "../src/components/adminVendors.js";
 import { parsePublicWebsiteUrl } from "../src/security/publicWebsiteUrl.js";
@@ -21,10 +23,11 @@ test("admin vendor status input fails closed to the pending queue", () => {
 });
 
 test("admin vendor actions expose only the allowed next states", () => {
-  assert.deepEqual(adminVendorActions("pending").map((action) => action.targetStatus), ["approved", "rejected"]);
+  assert.deepEqual(adminVendorActions("pending").map((action) => action.targetStatus), ["approved", "needs_information", "rejected"]);
   assert.deepEqual(adminVendorActions("approved").map((action) => action.targetStatus), ["suspended"]);
   assert.deepEqual(adminVendorActions("suspended").map((action) => action.targetStatus), ["approved"]);
-  assert.deepEqual(adminVendorActions("rejected").map((action) => action.targetStatus), ["pending"]);
+  assert.deepEqual(adminVendorActions("rejected").map((action) => action.targetStatus), ["needs_information", "pending"]);
+  assert.deepEqual(adminVendorActions("needs_information").map((action) => action.targetStatus), ["pending", "rejected"]);
   assert.deepEqual(adminVendorActions("unknown"), []);
 });
 
@@ -85,13 +88,15 @@ test("approval acknowledgements distinguish exact evidence from legacy alternate
 
 test("required and genuine legacy evidence states gate approval accurately", () => {
   const approve = adminVendorActions("pending")[0];
-  const required = { evidenceRequired: true, evidenceSummary: null, evidence: null };
-  const legacy = { evidenceRequired: false, evidenceSummary: null, evidence: null };
+  const required = { status: "pending", evidenceRequired: true, evidenceSummary: null, evidence: null };
+  const legacy = { status: "pending", evidenceRequired: false, evidenceSummary: null, evidence: null };
   const submitted = {
+    status: "pending",
     evidenceRequired: true,
     evidenceSummary: { revision: 2, portfolioUrlCount: 1, referenceUrlCount: 1 },
   };
   const malformedDetail = {
+    status: "pending",
     evidenceRequired: true,
     evidence: null,
     evidenceSummary: { revision: 2, portfolioUrlCount: 1, referenceUrlCount: 1 },
@@ -104,7 +109,7 @@ test("required and genuine legacy evidence states gate approval accurately", () 
   assert.equal(adminVendorEvidenceSummaryLabel(legacy), "Legacy · no structured evidence");
   assert.equal(isAdminVendorActionAllowed(approve, legacy), true);
   assert.equal(adminVendorEvidenceState(submitted), "submitted");
-  assert.match(adminVendorEvidenceSummaryLabel(submitted), /2 submitted evidence links · Revision 2/);
+  assert.match(adminVendorEvidenceSummaryLabel(submitted), /Evidence revision 2 · 2 submitted links/);
   assert.equal(isAdminVendorActionAllowed(approve, submitted), true);
   assert.equal(adminVendorEvidenceState(malformedDetail), "required");
   assert.equal(isAdminVendorActionAllowed(approve, malformedDetail), false);
@@ -119,8 +124,16 @@ test("queue normalization strictly drops legacy full-detail fields", () => {
     city: "Jaipur",
     createdAt: "2026-08-17T00:00:00.000Z",
     reviewRevision: 4,
+    evidenceReviewedRevision: 2,
     evidenceRequired: true,
     evidenceSummary: null,
+    informationRequestSummary: {
+      revision: 3,
+      evidenceRevision: 2,
+      requestedFields: ["portfolio"],
+      requestedAt: "2026-08-17T01:00:00.000Z",
+      applicantMessage: "This detail-only message must be discarded.",
+    },
     legalName: "Private Studio Legal Name",
     phone: "+91 99999 99999",
     websiteUrl: "https://private-studio.example.com",
@@ -134,19 +147,49 @@ test("queue normalization strictly drops legacy full-detail fields", () => {
     "city",
     "createdAt",
     "evidenceRequired",
+    "evidenceReviewedRevision",
     "evidenceSummary",
     "id",
+    "informationRequestSummary",
     "revision",
     "status",
   ]);
   for (const privateField of ["legalName", "phone", "websiteUrl", "owner", "evidence"]) {
     assert.equal(Object.hasOwn(summary, privateField), false, privateField);
   }
+  assert.deepEqual(summary.informationRequestSummary, {
+    revision: 3,
+    evidenceRevision: 2,
+    requestedFields: ["portfolio"],
+    requestedAt: "2026-08-17T01:00:00.000Z",
+  });
+  assert.equal(Object.hasOwn(summary.informationRequestSummary, "applicantMessage"), false);
+  assert.equal(normalizeAdminVendorSummary({
+    ...summary,
+    status: "needs_information",
+    reviewRevision: summary.revision,
+    informationRequestSummary: {
+      revision: 4,
+      evidenceRevision: 2,
+      requestedFields: ["portfolio", "future_field"],
+    },
+  }).informationRequestSummary, null);
+  assert.equal(normalizeAdminVendorSummary({
+    ...summary,
+    status: "needs_information",
+    reviewRevision: summary.revision,
+    informationRequestSummary: {
+      revision: 4,
+      evidenceRevision: 2,
+      requestedFields: ["portfolio", "portfolio"],
+    },
+  }).informationRequestSummary, null);
 });
 
 test("status count normalization preserves unavailable counts", () => {
   assert.deepEqual(normalizeAdminStatusCounts({ pending: 3, approved: "4", rejected: -1 }), {
     pending: 3,
+    needs_information: null,
     approved: 4,
     rejected: null,
     suspended: null,
@@ -162,6 +205,51 @@ test("status counts move once and never become negative", () => {
     adjustAdminStatusCounts({ pending: 0, rejected: 0 }, "pending", "rejected"),
     { pending: 0, rejected: 1 },
   );
+});
+
+test("information requests require safe applicant-visible instructions separate from private reasons", () => {
+  const vendor = {
+    evidence: {
+      portfolioUrls: ["https://work-samples.example.net/gallery"],
+      referenceUrls: ["https://reviews.example.org/studio"],
+      registrationReference: "UDYAM-RJ-12-1234567",
+    },
+  };
+  assert.deepEqual(validateAdminInformationRequest({
+    requestedFields: ["portfolio", "portfolio", "references"],
+    applicantMessage: "Please replace the inaccessible work sample and add a current public review.",
+  }, vendor), {});
+  assert.match(validateAdminInformationRequest({ requestedFields: [], applicantMessage: "Please update the evidence supplied." }, vendor).requestedFields, /at least one/i);
+  for (const applicantMessage of [
+    "Open https://private.example.com and replace this item.",
+    "Confirm PAN ABCDE1234F before sending a revision.",
+    "Update registration UDYAM-RJ-12-1234567 for review.",
+    "Replace work samples example net with a current gallery.",
+  ]) {
+    assert.match(validateAdminInformationRequest({ requestedFields: ["portfolio"], applicantMessage }, vendor).applicantMessage, /address|identity|registration|evidence/i, applicantMessage);
+  }
+});
+
+test("needs-information status is non-approvable and accepts only its declared actions", () => {
+  const needsInformation = {
+    status: "needs_information",
+    evidenceRequired: true,
+    evidence: { revision: 2 },
+  };
+  const requestInformation = adminVendorActions("pending").find((action) => action.targetStatus === "needs_information");
+  const approve = adminVendorActions("pending").find((action) => action.targetStatus === "approved");
+  const cancel = adminVendorActions("needs_information").find((action) => action.targetStatus === "pending");
+  assert.equal(isAdminVendorActionAllowed(approve, needsInformation), false);
+  assert.equal(isAdminVendorActionAllowed(requestInformation, needsInformation), false);
+  assert.equal(isAdminVendorActionAllowed(cancel, needsInformation), true);
+});
+
+test("decision failures distinguish safe replay from stale or conflicting keys", () => {
+  assert.equal(classifyAdminVendorDecisionFailure(new TypeError("network failed")), "unconfirmed");
+  assert.equal(classifyAdminVendorDecisionFailure({ status: 503, unavailable: true }), "unconfirmed");
+  assert.equal(classifyAdminVendorDecisionFailure({ status: 409, code: "vendor_review_conflict" }), "application_changed");
+  assert.equal(classifyAdminVendorDecisionFailure({ status: 409, code: "idempotency_conflict" }), "idempotency_conflict");
+  assert.equal(classifyAdminVendorDecisionFailure({ status: 422, code: "validation_failed" }), "failed");
 });
 
 test("operator evidence links allow only public credential-free HTTPS destinations", () => {

@@ -18,6 +18,8 @@ import {
   STORE_SCHEMA_V8_MIGRATION_SQL,
   STORE_SCHEMA_V9_FINALIZE_SQL,
   STORE_SCHEMA_V9_MIGRATION_SQL,
+  STORE_SCHEMA_V10_FINALIZE_SQL,
+  STORE_SCHEMA_V10_MIGRATION_SQL,
   STORE_SCHEMA_VERSION,
   createDurableDatabase,
   executeSql,
@@ -1258,7 +1260,7 @@ test("schema v9 is additive, keeps evidence immutable, and blocks unacknowledged
   );
 });
 
-test("schema v9 fresh install and interrupted-column restart converge without duplicate evidence structures", async () => {
+test("schema v10 fresh install and interrupted v9-column restart converge without duplicate evidence structures", async () => {
   assert.doesNotMatch(STORE_SCHEMA_V9_FINALIZE_SQL, /DROP\s+TRIGGER/iu);
   const fresh = new DatabaseSync(":memory:");
   fresh.exec(`CREATE TABLE _sql_schema_migrations (
@@ -1266,7 +1268,7 @@ test("schema v9 fresh install and interrupted-column restart converge without du
     applied_at TEXT NOT NULL DEFAULT (datetime('now'))
   )`);
   fresh.exec(STORE_SCHEMA_SQL);
-  assert.equal(fresh.prepare("SELECT MAX(id) AS version FROM _sql_schema_migrations").get().version, 9);
+  assert.equal(fresh.prepare("SELECT MAX(id) AS version FROM _sql_schema_migrations").get().version, 10);
   assert.deepEqual(
     fresh.prepare(
       `SELECT name FROM sqlite_master
@@ -1276,9 +1278,17 @@ test("schema v9 fresh install and interrupted-column restart converge without du
     [
       "vendor_application_evidence_immutable_delete",
       "vendor_application_evidence_immutable_update",
+      "vendor_application_evidence_mirror_insert_v10",
+      "vendor_application_evidence_revisions_actor_update",
+      "vendor_application_evidence_revisions_apply_insert",
+      "vendor_application_evidence_revisions_delete",
+      "vendor_application_evidence_revisions_identity_update",
+      "vendor_application_evidence_revisions_state_insert",
+      "vendor_application_evidence_revisions_validate_insert",
       "vendor_application_evidence_validate_insert",
-      "vendor_application_evidence_vendor_state_insert",
-      "vendors_evidence_approval_guard",
+      "vendor_application_evidence_vendor_state_insert_v10",
+      "vendors_evidence_approval_guard_v10",
+      "vendors_evidence_latest_revision_guard",
     ],
   );
 
@@ -1366,7 +1376,264 @@ test("schema v9 fresh install and interrupted-column restart converge without du
   );
 });
 
-test("schema v9 finalize failures roll back atomically and never remove old-writer approval guards", async () => {
+test("schema v10 enforces contiguous immutable revisions, safe applicant text, and the request cap", () => {
+  const sqlite = new DatabaseSync(":memory:");
+  sqlite.exec(`CREATE TABLE _sql_schema_migrations (
+    id INTEGER PRIMARY KEY,
+    applied_at TEXT NOT NULL DEFAULT (datetime('now'))
+  )`);
+  sqlite.exec(STORE_SCHEMA_SQL);
+  const v10GlobPatterns = [...STORE_SCHEMA_V10_FINALIZE_SQL.matchAll(/GLOB '([^']+)'/gu)].map((match) => match[1]);
+  assert.ok(v10GlobPatterns.length > 0);
+  assert.ok(
+    v10GlobPatterns.every((pattern) => pattern.length <= 32),
+    "Workerd rejects the long expanded GLOB patterns that desktop SQLite accepts",
+  );
+  const insertUser = sqlite.prepare(
+    `INSERT INTO users
+      (id, name, email, password_hash, password_salt, password_iterations, password_scheme, role)
+     VALUES (?, ?, ?, 'hash', 'salt', 100000, 'pbkdf2-server-v1', ?)`,
+  );
+  insertUser.run("revision-owner", "Revision Owner", "revision-owner@example.com", "vendor");
+  insertUser.run("revision-admin", "Revision Admin", "revision-admin@example.com", "admin");
+  sqlite.prepare(
+    `INSERT INTO vendors
+      (id, user_id, slug, business_name, status, category, categories_json, city, service_areas_json,
+       description, min_budget, max_budget, currency)
+     VALUES ('revision-cap-vendor', 'revision-owner', 'revision-cap-vendor', 'Revision Cap Vendor', 'pending',
+             'photography', '["photography"]', 'Jaipur', '["Jaipur"]',
+             'A schema-level application used to exercise append-only revision invariants.',
+             100000, 500000, 'INR')`,
+  ).run();
+  sqlite.prepare(
+    `INSERT INTO vendor_application_evidence
+      (vendor_id, portfolio_urls_json, reference_urls_json, registration_type,
+       registration_reference, attested, attested_at, created_at)
+     VALUES ('revision-cap-vendor', '["https://revision-one.example.com/work"]',
+             '["https://revision-one-reference.example.com/review"]', 'not_registered', NULL, 1,
+             '2028-01-01T00:00:00.000Z', '2028-01-01T00:00:00.000Z')`,
+  ).run();
+  assert.deepEqual(
+    { ...sqlite.prepare(
+      `SELECT evidence_latest_revision, information_request_revision, information_requested
+       FROM vendors WHERE id = 'revision-cap-vendor'`,
+    ).get() },
+    { evidence_latest_revision: 1, information_request_revision: 0, information_requested: 0 },
+  );
+  assert.equal(
+    sqlite.prepare(
+      `SELECT COUNT(*) AS count FROM sqlite_master
+       WHERE type = 'trigger' AND name = 'vendor_application_evidence_vendor_state_insert'`,
+    ).get().count,
+    0,
+  );
+  assert.throws(
+    () => sqlite.prepare(
+      `INSERT INTO vendor_application_information_requests
+        (vendor_id, request_revision, evidence_revision, requested_fields_json, applicant_message,
+         requested_by_user_id, requested_at)
+       VALUES ('revision-cap-vendor', 1, 1, '["portfolio"]', ?, 'revision-admin',
+               '2028-01-01T00:00:01.000Z')`,
+    ).run("Please replace the portfolio.\u202e Unsafe direction."),
+    /invalid or sensitive content/,
+  );
+  assert.throws(
+    () => sqlite.prepare(
+      `INSERT INTO vendor_application_information_requests
+        (vendor_id, request_revision, evidence_revision, requested_fields_json, applicant_message,
+         requested_by_user_id, requested_at)
+       VALUES ('revision-cap-vendor', 1, 1, '["portfolio"]',
+               'Please verify PAN ABCDE1234F before replacing this portfolio.', 'revision-admin',
+               '2028-01-01T00:00:01.000Z')`,
+    ).run(),
+    /invalid or sensitive content/,
+  );
+  assert.throws(
+    () => sqlite.prepare(
+      `INSERT INTO audit_events (actor_user_id, action, entity_type, entity_id, metadata_json, created_at)
+       VALUES ('revision-admin', 'vendor.reviewed', 'vendor', 'revision-cap-vendor',
+               '{"reason":"Reviewed PAN ABCDE1234F before requesting an update."}',
+               '2028-01-01T00:00:01.000Z')`,
+    ).run(),
+    /identity references/,
+  );
+  assert.throws(
+    () => sqlite.prepare(
+      `INSERT INTO vendor_application_information_requests
+        (vendor_id, request_revision, evidence_revision, requested_fields_json, applicant_message,
+         requested_by_user_id, requested_at)
+       VALUES ('revision-cap-vendor', 1, 1, '["portfolio"]',
+               ' Please replace the portfolio with clearer work. ', 'revision-admin',
+               '2028-01-01T00:00:01.000Z')`,
+    ).run(),
+    /invalid or sensitive content/,
+  );
+
+  const insertRequest = sqlite.prepare(
+    `INSERT INTO vendor_application_information_requests
+      (vendor_id, request_revision, evidence_revision, requested_fields_json, applicant_message,
+       requested_by_user_id, requested_at)
+     VALUES ('revision-cap-vendor', ?, ?, '["portfolio"]',
+             'Please replace the portfolio with clearer representative work.', 'revision-admin', ?)`,
+  );
+  const insertRevision = sqlite.prepare(
+    `INSERT INTO vendor_application_evidence_revisions
+      (vendor_id, evidence_revision, portfolio_urls_json, reference_urls_json, registration_type,
+       registration_reference, attested, attested_at, submitted_by_user_id, created_at)
+     VALUES ('revision-cap-vendor', ?, '["https://revised-work.example.com/gallery"]',
+             '["https://revised-reference.example.com/review"]', 'not_registered', NULL, 1, ?,
+             'revision-owner', ?)`,
+  );
+  for (let revision = 2; revision <= 20; revision += 1) {
+    const requestRevision = revision - 1;
+    const requestedAt = `2028-01-${String(revision).padStart(2, "0")}T00:00:00.000Z`;
+    const submittedAt = `2028-02-${String(revision).padStart(2, "0")}T00:00:00.000Z`;
+    insertRequest.run(requestRevision, revision - 1, requestedAt);
+    insertRevision.run(revision, submittedAt, submittedAt);
+  }
+  assert.deepEqual(
+    { ...sqlite.prepare(
+      `SELECT evidence_latest_revision, information_request_revision, information_requested
+       FROM vendors WHERE id = 'revision-cap-vendor'`,
+    ).get() },
+    { evidence_latest_revision: 20, information_request_revision: 19, information_requested: 0 },
+  );
+  assert.equal(
+    sqlite.prepare(
+      `SELECT COUNT(*) AS count FROM vendor_application_evidence_revisions
+       WHERE vendor_id = 'revision-cap-vendor'`,
+    ).get().count,
+    20,
+  );
+  assert.throws(
+    () => insertRequest.run(20, 20, "2028-03-01T00:00:00.000Z"),
+    /invalid or sensitive content/,
+  );
+  assert.equal(
+    sqlite.prepare(
+      `SELECT COUNT(*) AS count FROM vendor_application_information_requests
+       WHERE vendor_id = 'revision-cap-vendor'`,
+    ).get().count,
+    19,
+  );
+  assert.throws(
+    () => sqlite.prepare(
+      `UPDATE vendor_application_evidence_revisions SET registration_type = 'gstin'
+       WHERE vendor_id = 'revision-cap-vendor' AND evidence_revision = 1`,
+    ).run(),
+    /revisions are immutable/,
+  );
+  assert.throws(
+    () => sqlite.prepare(
+      `DELETE FROM vendor_application_information_requests
+       WHERE vendor_id = 'revision-cap-vendor' AND request_revision = 1`,
+    ).run(),
+    /information requests are immutable/,
+  );
+  assert.throws(
+    () => sqlite.prepare(
+      "UPDATE vendors SET evidence_latest_revision = 19 WHERE id = 'revision-cap-vendor'",
+    ).run(),
+    /latest revision must reference append-only history/,
+  );
+});
+
+test("schema v10 migrates v9 evidence into revision one and replaces the old-worker tripwire", () => {
+  const sqlite = new DatabaseSync(":memory:");
+  sqlite.exec(`CREATE TABLE _sql_schema_migrations (
+    id INTEGER PRIMARY KEY,
+    applied_at TEXT NOT NULL DEFAULT (datetime('now'))
+  )`);
+  sqlite.exec(STORE_SCHEMA_V1_SQL);
+  sqlite.exec(STORE_SCHEMA_V2_MIGRATION_SQL);
+  sqlite.exec(STORE_SCHEMA_V3_MIGRATION_SQL);
+  sqlite.exec(STORE_SCHEMA_V4_MIGRATION_SQL);
+  sqlite.exec(STORE_SCHEMA_V5_MIGRATION_SQL);
+  sqlite.exec(STORE_SCHEMA_V6_MIGRATION_SQL);
+  sqlite.exec(STORE_SCHEMA_V7_MIGRATION_SQL);
+  sqlite.exec(STORE_SCHEMA_V8_MIGRATION_SQL);
+  sqlite.exec(STORE_SCHEMA_V9_MIGRATION_SQL);
+  sqlite.prepare(
+    `INSERT INTO users
+      (id, name, email, password_hash, password_salt, password_iterations, password_scheme, role)
+     VALUES ('migration-owner', 'Migration Owner', 'migration-owner@example.com',
+             'hash', 'salt', 100000, 'pbkdf2-server-v1', 'vendor')`,
+  ).run();
+  sqlite.prepare(
+    `INSERT INTO vendors
+      (id, user_id, slug, business_name, status, category, categories_json, city, service_areas_json,
+       description, min_budget, max_budget, currency)
+     VALUES ('migration-vendor', 'migration-owner', 'migration-vendor', 'Migration Vendor', 'pending',
+             'photography', '["photography"]', 'Jaipur', '["Jaipur"]',
+             'A populated v9 application that must retain its exact immutable evidence.',
+             100000, 500000, 'INR')`,
+  ).run();
+  sqlite.prepare(
+    `INSERT INTO vendor_application_evidence
+      (vendor_id, portfolio_urls_json, reference_urls_json, registration_type,
+       registration_reference, attested, attested_at, created_at)
+     VALUES ('migration-vendor', '["https://migration-portfolio.example.com/work"]',
+             '["https://migration-reference.example.com/review"]', 'gstin', '08ABCDE1234F1Z5', 1,
+             '2028-04-01T00:00:00.000Z', '2028-04-01T00:00:00.000Z')`,
+  ).run();
+  assert.equal(
+    sqlite.prepare(
+      `SELECT COUNT(*) AS count FROM sqlite_master
+       WHERE type = 'trigger' AND name = 'vendor_application_evidence_vendor_state_insert'`,
+    ).get().count,
+    1,
+  );
+
+  sqlite.exec(STORE_SCHEMA_V10_MIGRATION_SQL);
+  assert.equal(sqlite.prepare("SELECT MAX(id) AS version FROM _sql_schema_migrations").get().version, 10);
+  assert.deepEqual(
+    { ...sqlite.prepare(
+      `SELECT vendor_id, evidence_revision, portfolio_urls_json, reference_urls_json,
+              registration_type, registration_reference, attested, attested_at, submitted_by_user_id, created_at
+       FROM vendor_application_evidence_revisions WHERE vendor_id = 'migration-vendor'`,
+    ).get() },
+    {
+      vendor_id: "migration-vendor",
+      evidence_revision: 1,
+      portfolio_urls_json: '["https://migration-portfolio.example.com/work"]',
+      reference_urls_json: '["https://migration-reference.example.com/review"]',
+      registration_type: "gstin",
+      registration_reference: "08ABCDE1234F1Z5",
+      attested: 1,
+      attested_at: "2028-04-01T00:00:00.000Z",
+      submitted_by_user_id: "migration-owner",
+      created_at: "2028-04-01T00:00:00.000Z",
+    },
+  );
+  assert.equal(
+    sqlite.prepare("SELECT evidence_latest_revision FROM vendors WHERE id = 'migration-vendor'").get()
+      .evidence_latest_revision,
+    1,
+  );
+  assert.equal(
+    sqlite.prepare(
+      `SELECT COUNT(*) AS count FROM sqlite_master
+       WHERE type = 'trigger' AND name = 'vendor_application_evidence_vendor_state_insert'`,
+    ).get().count,
+    0,
+  );
+  assert.equal(
+    sqlite.prepare(
+      `SELECT COUNT(*) AS count FROM sqlite_master
+       WHERE type = 'trigger' AND name = 'vendor_application_evidence_vendor_state_insert_v10'`,
+    ).get().count,
+    1,
+  );
+  assert.throws(
+    () => sqlite.prepare(
+      `UPDATE vendor_application_evidence_revisions SET registration_reference = '08ABCDE1234F1Z6'
+       WHERE vendor_id = 'migration-vendor' AND evidence_revision = 1`,
+    ).run(),
+    /revisions are immutable/,
+  );
+});
+
+test("schema v9-to-v10 finalize failures roll back atomically and preserve an approval guard", async () => {
   const sqlite = new DatabaseSync(":memory:");
   sqlite.exec(`CREATE TABLE _sql_schema_migrations (
     id INTEGER PRIMARY KEY,
@@ -1391,16 +1658,25 @@ test("schema v9 finalize failures roll back atomically and never remove old-writ
   ).run();
 
   let failFinalize = true;
+  let failV10Finalize = false;
   const sql = {
     exec(statement, ...args) {
       const normalized = statement.trim().toUpperCase();
-      if (failFinalize && statement.includes("CREATE TABLE IF NOT EXISTS vendor_application_evidence")) {
+      if (failFinalize && statement.includes("CREATE TABLE IF NOT EXISTS vendor_application_evidence (")) {
         const failurePoint = statement.indexOf(
           "CREATE TRIGGER IF NOT EXISTS vendor_application_evidence_immutable_update",
         );
         assert.ok(failurePoint > 0);
         sqlite.exec(statement.slice(0, failurePoint));
         throw new Error("injected v9 finalize failure");
+      }
+      if (failV10Finalize && statement.includes("DROP TRIGGER IF EXISTS vendor_application_evidence_vendor_state_insert;")) {
+        const failurePoint = statement.indexOf(
+          "DROP TRIGGER IF EXISTS vendor_application_evidence_vendor_state_insert;",
+        );
+        assert.ok(failurePoint > 0);
+        sqlite.exec(statement.slice(0, failurePoint));
+        throw new Error("injected v10 finalize failure");
       }
       if (args.length > 0 || normalized.startsWith("SELECT") || normalized.startsWith("PRAGMA")) {
         const rows = sqlite.prepare(statement).all(...args);
@@ -1446,8 +1722,7 @@ test("schema v9 finalize failures roll back atomically and never remove old-writ
   );
 
   failFinalize = false;
-  new MelaivaStore(ctx, { ENVIRONMENT: "production" });
-  await initialized;
+  sqlite.exec(STORE_SCHEMA_V9_MIGRATION_SQL);
   assert.equal(sqlite.prepare("SELECT MAX(id) AS version FROM _sql_schema_migrations").get().version, 9);
   assert.equal(
     sqlite.prepare("SELECT evidence_required FROM vendors WHERE id = 'pre-v9-atomic-vendor'").get().evidence_required,
@@ -1467,15 +1742,45 @@ test("schema v9 finalize failures roll back atomically and never remove old-writ
     1,
   );
 
-  failFinalize = true;
+  failV10Finalize = true;
   new MelaivaStore(ctx, { ENVIRONMENT: "production" });
-  await assert.rejects(initialized, /injected v9 finalize failure/);
+  await assert.rejects(initialized, /injected v10 finalize failure/);
   assert.equal(sqlite.prepare("SELECT MAX(id) AS version FROM _sql_schema_migrations").get().version, 9);
+  assert.equal(
+    sqlite.prepare("SELECT COUNT(*) AS count FROM pragma_table_info('vendors') WHERE name = 'evidence_latest_revision'").get().count,
+    0,
+  );
+  assert.equal(
+    sqlite.prepare(
+      `SELECT COUNT(*) AS count FROM sqlite_master
+       WHERE type = 'trigger' AND name = 'vendor_application_evidence_vendor_state_insert'`,
+    ).get().count,
+    1,
+  );
+  assert.equal(
+    sqlite.prepare(
+      `SELECT COUNT(*) AS count FROM sqlite_master
+       WHERE type = 'trigger' AND name = 'vendor_application_evidence_vendor_state_insert_v10'`,
+    ).get().count,
+    0,
+  );
   assert.throws(
     () => sqlite.prepare("UPDATE vendors SET status = 'approved', verified = 1 WHERE id = 'post-v9-old-writer'").run(),
     /evidence must be completed and acknowledged/,
   );
   assert.equal(sqlite.prepare("SELECT status FROM vendors WHERE id = 'post-v9-old-writer'").get().status, "pending");
+
+  failV10Finalize = false;
+  new MelaivaStore(ctx, { ENVIRONMENT: "production" });
+  await initialized;
+  assert.equal(sqlite.prepare("SELECT MAX(id) AS version FROM _sql_schema_migrations").get().version, 10);
+  assert.equal(
+    sqlite.prepare(
+      `SELECT COUNT(*) AS count FROM sqlite_master
+       WHERE type = 'trigger' AND name = 'vendor_application_evidence_vendor_state_insert_v10'`,
+    ).get().count,
+    1,
+  );
 });
 
 test("schema v8 initialization resumes when the review revision column already exists", async () => {

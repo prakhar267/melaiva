@@ -1,4 +1,4 @@
-const STORE_SCHEMA_VERSION = 9;
+const STORE_SCHEMA_VERSION = 10;
 const MAINTENANCE_INTERVAL_MS = 60 * 60 * 1000;
 
 const STORE_SCHEMA_V1_SQL = `
@@ -1064,7 +1064,594 @@ ALTER TABLE vendors ADD COLUMN evidence_reviewed_revision INTEGER NOT NULL DEFAU
 ${STORE_SCHEMA_V9_FINALIZE_SQL}
 `;
 
-const STORE_SCHEMA_SQL = `${STORE_SCHEMA_V1_SQL}\n${STORE_SCHEMA_V2_MIGRATION_SQL}\n${STORE_SCHEMA_V3_MIGRATION_SQL}\n${STORE_SCHEMA_V4_MIGRATION_SQL}\n${STORE_SCHEMA_V5_MIGRATION_SQL}\n${STORE_SCHEMA_V6_MIGRATION_SQL}\n${STORE_SCHEMA_V7_MIGRATION_SQL}\n${STORE_SCHEMA_V8_MIGRATION_SQL}\n${STORE_SCHEMA_V9_MIGRATION_SQL}`;
+const STORE_SCHEMA_V10_FINALIZE_SQL = `
+CREATE TABLE IF NOT EXISTS vendor_application_evidence_revisions (
+  vendor_id TEXT NOT NULL REFERENCES vendors(id) ON DELETE RESTRICT,
+  evidence_revision INTEGER NOT NULL
+    CHECK (typeof(evidence_revision) = 'integer' AND evidence_revision BETWEEN 1 AND 20),
+  portfolio_urls_json TEXT NOT NULL
+    CHECK (json_valid(portfolio_urls_json) AND json_type(portfolio_urls_json) = 'array'
+      AND json_array_length(portfolio_urls_json) BETWEEN 1 AND 5 AND length(portfolio_urls_json) <= 2000),
+  reference_urls_json TEXT NOT NULL
+    CHECK (json_valid(reference_urls_json) AND json_type(reference_urls_json) = 'array'
+      AND json_array_length(reference_urls_json) BETWEEN 1 AND 3 AND length(reference_urls_json) <= 1200),
+  registration_type TEXT NOT NULL CHECK (registration_type IN ('gstin', 'cin', 'udyam', 'not_registered')),
+  registration_reference TEXT,
+  attested INTEGER NOT NULL CHECK (attested = 1),
+  attested_at TEXT NOT NULL CHECK (length(attested_at) BETWEEN 20 AND 35),
+  submitted_by_user_id TEXT REFERENCES users(id) ON DELETE SET NULL,
+  created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+  PRIMARY KEY (vendor_id, evidence_revision),
+  CHECK (
+    (registration_type = 'not_registered' AND registration_reference IS NULL)
+    OR (registration_type = 'gstin' AND registration_reference IS NOT NULL
+      AND length(registration_reference) = 15
+      AND substr(registration_reference, 1, 2) NOT GLOB '*[^0-9]*'
+      AND substr(registration_reference, 3, 5) NOT GLOB '*[^A-Z]*'
+      AND substr(registration_reference, 8, 4) NOT GLOB '*[^0-9]*'
+      AND substr(registration_reference, 12, 1) GLOB '[A-Z]'
+      AND substr(registration_reference, 13, 1) GLOB '[1-9A-Z]'
+      AND substr(registration_reference, 14, 1) = 'Z'
+      AND substr(registration_reference, 15, 1) GLOB '[0-9A-Z]')
+    OR (registration_type = 'cin' AND registration_reference IS NOT NULL
+      AND length(registration_reference) = 21
+      AND substr(registration_reference, 1, 1) GLOB '[LU]'
+      AND substr(registration_reference, 2, 5) NOT GLOB '*[^0-9]*'
+      AND substr(registration_reference, 7, 2) NOT GLOB '*[^A-Z]*'
+      AND substr(registration_reference, 9, 4) NOT GLOB '*[^0-9]*'
+      AND substr(registration_reference, 13, 3) NOT GLOB '*[^A-Z]*'
+      AND substr(registration_reference, 16, 6) NOT GLOB '*[^0-9]*')
+    OR (registration_type = 'udyam' AND registration_reference IS NOT NULL
+      AND length(registration_reference) = 19
+      AND substr(registration_reference, 1, 6) = 'UDYAM-'
+      AND substr(registration_reference, 7, 2) NOT GLOB '*[^A-Z]*'
+      AND substr(registration_reference, 9, 1) = '-'
+      AND substr(registration_reference, 10, 2) NOT GLOB '*[^0-9]*'
+      AND substr(registration_reference, 12, 1) = '-'
+      AND substr(registration_reference, 13, 7) NOT GLOB '*[^0-9]*')
+  )
+);
+
+CREATE TABLE IF NOT EXISTS vendor_application_information_requests (
+  vendor_id TEXT NOT NULL REFERENCES vendors(id) ON DELETE RESTRICT,
+  request_revision INTEGER NOT NULL
+    CHECK (typeof(request_revision) = 'integer' AND request_revision BETWEEN 1 AND 1000000000),
+  evidence_revision INTEGER NOT NULL
+    CHECK (typeof(evidence_revision) = 'integer' AND evidence_revision BETWEEN 0 AND 20),
+  requested_fields_json TEXT NOT NULL
+    CHECK (json_valid(requested_fields_json) AND json_type(requested_fields_json) = 'array'
+      AND json_array_length(requested_fields_json) BETWEEN 1 AND 3 AND length(requested_fields_json) <= 80),
+  applicant_message TEXT NOT NULL CHECK (length(applicant_message) BETWEEN 10 AND 1000),
+  requested_by_user_id TEXT REFERENCES users(id) ON DELETE SET NULL,
+  requested_at TEXT NOT NULL CHECK (length(requested_at) BETWEEN 20 AND 35),
+  PRIMARY KEY (vendor_id, request_revision)
+);
+CREATE INDEX IF NOT EXISTS idx_vendor_information_requests_current
+  ON vendor_application_information_requests(vendor_id, request_revision DESC);
+
+INSERT OR IGNORE INTO vendor_application_evidence_revisions
+  (vendor_id, evidence_revision, portfolio_urls_json, reference_urls_json, registration_type,
+   registration_reference, attested, attested_at, submitted_by_user_id, created_at)
+SELECT evidence.vendor_id, evidence.evidence_revision, evidence.portfolio_urls_json,
+       evidence.reference_urls_json, evidence.registration_type, evidence.registration_reference,
+       evidence.attested, evidence.attested_at, vendor.user_id, evidence.created_at
+FROM vendor_application_evidence evidence
+JOIN vendors vendor ON vendor.id = evidence.vendor_id;
+
+UPDATE vendors
+SET evidence_latest_revision = COALESCE(
+  (SELECT MAX(revision.evidence_revision)
+   FROM vendor_application_evidence_revisions revision WHERE revision.vendor_id = vendors.id),
+  0
+)
+WHERE evidence_latest_revision != COALESCE(
+  (SELECT MAX(revision.evidence_revision)
+   FROM vendor_application_evidence_revisions revision WHERE revision.vendor_id = vendors.id),
+  0
+);
+
+DROP TRIGGER IF EXISTS vendor_application_evidence_vendor_state_insert;
+DROP TRIGGER IF EXISTS vendors_evidence_approval_guard;
+DROP TRIGGER IF EXISTS audit_events_vendor_review_sensitive_insert;
+DROP TRIGGER IF EXISTS vendor_application_evidence_vendor_state_insert_v10;
+DROP TRIGGER IF EXISTS vendor_application_evidence_mirror_insert_v10;
+DROP TRIGGER IF EXISTS vendor_application_evidence_revisions_validate_insert;
+DROP TRIGGER IF EXISTS vendor_application_evidence_revisions_state_insert;
+DROP TRIGGER IF EXISTS vendor_application_evidence_revisions_apply_insert;
+DROP TRIGGER IF EXISTS vendor_application_evidence_revisions_identity_update;
+DROP TRIGGER IF EXISTS vendor_application_evidence_revisions_actor_update;
+DROP TRIGGER IF EXISTS vendor_application_evidence_revisions_delete;
+DROP TRIGGER IF EXISTS vendors_evidence_latest_revision_guard;
+DROP TRIGGER IF EXISTS vendor_application_information_requests_validate_insert;
+DROP TRIGGER IF EXISTS vendor_application_information_requests_apply_insert;
+DROP TRIGGER IF EXISTS vendor_application_information_requests_identity_update;
+DROP TRIGGER IF EXISTS vendor_application_information_requests_actor_update;
+DROP TRIGGER IF EXISTS vendor_application_information_requests_delete;
+DROP TRIGGER IF EXISTS vendors_information_request_status_guard;
+DROP TRIGGER IF EXISTS vendors_information_request_state_guard;
+DROP TRIGGER IF EXISTS vendors_evidence_approval_guard_v10;
+DROP TRIGGER IF EXISTS audit_events_vendor_review_sensitive_insert_v10;
+
+CREATE TRIGGER vendor_application_evidence_vendor_state_insert_v10
+BEFORE INSERT ON vendor_application_evidence
+WHEN NOT EXISTS (
+  SELECT 1 FROM vendors vendor
+  WHERE vendor.id = NEW.vendor_id AND vendor.status IN ('pending', 'rejected')
+)
+BEGIN
+  SELECT RAISE(ABORT, 'vendor application evidence requires a pending or rejected vendor');
+END;
+
+CREATE TRIGGER vendor_application_evidence_revisions_validate_insert
+BEFORE INSERT ON vendor_application_evidence_revisions
+WHEN
+  EXISTS (
+    SELECT 1 FROM json_each(NEW.portfolio_urls_json) item
+    WHERE item.type != 'text'
+      OR length(CAST(item.value AS TEXT)) NOT BETWEEN 10 AND 300
+      OR substr(CAST(item.value AS TEXT), 1, 8) != 'https://'
+      OR trim(CAST(item.value AS TEXT)) != CAST(item.value AS TEXT)
+      OR instr(CAST(item.value AS TEXT), '#') != 0
+      OR instr(substr(CAST(item.value AS TEXT), 9), '/') = 0
+      OR substr(substr(CAST(item.value AS TEXT), 9), 1,
+        instr(substr(CAST(item.value AS TEXT), 9), '/') - 1) GLOB '*.'
+      OR instr(substr(substr(CAST(item.value AS TEXT), 9), 1,
+        instr(substr(CAST(item.value AS TEXT), 9), '/') - 1), '.:') != 0
+      OR lower(substr(substr(CAST(item.value AS TEXT), 9), 1,
+        instr(substr(CAST(item.value AS TEXT), 9), '/') - 1)) GLOB 'xn--*'
+      OR lower(substr(substr(CAST(item.value AS TEXT), 9), 1,
+        instr(substr(CAST(item.value AS TEXT), 9), '/') - 1)) GLOB '*.xn--*'
+  )
+  OR EXISTS (
+    SELECT 1 FROM json_each(NEW.reference_urls_json) item
+    WHERE item.type != 'text'
+      OR length(CAST(item.value AS TEXT)) NOT BETWEEN 10 AND 300
+      OR substr(CAST(item.value AS TEXT), 1, 8) != 'https://'
+      OR trim(CAST(item.value AS TEXT)) != CAST(item.value AS TEXT)
+      OR instr(CAST(item.value AS TEXT), '#') != 0
+      OR instr(substr(CAST(item.value AS TEXT), 9), '/') = 0
+      OR substr(substr(CAST(item.value AS TEXT), 9), 1,
+        instr(substr(CAST(item.value AS TEXT), 9), '/') - 1) GLOB '*.'
+      OR instr(substr(substr(CAST(item.value AS TEXT), 9), 1,
+        instr(substr(CAST(item.value AS TEXT), 9), '/') - 1), '.:') != 0
+      OR lower(substr(substr(CAST(item.value AS TEXT), 9), 1,
+        instr(substr(CAST(item.value AS TEXT), 9), '/') - 1)) GLOB 'xn--*'
+      OR lower(substr(substr(CAST(item.value AS TEXT), 9), 1,
+        instr(substr(CAST(item.value AS TEXT), 9), '/') - 1)) GLOB '*.xn--*'
+  )
+  OR (SELECT COUNT(*) FROM json_each(NEW.portfolio_urls_json))
+    != (SELECT COUNT(DISTINCT CAST(item.value AS TEXT)) FROM json_each(NEW.portfolio_urls_json) item)
+  OR (SELECT COUNT(*) FROM json_each(NEW.reference_urls_json))
+    != (SELECT COUNT(DISTINCT CAST(item.value AS TEXT)) FROM json_each(NEW.reference_urls_json) item)
+  OR EXISTS (
+    SELECT 1 FROM json_each(NEW.portfolio_urls_json) portfolio
+    JOIN json_each(NEW.reference_urls_json) reference
+      ON CAST(reference.value AS TEXT) = CAST(portfolio.value AS TEXT)
+  )
+BEGIN
+  SELECT RAISE(ABORT, 'vendor application evidence URLs must be normalized unique public HTTPS URLs');
+END;
+
+CREATE TRIGGER vendor_application_evidence_revisions_state_insert
+BEFORE INSERT ON vendor_application_evidence_revisions
+WHEN
+  (
+    NEW.evidence_revision = 1
+    AND NOT EXISTS (
+      SELECT 1 FROM vendor_application_evidence compatibility
+      WHERE compatibility.vendor_id = NEW.vendor_id
+        AND compatibility.evidence_revision = 1
+        AND compatibility.portfolio_urls_json = NEW.portfolio_urls_json
+        AND compatibility.reference_urls_json = NEW.reference_urls_json
+        AND compatibility.registration_type = NEW.registration_type
+        AND compatibility.registration_reference IS NEW.registration_reference
+        AND compatibility.attested = NEW.attested
+        AND compatibility.attested_at = NEW.attested_at
+    )
+  )
+  OR (
+    NEW.evidence_revision > 1
+    AND NOT EXISTS (
+      SELECT 1 FROM vendors vendor
+      JOIN users owner ON owner.id = vendor.user_id
+      WHERE vendor.id = NEW.vendor_id
+        AND vendor.status IN ('pending', 'rejected')
+        AND vendor.information_requested = 1
+        AND vendor.evidence_latest_revision + 1 = NEW.evidence_revision
+        AND NEW.submitted_by_user_id = vendor.user_id
+        AND owner.status = 'active'
+    )
+  )
+BEGIN
+  SELECT RAISE(ABORT, 'vendor evidence revision requires the active owner and an information request');
+END;
+
+CREATE TRIGGER vendor_application_evidence_revisions_apply_insert
+AFTER INSERT ON vendor_application_evidence_revisions
+BEGIN
+  UPDATE vendors
+  SET evidence_latest_revision = NEW.evidence_revision,
+      information_requested = 0,
+      status = CASE
+        WHEN NEW.evidence_revision > 1 OR information_requested = 1 THEN 'pending'
+        ELSE status
+      END,
+      review_revision = review_revision + CASE
+        WHEN NEW.evidence_revision > 1 OR information_requested = 1 THEN 1
+        ELSE 0
+      END,
+      updated_at = CASE
+        WHEN NEW.evidence_revision > 1 OR information_requested = 1 THEN NEW.created_at
+        ELSE updated_at
+      END
+  WHERE id = NEW.vendor_id AND evidence_latest_revision < NEW.evidence_revision;
+END;
+
+CREATE TRIGGER vendor_application_evidence_mirror_insert_v10
+AFTER INSERT ON vendor_application_evidence
+BEGIN
+  INSERT INTO vendor_application_evidence_revisions
+    (vendor_id, evidence_revision, portfolio_urls_json, reference_urls_json, registration_type,
+     registration_reference, attested, attested_at, submitted_by_user_id, created_at)
+  SELECT NEW.vendor_id, NEW.evidence_revision, NEW.portfolio_urls_json, NEW.reference_urls_json,
+         NEW.registration_type, NEW.registration_reference, NEW.attested, NEW.attested_at,
+         vendor.user_id, NEW.created_at
+  FROM vendors vendor WHERE vendor.id = NEW.vendor_id;
+END;
+
+CREATE TRIGGER vendor_application_evidence_revisions_identity_update
+BEFORE UPDATE OF vendor_id, evidence_revision, portfolio_urls_json, reference_urls_json,
+  registration_type, registration_reference, attested, attested_at, created_at
+ON vendor_application_evidence_revisions
+BEGIN
+  SELECT RAISE(ABORT, 'vendor application evidence revisions are immutable');
+END;
+
+CREATE TRIGGER vendor_application_evidence_revisions_actor_update
+BEFORE UPDATE OF submitted_by_user_id ON vendor_application_evidence_revisions
+WHEN NEW.submitted_by_user_id IS NOT NULL OR OLD.submitted_by_user_id IS NULL
+BEGIN
+  SELECT RAISE(ABORT, 'vendor evidence revision actors can only be anonymized');
+END;
+
+CREATE TRIGGER vendor_application_evidence_revisions_delete
+BEFORE DELETE ON vendor_application_evidence_revisions
+BEGIN
+  SELECT RAISE(ABORT, 'vendor application evidence revisions are immutable');
+END;
+
+CREATE TRIGGER vendors_evidence_latest_revision_guard
+BEFORE UPDATE OF evidence_latest_revision ON vendors
+WHEN NEW.evidence_latest_revision < OLD.evidence_latest_revision
+  OR (
+    NEW.evidence_latest_revision > 0
+    AND NOT EXISTS (
+      SELECT 1 FROM vendor_application_evidence_revisions evidence
+      WHERE evidence.vendor_id = NEW.id
+        AND evidence.evidence_revision = NEW.evidence_latest_revision
+    )
+  )
+BEGIN
+  SELECT RAISE(ABORT, 'vendor evidence latest revision must reference append-only history');
+END;
+
+CREATE TRIGGER vendor_application_information_requests_validate_insert
+BEFORE INSERT ON vendor_application_information_requests
+WHEN
+  EXISTS (
+    SELECT 1 FROM json_each(NEW.requested_fields_json) item
+    WHERE item.type != 'text'
+      OR CAST(item.value AS TEXT) NOT IN ('portfolio', 'references', 'registration')
+  )
+  OR (SELECT COUNT(*) FROM json_each(NEW.requested_fields_json))
+    != (SELECT COUNT(DISTINCT CAST(item.value AS TEXT))
+        FROM json_each(NEW.requested_fields_json) item)
+  OR NOT EXISTS (
+    SELECT 1 FROM vendors vendor
+    JOIN users operator ON operator.id = NEW.requested_by_user_id
+    WHERE vendor.id = NEW.vendor_id
+      AND vendor.status IN ('pending', 'rejected')
+      AND vendor.information_requested = 0
+      AND vendor.evidence_latest_revision < 20
+      AND NEW.request_revision = vendor.information_request_revision + 1
+      AND NEW.evidence_revision = vendor.evidence_latest_revision
+      AND operator.role = 'admin'
+      AND operator.status = 'active'
+  )
+  OR lower(NEW.applicant_message) LIKE '%http://%'
+  OR lower(NEW.applicant_message) LIKE '%https://%'
+  OR lower(NEW.applicant_message) LIKE '%www.%'
+  OR trim(NEW.applicant_message, ' ' || char(9) || char(10) || char(13)) != NEW.applicant_message
+  OR EXISTS (
+    SELECT 1
+    FROM (
+      SELECT column1 AS code
+      FROM (VALUES
+        (0), (1), (2), (3), (4), (5), (6), (7), (8),
+        (11), (12), (14), (15), (16), (17), (18), (19), (20), (21), (22), (23),
+        (24), (25), (26), (27), (28), (29), (30), (31), (127),
+        (8234), (8235), (8236), (8237), (8238), (8294), (8295), (8296), (8297)
+      )
+    ) disallowed_character
+    WHERE instr(NEW.applicant_message, char(disallowed_character.code)) != 0
+  )
+  OR lower(NEW.applicant_message) GLOB '*[a-z0-9].[a-z][a-z]*'
+  OR lower(NEW.applicant_message) GLOB '*[0-9].[0-9].[0-9].[0-9]*'
+  OR EXISTS (
+    WITH RECURSIVE
+      compact(value) AS (
+        SELECT upper(replace(replace(replace(replace(replace(
+          NEW.applicant_message, ' ', ''), '-', ''), char(9), ''), char(10), ''), char(13), ''))
+      ),
+      positions(position) AS (
+        SELECT 1
+        UNION ALL
+        SELECT position + 1 FROM positions, compact WHERE position < length(compact.value)
+      )
+    SELECT 1 FROM compact, positions
+    WHERE
+      (length(substr(value, position, 12)) = 12
+        AND substr(value, position, 12) NOT GLOB '*[^0-9]*')
+      OR (length(substr(value, position, 10)) = 10
+        AND substr(value, position, 5) NOT GLOB '*[^A-Z]*'
+        AND substr(value, position + 5, 4) NOT GLOB '*[^0-9]*'
+        AND substr(value, position + 9, 1) GLOB '[A-Z]')
+      OR (length(substr(value, position, 8)) = 8
+        AND substr(value, position, 1) GLOB '[A-Z]'
+        AND substr(value, position + 1, 7) NOT GLOB '*[^0-9]*')
+      OR (length(substr(value, position, 15)) = 15
+        AND substr(value, position, 2) NOT GLOB '*[^0-9]*'
+        AND substr(value, position + 2, 5) NOT GLOB '*[^A-Z]*'
+        AND substr(value, position + 7, 4) NOT GLOB '*[^0-9]*'
+        AND substr(value, position + 11, 1) GLOB '[A-Z]'
+        AND substr(value, position + 12, 1) GLOB '[1-9A-Z]'
+        AND substr(value, position + 13, 1) = 'Z'
+        AND substr(value, position + 14, 1) GLOB '[0-9A-Z]')
+      OR (length(substr(value, position, 21)) = 21
+        AND substr(value, position, 1) GLOB '[LU]'
+        AND substr(value, position + 1, 5) NOT GLOB '*[^0-9]*'
+        AND substr(value, position + 6, 2) NOT GLOB '*[^A-Z]*'
+        AND substr(value, position + 8, 4) NOT GLOB '*[^0-9]*'
+        AND substr(value, position + 12, 3) NOT GLOB '*[^A-Z]*'
+        AND substr(value, position + 15, 6) NOT GLOB '*[^0-9]*')
+      OR (substr(value, position, 5) = 'UDYAM'
+        AND length(substr(value, position, 16)) = 16
+        AND substr(value, position + 5, 2) NOT GLOB '*[^A-Z]*'
+        AND substr(value, position + 7, 9) NOT GLOB '*[^0-9]*')
+  )
+  OR EXISTS (
+    SELECT 1 FROM vendor_application_evidence_revisions evidence
+    WHERE evidence.vendor_id = NEW.vendor_id
+      AND (
+        (
+          evidence.registration_reference IS NOT NULL
+          AND instr(
+            upper(replace(replace(replace(replace(replace(
+              NEW.applicant_message, ' ', ''), '-', ''), char(9), ''), char(10), ''), char(13), '')),
+            upper(replace(evidence.registration_reference, '-', ''))
+          ) != 0
+        )
+        OR EXISTS (
+          SELECT 1 FROM json_each(evidence.portfolio_urls_json) url
+          WHERE instr(
+            lower(replace(replace(replace(replace(
+              NEW.applicant_message, ' ', ''), char(9), ''), char(10), ''), char(13), '')),
+            lower(substr(substr(CAST(url.value AS TEXT), 9), 1,
+              instr(substr(CAST(url.value AS TEXT), 9), '/') - 1))
+          ) != 0
+        )
+        OR EXISTS (
+          SELECT 1 FROM json_each(evidence.reference_urls_json) url
+          WHERE instr(
+            lower(replace(replace(replace(replace(
+              NEW.applicant_message, ' ', ''), char(9), ''), char(10), ''), char(13), '')),
+            lower(substr(substr(CAST(url.value AS TEXT), 9), 1,
+              instr(substr(CAST(url.value AS TEXT), 9), '/') - 1))
+          ) != 0
+        )
+      )
+  )
+BEGIN
+  SELECT RAISE(ABORT, 'vendor information requests contain invalid or sensitive content');
+END;
+
+CREATE TRIGGER vendor_application_information_requests_apply_insert
+AFTER INSERT ON vendor_application_information_requests
+BEGIN
+  UPDATE vendors
+  SET status = 'pending',
+      verified = 0,
+      information_request_revision = NEW.request_revision,
+      information_requested = 1,
+      evidence_reviewed_revision = NEW.evidence_revision,
+      review_revision = review_revision + 1,
+      updated_at = NEW.requested_at
+  WHERE id = NEW.vendor_id;
+END;
+
+CREATE TRIGGER vendor_application_information_requests_identity_update
+BEFORE UPDATE OF vendor_id, request_revision, evidence_revision, requested_fields_json,
+  applicant_message, requested_at
+ON vendor_application_information_requests
+BEGIN
+  SELECT RAISE(ABORT, 'vendor information requests are immutable');
+END;
+
+CREATE TRIGGER vendor_application_information_requests_actor_update
+BEFORE UPDATE OF requested_by_user_id ON vendor_application_information_requests
+WHEN NEW.requested_by_user_id IS NOT NULL OR OLD.requested_by_user_id IS NULL
+BEGIN
+  SELECT RAISE(ABORT, 'vendor information request actors can only be anonymized');
+END;
+
+CREATE TRIGGER vendor_application_information_requests_delete
+BEFORE DELETE ON vendor_application_information_requests
+BEGIN
+  SELECT RAISE(ABORT, 'vendor information requests are immutable');
+END;
+
+CREATE TRIGGER vendors_information_request_status_guard
+BEFORE UPDATE OF status ON vendors
+WHEN OLD.status != NEW.status
+  AND OLD.information_requested = 1
+  AND NEW.information_requested = 1
+BEGIN
+  SELECT RAISE(ABORT, 'vendor information request must be resolved before a status decision');
+END;
+
+CREATE TRIGGER vendors_information_request_state_guard
+BEFORE UPDATE OF information_requested, information_request_revision ON vendors
+WHEN
+  NEW.information_request_revision < OLD.information_request_revision
+  OR (
+    NEW.information_requested = 1
+    AND (
+      NEW.status NOT IN ('pending', 'rejected')
+      OR NOT EXISTS (
+        SELECT 1 FROM vendor_application_information_requests request
+        WHERE request.vendor_id = NEW.id
+          AND request.request_revision = NEW.information_request_revision
+      )
+    )
+  )
+BEGIN
+  SELECT RAISE(ABORT, 'vendor information request state is invalid');
+END;
+
+CREATE TRIGGER vendors_evidence_approval_guard_v10
+BEFORE UPDATE OF status ON vendors
+WHEN OLD.status != NEW.status
+  AND NEW.status = 'approved'
+  AND (
+    NEW.information_requested = 1
+    OR (NEW.evidence_required = 1 AND NEW.evidence_latest_revision = 0)
+    OR NEW.evidence_latest_revision != NEW.evidence_reviewed_revision
+    OR (
+      NEW.evidence_latest_revision > 0
+      AND NOT EXISTS (
+        SELECT 1 FROM vendor_application_evidence_revisions evidence
+        WHERE evidence.vendor_id = NEW.id
+          AND evidence.evidence_revision = NEW.evidence_latest_revision
+      )
+    )
+  )
+BEGIN
+  SELECT RAISE(ABORT, 'vendor evidence must be completed and acknowledged before approval');
+END;
+
+CREATE TRIGGER audit_events_vendor_review_sensitive_insert_v10
+BEFORE INSERT ON audit_events
+WHEN NEW.action = 'vendor.reviewed'
+  AND NEW.entity_type = 'vendor'
+  AND (
+    lower(COALESCE(json_extract(NEW.metadata_json, '$.reason'), json_extract(NEW.metadata_json, '$.note'), ''))
+      LIKE '%http://%'
+    OR lower(COALESCE(json_extract(NEW.metadata_json, '$.reason'), json_extract(NEW.metadata_json, '$.note'), ''))
+      LIKE '%https://%'
+    OR lower(COALESCE(json_extract(NEW.metadata_json, '$.reason'), json_extract(NEW.metadata_json, '$.note'), ''))
+      LIKE '%www.%'
+    OR lower(COALESCE(json_extract(NEW.metadata_json, '$.reason'), json_extract(NEW.metadata_json, '$.note'), ''))
+      GLOB '*[a-z0-9].[a-z][a-z]*'
+    OR lower(COALESCE(json_extract(NEW.metadata_json, '$.reason'), json_extract(NEW.metadata_json, '$.note'), ''))
+      GLOB '*[0-9].[0-9].[0-9].[0-9]*'
+    OR EXISTS (
+      WITH RECURSIVE
+        compact(value) AS (
+          SELECT upper(replace(replace(replace(replace(replace(
+            COALESCE(json_extract(NEW.metadata_json, '$.reason'), json_extract(NEW.metadata_json, '$.note'), ''),
+            ' ', ''), '-', ''), char(9), ''), char(10), ''), char(13), ''))
+        ),
+        positions(position) AS (
+          SELECT 1
+          UNION ALL
+          SELECT position + 1 FROM positions, compact WHERE position < length(compact.value)
+        )
+      SELECT 1 FROM compact, positions
+      WHERE
+        (length(substr(value, position, 12)) = 12
+          AND substr(value, position, 12) NOT GLOB '*[^0-9]*')
+        OR (length(substr(value, position, 10)) = 10
+          AND substr(value, position, 5) NOT GLOB '*[^A-Z]*'
+          AND substr(value, position + 5, 4) NOT GLOB '*[^0-9]*'
+          AND substr(value, position + 9, 1) GLOB '[A-Z]')
+        OR (length(substr(value, position, 8)) = 8
+          AND substr(value, position, 1) GLOB '[A-Z]'
+          AND substr(value, position + 1, 7) NOT GLOB '*[^0-9]*')
+        OR (length(substr(value, position, 15)) = 15
+          AND substr(value, position, 2) NOT GLOB '*[^0-9]*'
+          AND substr(value, position + 2, 5) NOT GLOB '*[^A-Z]*'
+          AND substr(value, position + 7, 4) NOT GLOB '*[^0-9]*'
+          AND substr(value, position + 11, 1) GLOB '[A-Z]'
+          AND substr(value, position + 12, 1) GLOB '[1-9A-Z]'
+          AND substr(value, position + 13, 1) = 'Z'
+          AND substr(value, position + 14, 1) GLOB '[0-9A-Z]')
+        OR (length(substr(value, position, 21)) = 21
+          AND substr(value, position, 1) GLOB '[LU]'
+          AND substr(value, position + 1, 5) NOT GLOB '*[^0-9]*'
+          AND substr(value, position + 6, 2) NOT GLOB '*[^A-Z]*'
+          AND substr(value, position + 8, 4) NOT GLOB '*[^0-9]*'
+          AND substr(value, position + 12, 3) NOT GLOB '*[^A-Z]*'
+          AND substr(value, position + 15, 6) NOT GLOB '*[^0-9]*')
+        OR (substr(value, position, 5) = 'UDYAM'
+          AND length(substr(value, position, 16)) = 16
+          AND substr(value, position + 5, 2) NOT GLOB '*[^A-Z]*'
+          AND substr(value, position + 7, 9) NOT GLOB '*[^0-9]*')
+    )
+    OR EXISTS (
+      SELECT 1 FROM vendor_application_evidence_revisions evidence
+      WHERE evidence.vendor_id = NEW.entity_id
+        AND (
+          (
+            evidence.registration_reference IS NOT NULL
+            AND instr(
+              upper(replace(replace(replace(replace(replace(
+                COALESCE(json_extract(NEW.metadata_json, '$.reason'), json_extract(NEW.metadata_json, '$.note'), ''),
+                ' ', ''), '-', ''), char(9), ''), char(10), ''), char(13), '')),
+              upper(replace(evidence.registration_reference, '-', ''))
+            ) != 0
+          )
+          OR EXISTS (
+            SELECT 1 FROM json_each(evidence.portfolio_urls_json) url
+            WHERE instr(
+              lower(replace(replace(replace(replace(
+                COALESCE(json_extract(NEW.metadata_json, '$.reason'), json_extract(NEW.metadata_json, '$.note'), ''),
+                ' ', ''), char(9), ''), char(10), ''), char(13), '')),
+              lower(substr(substr(CAST(url.value AS TEXT), 9), 1,
+                instr(substr(CAST(url.value AS TEXT), 9), '/') - 1))
+            ) != 0
+          )
+          OR EXISTS (
+            SELECT 1 FROM json_each(evidence.reference_urls_json) url
+            WHERE instr(
+              lower(replace(replace(replace(replace(
+                COALESCE(json_extract(NEW.metadata_json, '$.reason'), json_extract(NEW.metadata_json, '$.note'), ''),
+                ' ', ''), char(9), ''), char(10), ''), char(13), '')),
+              lower(substr(substr(CAST(url.value AS TEXT), 9), 1,
+                instr(substr(CAST(url.value AS TEXT), 9), '/') - 1))
+            ) != 0
+          )
+        )
+    )
+  )
+BEGIN
+  SELECT RAISE(ABORT, 'vendor review reasons must not contain evidence addresses or identity references');
+END;
+
+INSERT OR IGNORE INTO _sql_schema_migrations (id) VALUES (10);
+PRAGMA optimize;
+`;
+
+const STORE_SCHEMA_V10_MIGRATION_SQL = `
+ALTER TABLE vendors ADD COLUMN evidence_latest_revision INTEGER NOT NULL DEFAULT 0
+  CHECK (typeof(evidence_latest_revision) = 'integer' AND evidence_latest_revision BETWEEN 0 AND 20);
+ALTER TABLE vendors ADD COLUMN information_request_revision INTEGER NOT NULL DEFAULT 0
+  CHECK (typeof(information_request_revision) = 'integer' AND information_request_revision >= 0);
+ALTER TABLE vendors ADD COLUMN information_requested INTEGER NOT NULL DEFAULT 0
+  CHECK (information_requested IN (0, 1));
+${STORE_SCHEMA_V10_FINALIZE_SQL}
+`;
+
+const STORE_SCHEMA_SQL = `${STORE_SCHEMA_V1_SQL}\n${STORE_SCHEMA_V2_MIGRATION_SQL}\n${STORE_SCHEMA_V3_MIGRATION_SQL}\n${STORE_SCHEMA_V4_MIGRATION_SQL}\n${STORE_SCHEMA_V5_MIGRATION_SQL}\n${STORE_SCHEMA_V6_MIGRATION_SQL}\n${STORE_SCHEMA_V7_MIGRATION_SQL}\n${STORE_SCHEMA_V8_MIGRATION_SQL}\n${STORE_SCHEMA_V9_MIGRATION_SQL}\n${STORE_SCHEMA_V10_MIGRATION_SQL}`;
 
 const DEMO_CATALOG_SQL = `
 INSERT OR IGNORE INTO vendors
@@ -1111,6 +1698,30 @@ const VENDOR_EVIDENCE_TRIGGER_NAMES = Object.freeze([
   "audit_events_vendor_review_sensitive_insert",
 ]);
 
+const VENDOR_EVIDENCE_V10_TRIGGER_NAMES = Object.freeze([
+  "vendor_application_evidence_validate_insert",
+  "vendor_application_evidence_vendor_state_insert_v10",
+  "vendor_application_evidence_immutable_update",
+  "vendor_application_evidence_immutable_delete",
+  "vendor_application_evidence_mirror_insert_v10",
+  "vendor_application_evidence_revisions_validate_insert",
+  "vendor_application_evidence_revisions_state_insert",
+  "vendor_application_evidence_revisions_apply_insert",
+  "vendor_application_evidence_revisions_identity_update",
+  "vendor_application_evidence_revisions_actor_update",
+  "vendor_application_evidence_revisions_delete",
+  "vendors_evidence_latest_revision_guard",
+  "vendor_application_information_requests_validate_insert",
+  "vendor_application_information_requests_apply_insert",
+  "vendor_application_information_requests_identity_update",
+  "vendor_application_information_requests_actor_update",
+  "vendor_application_information_requests_delete",
+  "vendors_information_request_status_guard",
+  "vendors_information_request_state_guard",
+  "vendors_evidence_approval_guard_v10",
+  "audit_events_vendor_review_sensitive_insert_v10",
+]);
+
 function runStorageTransaction(storage, callback) {
   return typeof storage.transactionSync === "function" ? storage.transactionSync(callback) : callback();
 }
@@ -1155,6 +1766,65 @@ function assertVendorEvidenceSchemaReady(sqlStorage) {
   if (!ready) throw new Error("vendor evidence schema v9 is incomplete");
 }
 
+function assertVendorEvidenceV10SchemaReady(sqlStorage) {
+  const legacyTriggerName = "vendor_application_evidence_vendor_state_insert";
+  const inspectedTriggerNames = [...VENDOR_EVIDENCE_V10_TRIGGER_NAMES, legacyTriggerName];
+  const migration = sqlStorage
+    .exec("SELECT id FROM _sql_schema_migrations WHERE id = 10 LIMIT 1")
+    .toArray()[0];
+  const vendorColumns = new Set(sqlStorage.exec("PRAGMA table_info(vendors)").toArray().map((column) => column.name));
+  const revisionColumns = new Set(
+    sqlStorage.exec("PRAGMA table_info(vendor_application_evidence_revisions)").toArray().map((column) => column.name),
+  );
+  const requestColumns = new Set(
+    sqlStorage.exec("PRAGMA table_info(vendor_application_information_requests)").toArray().map((column) => column.name),
+  );
+  const triggers = new Map(
+    sqlStorage
+      .exec(
+        `SELECT name, sql FROM sqlite_master
+         WHERE type = 'trigger' AND name IN (${inspectedTriggerNames.map(() => "?").join(", ")})`,
+        ...inspectedTriggerNames,
+      )
+      .toArray()
+      .map((trigger) => [trigger.name, String(trigger.sql || "")]),
+  );
+  const approvalGuard = triggers.get("vendors_evidence_approval_guard_v10") || "";
+  const revisionGuard = triggers.get("vendor_application_evidence_revisions_state_insert") || "";
+  const latestRevisionGuard = triggers.get("vendors_evidence_latest_revision_guard") || "";
+  const ready = Boolean(migration)
+    && ["evidence_latest_revision", "information_request_revision", "information_requested"]
+      .every((column) => vendorColumns.has(column))
+    && [
+      "vendor_id",
+      "evidence_revision",
+      "portfolio_urls_json",
+      "reference_urls_json",
+      "registration_type",
+      "registration_reference",
+      "attested",
+      "attested_at",
+      "submitted_by_user_id",
+      "created_at",
+    ].every((column) => revisionColumns.has(column))
+    && [
+      "vendor_id",
+      "request_revision",
+      "evidence_revision",
+      "requested_fields_json",
+      "applicant_message",
+      "requested_by_user_id",
+      "requested_at",
+    ].every((column) => requestColumns.has(column))
+    && VENDOR_EVIDENCE_V10_TRIGGER_NAMES.every((name) => triggers.has(name))
+    && approvalGuard.includes("NEW.evidence_latest_revision != NEW.evidence_reviewed_revision")
+    && approvalGuard.includes("NEW.information_requested = 1")
+    && revisionGuard.includes("vendor.evidence_latest_revision + 1 = NEW.evidence_revision")
+    && latestRevisionGuard.includes("vendor evidence latest revision must reference append-only history")
+    && !triggers.has(legacyTriggerName);
+  if (!ready) throw new Error("vendor evidence schema v10 is incomplete");
+}
+
 export class MelaivaStore {
   constructor(ctx, env) {
     this.ctx = ctx;
@@ -1174,7 +1844,7 @@ export class MelaivaStore {
       if (version === 0) {
         runStorageTransaction(ctx.storage, () => {
           this.sql.exec(STORE_SCHEMA_SQL).toArray();
-          assertVendorEvidenceSchemaReady(this.sql);
+          assertVendorEvidenceV10SchemaReady(this.sql);
         });
       } else if (version < 2) {
         const idempotencyColumns = this.sql.exec("PRAGMA table_info(idempotency_keys)").toArray();
@@ -1265,6 +1935,72 @@ export class MelaivaStore {
           assertVendorEvidenceSchemaReady(this.sql);
         });
       }
+      if (version > 0 && version < 10) {
+        runStorageTransaction(ctx.storage, () => {
+          const vendorColumns = new Set(
+            this.sql.exec("PRAGMA table_info(vendors)").toArray().map((column) => column.name),
+          );
+          if (!vendorColumns.has("evidence_latest_revision")) {
+            this.sql
+              .exec(
+                `ALTER TABLE vendors ADD COLUMN evidence_latest_revision INTEGER NOT NULL DEFAULT 0
+                   CHECK (typeof(evidence_latest_revision) = 'integer' AND evidence_latest_revision BETWEEN 0 AND 20)`,
+              )
+              .toArray();
+          }
+          if (!vendorColumns.has("information_request_revision")) {
+            this.sql
+              .exec(
+                `ALTER TABLE vendors ADD COLUMN information_request_revision INTEGER NOT NULL DEFAULT 0
+                   CHECK (typeof(information_request_revision) = 'integer' AND information_request_revision >= 0)`,
+              )
+              .toArray();
+          }
+          if (!vendorColumns.has("information_requested")) {
+            this.sql
+              .exec(
+                `ALTER TABLE vendors ADD COLUMN information_requested INTEGER NOT NULL DEFAULT 0
+                   CHECK (information_requested IN (0, 1))`,
+              )
+              .toArray();
+          }
+          this.sql.exec(STORE_SCHEMA_V10_FINALIZE_SQL).toArray();
+          assertVendorEvidenceV10SchemaReady(this.sql);
+        });
+      }
+      if (version === 10) {
+        runStorageTransaction(ctx.storage, () => {
+          const vendorColumns = new Set(
+            this.sql.exec("PRAGMA table_info(vendors)").toArray().map((column) => column.name),
+          );
+          if (!vendorColumns.has("evidence_latest_revision")) {
+            this.sql
+              .exec(
+                `ALTER TABLE vendors ADD COLUMN evidence_latest_revision INTEGER NOT NULL DEFAULT 0
+                   CHECK (typeof(evidence_latest_revision) = 'integer' AND evidence_latest_revision BETWEEN 0 AND 20)`,
+              )
+              .toArray();
+          }
+          if (!vendorColumns.has("information_request_revision")) {
+            this.sql
+              .exec(
+                `ALTER TABLE vendors ADD COLUMN information_request_revision INTEGER NOT NULL DEFAULT 0
+                   CHECK (typeof(information_request_revision) = 'integer' AND information_request_revision >= 0)`,
+              )
+              .toArray();
+          }
+          if (!vendorColumns.has("information_requested")) {
+            this.sql
+              .exec(
+                `ALTER TABLE vendors ADD COLUMN information_requested INTEGER NOT NULL DEFAULT 0
+                   CHECK (information_requested IN (0, 1))`,
+              )
+              .toArray();
+          }
+          this.sql.exec(STORE_SCHEMA_V10_FINALIZE_SQL).toArray();
+          assertVendorEvidenceV10SchemaReady(this.sql);
+        });
+      }
       if (env?.ENABLE_DEMO_CATALOG === "true" && env?.ENVIRONMENT !== "production") {
         this.sql.exec(DEMO_CATALOG_SQL).toArray();
       }
@@ -1319,6 +2055,12 @@ export class MelaivaStore {
         ? "unique_constraint"
         : /vendor application evidence requires a pending or rejected vendor/i.test(message)
           ? "vendor_evidence_state_conflict"
+          : /vendor evidence revision requires the active owner and an information request/i.test(message)
+            ? "vendor_evidence_revision_conflict"
+            : /vendor information requests contain invalid or sensitive content/i.test(message)
+              ? "vendor_information_request_conflict"
+              : /vendor information request must be resolved before a status decision|vendor information request state is invalid/i.test(message)
+                ? "vendor_information_state_conflict"
           : /vendor evidence must be completed and acknowledged before approval/i.test(message)
             ? "vendor_evidence_approval_conflict"
             : /vendor review reasons must not contain evidence addresses or identity references/i.test(message)
@@ -1412,6 +2154,8 @@ export {
   STORE_SCHEMA_V8_MIGRATION_SQL,
   STORE_SCHEMA_V9_FINALIZE_SQL,
   STORE_SCHEMA_V9_MIGRATION_SQL,
+  STORE_SCHEMA_V10_FINALIZE_SQL,
+  STORE_SCHEMA_V10_MIGRATION_SQL,
   STORE_SCHEMA_VERSION,
   executeSql,
 };

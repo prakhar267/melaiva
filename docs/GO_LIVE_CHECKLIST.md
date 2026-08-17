@@ -27,11 +27,13 @@
 - [ ] Dependency, static, secret, and dynamic scans have no unresolved high/critical findings.
 - [ ] Any future payment-webhook replay/signature/idempotency tests pass before payment features are enabled.
 - [ ] Logs contain no secrets, PII, payment payloads, or raw AI prompts.
+- [ ] Vendor evidence/history reads preserve summary-versus-detail authorization: queue summaries contain no URLs, registration references, applicant messages, private reasons, or staff identity, and applicant context never exposes private operator rationale.
 
 ## Reliability and recovery
 
 - [ ] Staging uses isolated Cloudflare bindings and anonymized data only.
 - [ ] The SQLite Durable Object migration has been applied on a clean deployment and a production recovery bookmark recorded.
+- [ ] Schema-v9→v10 migration, cold restart, mixed-version rollout, and rollback have proved that revision-1 evidence is preserved exactly, later revisions remain append-only, and old Workers fail closed.
 - [ ] Restore, rollback, leaked-key, stuck-request, payment-mismatch, and provider-outage runbooks have been exercised.
 - [ ] External synthetics cover homepage, health, catalog, authentication, request submission, vendor offer, and AI fallback.
 - [ ] Alerting covers error rate, quota/CPU, Durable Object storage/alarm freshness, and AI errors/cost.
@@ -47,6 +49,8 @@
 - [ ] Search, structured brief, AI fallback, auction submission, comparison, vendor onboarding, and dashboards render without client exceptions.
 - [ ] Planner-to-request handoff preserves only reviewed user-entered facts, rejects malformed or stale navigation state, leaves service and service budget explicit, and lets provenance be dismissed without erasing draft edits or changing direct request links.
 - [ ] Award conversations pass owner/winner/admin/outsider authorization, idempotent retry, suspension pause, long-text wrapping, and 390 px composer checks without exposing customer contact details.
+- [ ] Vendor information requests pass operator/applicant/outsider authorization, exact status/review/evidence/request revision conflicts, idempotent replay, concurrent request/response/approval races, immutable-history checks, and responsive/accessibility review.
+- [ ] Applicant-facing copy says `needs_information` is an in-product state and does not claim an email, SMS, push, or other notification was sent.
 
 ## Launch decision
 

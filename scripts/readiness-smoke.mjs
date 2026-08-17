@@ -28,6 +28,15 @@ const minimumEvidenceRevision = minimumRevisionInput
   ? parsePositiveInteger(minimumRevisionInput, "MELAIVA_SMOKE_MINIMUM_EVIDENCE_REVISION")
   : null;
 
+const expectedWorkerVersionId = (process.env.MELAIVA_SMOKE_EXPECTED_WORKER_VERSION_ID || "").trim();
+if (expectedWorkerVersionId && !/^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/iu.test(expectedWorkerVersionId)) {
+  throw new Error("MELAIVA_SMOKE_EXPECTED_WORKER_VERSION_ID must be a Worker version UUID.");
+}
+const expectedWorkerVersionTag = (process.env.MELAIVA_SMOKE_EXPECTED_WORKER_VERSION_TAG || "").trim();
+if (expectedWorkerVersionTag && !/^[0-9a-f]{40}$/u.test(expectedWorkerVersionTag)) {
+  throw new Error("MELAIVA_SMOKE_EXPECTED_WORKER_VERSION_TAG must be a full lowercase Git SHA.");
+}
+
 const workerVersionOverride = (process.env.MELAIVA_SMOKE_WORKER_VERSION_OVERRIDE || "").trim();
 const workerName = (process.env.MELAIVA_SMOKE_WORKER_NAME || "").trim();
 if (Boolean(workerVersionOverride) !== Boolean(workerName)) {
@@ -63,6 +72,12 @@ const health = JSON.parse(healthResponse.body);
 if (health?.data?.status !== "ok" || health?.data?.database !== "ok" || health?.data?.authentication !== "ok") {
   throw new Error("Health response did not report all required services as healthy.");
 }
+if (expectedWorkerVersionId && health?.data?.workerVersionId !== expectedWorkerVersionId) {
+  throw new Error(`Health response ran Worker version ${health?.data?.workerVersionId || "unknown"}, expected ${expectedWorkerVersionId}.`);
+}
+if (expectedWorkerVersionTag && health?.data?.workerVersionTag !== expectedWorkerVersionTag) {
+  throw new Error(`Health response ran Worker tag ${health?.data?.workerVersionTag || "unknown"}, expected ${expectedWorkerVersionTag}.`);
+}
 
 const authConfigResponse = await request("/api/v1/auth/config");
 const authConfig = JSON.parse(authConfigResponse.body);
@@ -95,6 +110,8 @@ if (!vendorOnboarding.response.headers.get("content-type")?.includes("text/html"
 console.log(JSON.stringify({
   origin: baseUrl,
   version: health.data.version,
+  workerVersionId: health.data.workerVersionId || null,
+  workerVersionTag: health.data.workerVersionTag || null,
   services: {
     database: health.data.database,
     authentication: health.data.authentication,

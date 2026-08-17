@@ -164,10 +164,17 @@ test("production health fails closed when required authentication secrets are mi
       ENVIRONMENT: "production",
       SESSION_SECRET,
       PASSWORD_PEPPER: "health-password-pepper-that-is-more-than-thirty-two-characters",
+      CF_VERSION_METADATA: {
+        id: "11111111-2222-4333-8444-555555555555",
+        tag: "0123456789abcdef0123456789abcdef01234567",
+      },
     },
   );
   assert.equal(ready.status, 200, await ready.clone().text());
-  assert.equal((await ready.json()).data.authentication, "ok");
+  const health = (await ready.json()).data;
+  assert.equal(health.authentication, "ok");
+  assert.equal(health.workerVersionId, "11111111-2222-4333-8444-555555555555");
+  assert.equal(health.workerVersionTag, "0123456789abcdef0123456789abcdef01234567");
 });
 
 test("PBKDF2 password hashes use a random salt and reject a wrong password", async () => {

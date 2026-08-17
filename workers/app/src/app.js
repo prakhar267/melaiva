@@ -2163,6 +2163,8 @@ function buildApp() {
           database,
           authentication,
           version: c.env?.APP_VERSION || "dev",
+          workerVersionId: c.env?.CF_VERSION_METADATA?.id || null,
+          workerVersionTag: c.env?.CF_VERSION_METADATA?.tag || null,
           timestamp: new Date().toISOString(),
         },
       },

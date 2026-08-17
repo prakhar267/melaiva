@@ -90,6 +90,125 @@ export function evidenceFocusNeedsScroll(rect, viewportHeight) {
   return top < 0 || bottom > height;
 }
 
+export const VENDOR_EVIDENCE_DISCARD_FAILURE_MESSAGE = "The latest evidence request could not be loaded. The entries you discarded remain cleared; retry the account check to load the current record.";
+
+export function createVendorEvidenceLifecycleState() {
+  return {
+    generation: 0,
+    locked: false,
+    mutationInFlight: false,
+    focusDescriptor: null,
+    submissionSequence: 0,
+    submissionUnconfirmed: false,
+    keyPreserved: false,
+    draftCleared: false,
+    explicitDiscard: false,
+    accessErrorMessage: "",
+  };
+}
+
+export function vendorEvidenceLifecycleTransition(state, event = {}) {
+  const current = state || createVendorEvidenceLifecycleState();
+  switch (event.type) {
+    case "capture_focus":
+      return {
+        ...current,
+        focusDescriptor: typeof event.focusDescriptor === "string" && event.focusDescriptor
+          ? event.focusDescriptor
+          : null,
+      };
+    case "consume_focus":
+      return { ...current, focusDescriptor: null };
+    case "begin_submission":
+      if (current.locked) return current;
+      return {
+        ...current,
+        locked: true,
+        submissionSequence: current.submissionSequence + 1,
+        draftCleared: false,
+        accessErrorMessage: "",
+      };
+    case "mutation_started":
+      if (!current.locked) return current;
+      return {
+        ...current,
+        mutationInFlight: true,
+        keyPreserved: true,
+      };
+    case "focus_revalidation": {
+      const mutationInFlight = event.mutationInFlight ?? current.mutationInFlight;
+      return {
+        ...current,
+        generation: current.generation + 1,
+        locked: Boolean(mutationInFlight),
+        mutationInFlight: Boolean(mutationInFlight),
+        submissionUnconfirmed: Boolean(mutationInFlight) || current.submissionUnconfirmed,
+        keyPreserved: Boolean(mutationInFlight) || current.keyPreserved,
+      };
+    }
+    case "mutation_unconfirmed":
+      return {
+        ...current,
+        submissionUnconfirmed: true,
+        keyPreserved: true,
+      };
+    case "submission_confirmed":
+      return {
+        ...current,
+        submissionUnconfirmed: false,
+        keyPreserved: false,
+      };
+    case "mutation_settled":
+      return {
+        ...current,
+        locked: false,
+        mutationInFlight: false,
+      };
+    case "release_submission":
+      return { ...current, locked: false };
+    case "form_changed":
+      if (current.locked) return current;
+      return {
+        ...current,
+        submissionUnconfirmed: false,
+        keyPreserved: false,
+        draftCleared: false,
+        explicitDiscard: false,
+      };
+    case "draft_loaded":
+      return {
+        ...current,
+        draftCleared: false,
+        explicitDiscard: false,
+        accessErrorMessage: "",
+      };
+    case "explicit_discard":
+      return {
+        ...createVendorEvidenceLifecycleState(),
+        generation: current.generation + 1,
+        draftCleared: true,
+        explicitDiscard: true,
+      };
+    case "clear_private":
+      return {
+        ...createVendorEvidenceLifecycleState(),
+        generation: current.generation + 1,
+        draftCleared: true,
+      };
+    case "discard_load_failed":
+      return {
+        ...current,
+        accessErrorMessage: current.explicitDiscard
+          ? VENDOR_EVIDENCE_DISCARD_FAILURE_MESSAGE
+          : "",
+      };
+    case "access_retry":
+      return { ...current, accessErrorMessage: "" };
+    default:
+      return current;
+  }
+}
+
 export function canCompleteVendorEvidence(status, evidenceComplete) {
   return status === "needs_information"
     || (evidenceComplete !== true && ["pending", "rejected"].includes(status));

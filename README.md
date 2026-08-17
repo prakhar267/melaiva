@@ -82,8 +82,9 @@ npm run check
 npm test
 npx wrangler deploy --env="" --dry-run
 npx wrangler deploy --env staging --dry-run
-npx wrangler deploy --env=""
 MELAIVA_SMOKE_BASE_URL=https://melaiva.prakhargupta267.workers.dev npm run smoke:readiness
 ```
+
+Production promotion is intentionally handled by the protected deployment workflow rather than a direct `wrangler deploy`: the exact commit must pass CI and the full staging job, soak under the same Git tag, upload as an immutable zero-traffic Worker version, pass an exact version-override smoke, and then cut over at 100%. The movable `production` Git tag records the source currently serving production and gives scheduled monitoring the matching release-specific readiness contract; a failed promotion restores both the previous Worker version and that tag.
 
 The free launch target is the Worker `melaiva` on `workers.dev`. A paid custom domain, production email/payment providers, approved vendor supply, legal/trademark clearance, and operational verification are separate commercial launch gates—not claims made by this codebase.

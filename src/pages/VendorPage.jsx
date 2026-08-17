@@ -43,6 +43,7 @@ import {
   buildVendorEvidence,
   buildVendorEvidenceSubmissionPayload,
   canCompleteVendorEvidence,
+  createVendorEvidenceLifecycleState,
   evidenceFocusIndexAfterRemoval,
   evidenceFocusNeedsScroll,
   normalizeInformationRequest,
@@ -58,6 +59,7 @@ import {
   vendorEvidenceConflictState,
   vendorEvidenceContextRefreshDecision,
   vendorEvidenceExplicitReloadPlan,
+  vendorEvidenceLifecycleTransition,
   vendorEvidencePreflightIdentityMatches,
   vendorEvidencePreflightMatches,
   vendorEvidenceFieldRequested,
@@ -66,6 +68,7 @@ import {
 import {
   checkVendorApplicationEvidenceCompatibility,
   VENDOR_APPLICATION_EVIDENCE_HEADERS,
+  workerVersionAffinityHeaders,
 } from "../components/vendorApplicationCompatibility.js";
 
 function categoryLabel(value) {
@@ -640,8 +643,13 @@ function createVendorOnboardingForm() {
   };
 }
 
-async function readVendorEvidenceCompletionAccess({ signal } = {}) {
-  const response = await fetch("/api/v1/vendors/onboarding/evidence", { cache: "no-store", credentials: "include", signal });
+async function readVendorEvidenceCompletionAccess({ signal, versionKey } = {}) {
+  const response = await fetch("/api/v1/vendors/onboarding/evidence", {
+    cache: "no-store",
+    credentials: "include",
+    headers: workerVersionAffinityHeaders(versionKey),
+    signal,
+  });
   if (response.status === 401) return { state: "guest", vendorStatus: null, context: null };
   if (response.status === 403) return { state: "status_unavailable", vendorStatus: null, context: null };
   if (response.status === 404) return { state: "no_application", vendorStatus: null, context: null };
@@ -711,11 +719,15 @@ export function VendorOnboardingPage({ notify, onOpenAuth, authRevision = 0 }) {
   const evidenceContextRef = useRef(null);
   const evidenceModeRef = useRef(evidenceOnly);
   const evidenceAuthRevisionRef = useRef(authRevision);
-  const submissionGenerationRef = useRef(0);
+  const evidenceLifecycleRef = useRef(createVendorEvidenceLifecycleState());
   const activeMutationRef = useRef(null);
-  const submissionLockRef = useRef(false);
-  const evidenceFocusRestoreRef = useRef(null);
   const evidenceFocusRestoreFrameRef = useRef(null);
+
+  function transitionEvidenceLifecycle(event) {
+    const next = vendorEvidenceLifecycleTransition(evidenceLifecycleRef.current, event);
+    evidenceLifecycleRef.current = next;
+    return next;
+  }
 
   function cancelScheduledEvidenceFocus() {
     if (evidenceFocusRestoreFrameRef.current !== null) {
@@ -724,12 +736,12 @@ export function VendorOnboardingPage({ notify, onOpenAuth, authRevision = 0 }) {
     }
   }
 
-  function clearPrivateEvidenceDraft() {
-    submissionGenerationRef.current += 1;
+  function clearPrivateEvidenceDraft({ explicitDiscard = false } = {}) {
+    const lifecycle = transitionEvidenceLifecycle({
+      type: explicitDiscard ? "explicit_discard" : "clear_private",
+    });
     activeMutationRef.current = null;
-    submissionLockRef.current = false;
     cancelScheduledEvidenceFocus();
-    evidenceFocusRestoreRef.current = null;
     submissionKeyRef.current = null;
     formInitializedRef.current = false;
     dirtyRef.current = false;
@@ -742,24 +754,27 @@ export function VendorOnboardingPage({ notify, onOpenAuth, authRevision = 0 }) {
     setSuccess(null);
     setEvidenceContext(null);
     setEvidenceConflict(null);
-    setSubmissionUnconfirmed(false);
-    setEvidenceAccessErrorMessage("");
+    setSubmissionUnconfirmed(lifecycle.submissionUnconfirmed);
+    setEvidenceAccessErrorMessage(lifecycle.accessErrorMessage);
   }
 
   function captureEvidenceFocus() {
     const activeElement = document.activeElement;
     if (formRef.current?.contains(activeElement)) {
-      evidenceFocusRestoreRef.current = activeElement?.getAttribute?.("data-evidence-focus") || null;
+      transitionEvidenceLifecycle({
+        type: "capture_focus",
+        focusDescriptor: activeElement?.getAttribute?.("data-evidence-focus") || null,
+      });
     }
   }
 
   function scheduleEvidenceFocus(focusDescriptor) {
     cancelScheduledEvidenceFocus();
     if (!focusDescriptor) return;
-    const focusGeneration = submissionGenerationRef.current;
+    const focusGeneration = evidenceLifecycleRef.current.generation;
     evidenceFocusRestoreFrameRef.current = window.requestAnimationFrame(() => {
       evidenceFocusRestoreFrameRef.current = null;
-      if (focusGeneration !== submissionGenerationRef.current || !evidenceModeRef.current) return;
+      if (focusGeneration !== evidenceLifecycleRef.current.generation || !evidenceModeRef.current) return;
       const controls = [...(formRef.current?.querySelectorAll("[data-evidence-focus]") || [])]
         .filter((element) => !element.disabled && element.getAttribute("aria-hidden") !== "true");
       const target = controls.find((element) => element.getAttribute("data-evidence-focus") === focusDescriptor)
@@ -774,8 +789,8 @@ export function VendorOnboardingPage({ notify, onOpenAuth, authRevision = 0 }) {
   }
 
   function restoreEvidenceFocus() {
-    const focusDescriptor = evidenceFocusRestoreRef.current;
-    evidenceFocusRestoreRef.current = null;
+    const focusDescriptor = evidenceLifecycleRef.current.focusDescriptor;
+    transitionEvidenceLifecycle({ type: "consume_focus" });
     scheduleEvidenceFocus(focusDescriptor);
   }
 
@@ -786,7 +801,10 @@ export function VendorOnboardingPage({ notify, onOpenAuth, authRevision = 0 }) {
     setCompatibility("checking");
     async function checkCompatibility() {
       try {
-        const compatible = await checkVendorApplicationEvidenceCompatibility({ signal: controller.signal });
+        const compatible = await checkVendorApplicationEvidenceCompatibility({
+          signal: controller.signal,
+          versionKey: loadedVendorIdRef.current,
+        });
         if (!controller.signal.aborted) setCompatibility(compatible ? "ready" : "upgrade");
       } catch (error) {
         if (error?.name !== "AbortError" && !controller.signal.aborted) setCompatibility("error");
@@ -801,14 +819,16 @@ export function VendorOnboardingPage({ notify, onOpenAuth, authRevision = 0 }) {
     const revalidateFocusedAccount = () => {
       captureEvidenceFocus();
       evidenceReadSequenceRef.current += 1;
-      submissionGenerationRef.current += 1;
       const mutationInFlight = Boolean(activeMutationRef.current);
-      submissionLockRef.current = mutationInFlight;
+      const lifecycle = transitionEvidenceLifecycle({
+        type: "focus_revalidation",
+        mutationInFlight,
+      });
       if (mutationInFlight) {
-        setSubmissionUnconfirmed(true);
+        setSubmissionUnconfirmed(lifecycle.submissionUnconfirmed);
         setSubmitError("We are rechecking this account before confirming the in-flight submission. The unchanged form and secure submission key are preserved for a safe retry.");
       }
-      setLoading(mutationInFlight);
+      setLoading(lifecycle.locked);
       setEvidenceIdentityPending(true);
       setEvidenceAccess("checking");
       setEvidenceAccessRetryKey((value) => value + 1);
@@ -849,13 +869,17 @@ export function VendorOnboardingPage({ notify, onOpenAuth, authRevision = 0 }) {
       return undefined;
     }
     const controller = new AbortController();
-    setEvidenceAccessErrorMessage("");
+    const lifecycle = transitionEvidenceLifecycle({ type: "access_retry" });
+    setEvidenceAccessErrorMessage(lifecycle.accessErrorMessage);
     setEvidenceIdentityPending(true);
     setEvidenceAccess("checking");
     setEvidenceVendorStatus(null);
     async function checkEvidenceAccess() {
       try {
-        const result = await readVendorEvidenceCompletionAccess({ signal: controller.signal });
+        const result = await readVendorEvidenceCompletionAccess({
+          signal: controller.signal,
+          versionKey: loadedVendorIdRef.current || evidenceContextRef.current?.vendorId,
+        });
         if (!controller.signal.aborted && readSequence === evidenceReadSequenceRef.current) {
           const boundVendorId = loadedVendorIdRef.current || evidenceContextRef.current?.vendorId || null;
           const incomingVendorId = result.context?.vendorId || null;
@@ -872,6 +896,7 @@ export function VendorOnboardingPage({ notify, onOpenAuth, authRevision = 0 }) {
               setEvidenceContext(result.context);
               if (["eligible", "revision"].includes(result.state)) {
                 setForm((current) => ({ ...current, ...prefillVendorEvidence(result.context) }));
+                transitionEvidenceLifecycle({ type: "draft_loaded" });
                 formInitializedRef.current = true;
                 loadedVendorIdRef.current = result.context.vendorId;
               }
@@ -898,7 +923,7 @@ export function VendorOnboardingPage({ notify, onOpenAuth, authRevision = 0 }) {
             setSubmitError("");
             setEvidenceIdentityPending(false);
             if (["eligible", "revision"].includes(result.state)) restoreEvidenceFocus();
-            else evidenceFocusRestoreRef.current = null;
+            else transitionEvidenceLifecycle({ type: "consume_focus" });
             return;
           }
           setEvidenceAccess(result.state);
@@ -907,10 +932,12 @@ export function VendorOnboardingPage({ notify, onOpenAuth, authRevision = 0 }) {
           setEvidenceContext(result.context);
           if (refreshDecision.shouldResetForm) {
             setForm((current) => ({ ...current, ...prefillVendorEvidence(result.context) }));
+            transitionEvidenceLifecycle({ type: "draft_loaded" });
             formInitializedRef.current = true;
             dirtyRef.current = false;
             submissionKeyRef.current = null;
-            setSubmissionUnconfirmed(false);
+            const lifecycle = transitionEvidenceLifecycle({ type: "submission_confirmed" });
+            setSubmissionUnconfirmed(lifecycle.submissionUnconfirmed);
             setEvidenceConflict(null);
             setErrors({});
             setSubmitError("");
@@ -918,13 +945,17 @@ export function VendorOnboardingPage({ notify, onOpenAuth, authRevision = 0 }) {
           if (result.context?.vendorId) loadedVendorIdRef.current = result.context.vendorId;
           setEvidenceIdentityPending(false);
           if (["eligible", "revision"].includes(result.state)) restoreEvidenceFocus();
-          else evidenceFocusRestoreRef.current = null;
+          else transitionEvidenceLifecycle({ type: "consume_focus" });
         }
       } catch (error) {
         if (error?.name !== "AbortError" && !controller.signal.aborted && readSequence === evidenceReadSequenceRef.current) {
           setEvidenceAccess("error");
           setEvidenceIdentityPending(false);
-          evidenceFocusRestoreRef.current = null;
+          transitionEvidenceLifecycle({ type: "consume_focus" });
+          if (evidenceLifecycleRef.current.explicitDiscard) {
+            const lifecycle = transitionEvidenceLifecycle({ type: "discard_load_failed" });
+            setEvidenceAccessErrorMessage(lifecycle.accessErrorMessage);
+          }
         }
       }
     }
@@ -933,10 +964,11 @@ export function VendorOnboardingPage({ notify, onOpenAuth, authRevision = 0 }) {
   }, [authRevision, compatibility, evidenceAccessRetryKey, evidenceOnly]);
 
   function markFormChanged() {
-    if (submissionLockRef.current) return false;
+    if (evidenceLifecycleRef.current.locked) return false;
+    const lifecycle = transitionEvidenceLifecycle({ type: "form_changed" });
     dirtyRef.current = true;
     submissionKeyRef.current = null;
-    setSubmissionUnconfirmed(false);
+    setSubmissionUnconfirmed(lifecycle.submissionUnconfirmed);
     return true;
   }
 
@@ -978,14 +1010,15 @@ export function VendorOnboardingPage({ notify, onOpenAuth, authRevision = 0 }) {
 
   async function reloadLatestEvidence() {
     const readSequence = ++evidenceReadSequenceRef.current;
+    const versionKey = loadedVendorIdRef.current || evidenceContextRef.current?.vendorId;
     // Discard is an immediate user decision, not a side effect of a later read.
     // Clear first so focus/auth revalidation cannot cancel the discard intent.
-    clearPrivateEvidenceDraft();
+    clearPrivateEvidenceDraft({ explicitDiscard: true });
     setEvidenceIdentityPending(true);
     setEvidenceAccess("checking");
     setLoading(true);
     try {
-      const result = await readVendorEvidenceCompletionAccess();
+      const result = await readVendorEvidenceCompletionAccess({ versionKey });
       if (readSequence !== evidenceReadSequenceRef.current) return;
       const reloadPlan = vendorEvidenceExplicitReloadPlan(result);
       setEvidenceAccess(result.state);
@@ -997,6 +1030,7 @@ export function VendorOnboardingPage({ notify, onOpenAuth, authRevision = 0 }) {
       if (reloadPlan.shouldPrefill && result.context) {
         loadedVendorIdRef.current = reloadPlan.vendorId;
         setForm((current) => ({ ...current, ...prefillVendorEvidence(result.context) }));
+        transitionEvidenceLifecycle({ type: "draft_loaded" });
         formInitializedRef.current = true;
       }
       setEvidenceIdentityPending(false);
@@ -1005,7 +1039,8 @@ export function VendorOnboardingPage({ notify, onOpenAuth, authRevision = 0 }) {
       if (readSequence === evidenceReadSequenceRef.current) {
         setEvidenceAccess("error");
         setEvidenceIdentityPending(false);
-        setEvidenceAccessErrorMessage("The latest evidence request could not be loaded. The entries you discarded remain cleared; retry the account check to load the current record.");
+        const lifecycle = transitionEvidenceLifecycle({ type: "discard_load_failed" });
+        setEvidenceAccessErrorMessage(lifecycle.accessErrorMessage);
       }
     } finally {
       if (readSequence === evidenceReadSequenceRef.current) setLoading(false);
@@ -1014,9 +1049,9 @@ export function VendorOnboardingPage({ notify, onOpenAuth, authRevision = 0 }) {
 
   async function submit(event) {
     event.preventDefault();
-    if (submissionLockRef.current) return;
-    const submissionGeneration = submissionGenerationRef.current;
-    const submissionIsCurrent = () => submissionGenerationRef.current === submissionGeneration;
+    if (evidenceLifecycleRef.current.locked) return;
+    const submissionGeneration = evidenceLifecycleRef.current.generation;
+    const submissionIsCurrent = () => evidenceLifecycleRef.current.generation === submissionGeneration;
     const retryingUnconfirmedSubmission = submissionUnconfirmed;
     if (compatibility !== "ready") {
       setSubmitError(compatibility === "upgrade"
@@ -1064,8 +1099,8 @@ export function VendorOnboardingPage({ notify, onOpenAuth, authRevision = 0 }) {
       return;
     }
     if (evidenceOnly) captureEvidenceFocus();
-    submissionLockRef.current = true;
-    setLoading(true); setSubmitError(""); setErrors({});
+    const submissionLifecycle = transitionEvidenceLifecycle({ type: "begin_submission" });
+    setLoading(submissionLifecycle.locked); setSubmitError(""); setErrors({});
     let submissionStarted = false;
     let compatibilityConfirmed = false;
     let mutationToken = null;
@@ -1080,6 +1115,7 @@ export function VendorOnboardingPage({ notify, onOpenAuth, authRevision = 0 }) {
         setEvidenceContext(accessResult.context);
         if (["eligible", "revision"].includes(accessResult.state)) {
           setForm((current) => ({ ...current, ...prefillVendorEvidence(accessResult.context) }));
+          transitionEvidenceLifecycle({ type: "draft_loaded" });
           formInitializedRef.current = true;
           loadedVendorIdRef.current = accessResult.context.vendorId;
         }
@@ -1090,12 +1126,13 @@ export function VendorOnboardingPage({ notify, onOpenAuth, authRevision = 0 }) {
     const verifyPostDispatchEvidenceIdentity = async () => {
       let latest = null;
       try {
-        latest = await readVendorEvidenceCompletionAccess();
+        latest = await readVendorEvidenceCompletionAccess({ versionKey: expectedContext?.vendorId });
       } catch {
         if (submissionIsCurrent()) {
+          const lifecycle = transitionEvidenceLifecycle({ type: "mutation_unconfirmed" });
           setEvidenceAccess("error");
           setEvidenceIdentityPending(false);
-          setSubmissionUnconfirmed(true);
+          setSubmissionUnconfirmed(lifecycle.submissionUnconfirmed);
           setSubmitError("We could not verify the current account after this submission attempt. Your unchanged entries and secure submission key remain hidden for a safe retry.");
         }
         return null;
@@ -1111,7 +1148,7 @@ export function VendorOnboardingPage({ notify, onOpenAuth, authRevision = 0 }) {
       return latest;
     };
     try {
-      const compatible = await checkVendorApplicationEvidenceCompatibility();
+      const compatible = await checkVendorApplicationEvidenceCompatibility({ versionKey: expectedContext?.vendorId });
       if (!submissionIsCurrent()) return;
       if (!compatible) {
         setCompatibility("upgrade");
@@ -1123,7 +1160,7 @@ export function VendorOnboardingPage({ notify, onOpenAuth, authRevision = 0 }) {
       compatibilityConfirmed = true;
       setCompatibility("ready");
       if (shouldPreflightVendorEvidenceSubmission({ evidenceOnly, submissionUnconfirmed: retryingUnconfirmedSubmission })) {
-        const accessResult = await readVendorEvidenceCompletionAccess();
+        const accessResult = await readVendorEvidenceCompletionAccess({ versionKey: expectedContext?.vendorId });
         if (!submissionIsCurrent()) return;
         if (!vendorEvidencePreflightIdentityMatches(expectedContext, accessResult)) {
           clearForDifferentEvidenceIdentity(accessResult);
@@ -1147,8 +1184,9 @@ export function VendorOnboardingPage({ notify, onOpenAuth, authRevision = 0 }) {
       submissionStarted = true;
       mutationToken = {};
       activeMutationRef.current = mutationToken;
+      transitionEvidenceLifecycle({ type: "mutation_started" });
       if (evidenceOnly) setEvidenceIdentityPending(true);
-      const response = await fetch(evidenceOnly ? "/api/v1/vendors/onboarding/evidence" : "/api/v1/vendors/onboarding", { method: evidenceOnly ? "PUT" : "POST", headers: { "Content-Type": "application/json", "Idempotency-Key": submissionKey, ...(evidenceOnly ? VENDOR_APPLICATION_EVIDENCE_HEADERS : {}) }, credentials: "include", body: JSON.stringify(payload) });
+      const response = await fetch(evidenceOnly ? "/api/v1/vendors/onboarding/evidence" : "/api/v1/vendors/onboarding", { method: evidenceOnly ? "PUT" : "POST", headers: { "Content-Type": "application/json", "Idempotency-Key": submissionKey, ...(evidenceOnly ? { ...VENDOR_APPLICATION_EVIDENCE_HEADERS, ...workerVersionAffinityHeaders(expectedContext?.vendorId) } : {}) }, credentials: "include", body: JSON.stringify(payload) });
       if (!submissionIsCurrent()) return;
       if (evidenceOnly) {
         postDispatchAccess = await verifyPostDispatchEvidenceIdentity();
@@ -1186,7 +1224,8 @@ export function VendorOnboardingPage({ notify, onOpenAuth, authRevision = 0 }) {
           setEvidenceAccess("error");
           setEvidenceIdentityPending(false);
           if (retryingUnconfirmedSubmission) {
-            setSubmissionUnconfirmed(true);
+            const lifecycle = transitionEvidenceLifecycle({ type: "mutation_unconfirmed" });
+            setSubmissionUnconfirmed(lifecycle.submissionUnconfirmed);
             setSubmitError("We still could not verify the account for the earlier submission. Your unchanged form and secure submission key remain hidden for another safe retry.");
           } else {
             setSubmitError("Application eligibility could not be confirmed. Your entries remain hidden in this tab and nothing was submitted.");
@@ -1196,31 +1235,37 @@ export function VendorOnboardingPage({ notify, onOpenAuth, authRevision = 0 }) {
         }
       } else if (requestError.code === "SIGN_IN") setSubmitError(requestError.message);
       else if (evidenceOnly && requestError.code === "client_upgrade_required") {
+        const lifecycle = transitionEvidenceLifecycle({ type: "submission_confirmed" });
         setCompatibility("upgrade");
-        setSubmissionUnconfirmed(false);
+        setSubmissionUnconfirmed(lifecycle.submissionUnconfirmed);
         setSubmitError(requestError.message);
       }
       else if (evidenceOnly && vendorEvidenceConflictState(requestError)) {
+        const lifecycle = transitionEvidenceLifecycle({ type: "submission_confirmed" });
         setEvidenceConflict({ kind: vendorEvidenceConflictState(requestError), latest: postDispatchAccess });
-        setSubmissionUnconfirmed(false);
+        setSubmissionUnconfirmed(lifecycle.submissionUnconfirmed);
         setSubmitError("The application changed while you were submitting. Your edits are preserved; load the latest application version before trying again.");
         scheduleEvidenceFocus("load-latest");
       } else if (evidenceOnly && Object.keys(vendorEvidenceServerFieldErrors(requestError.details)).length) {
         const serverErrors = vendorEvidenceServerFieldErrors(requestError.details);
+        const lifecycle = transitionEvidenceLifecycle({ type: "submission_confirmed" });
         setErrors(serverErrors);
-        setSubmissionUnconfirmed(false);
+        setSubmissionUnconfirmed(lifecycle.submissionUnconfirmed);
         setSubmitError("Review the highlighted evidence fields. Your entries remain in this form.");
         window.requestAnimationFrame(() => formRef.current?.querySelector('[aria-invalid="true"]')?.focus());
       } else if (requestError.code === "CONFIRMATION_MISSING") {
-        setSubmissionUnconfirmed(true);
+        const lifecycle = transitionEvidenceLifecycle({ type: "mutation_unconfirmed" });
+        setSubmissionUnconfirmed(lifecycle.submissionUnconfirmed);
         setSubmitError("The service accepted this request, but the saved revision could not be confirmed. Keep this form unchanged and check your application status before retrying.");
         restoreEvidenceFocus();
       } else if (isServiceUnavailable(requestError)) {
-        setSubmissionUnconfirmed(true);
+        const lifecycle = transitionEvidenceLifecycle({ type: "mutation_unconfirmed" });
+        setSubmissionUnconfirmed(lifecycle.submissionUnconfirmed);
         setSubmitError("We could not confirm whether the service saved this request. Keep the form unchanged; retrying will reuse the same secure submission key, or check your application status first.");
         restoreEvidenceFocus();
       } else {
-        setSubmissionUnconfirmed(false);
+        const lifecycle = transitionEvidenceLifecycle({ type: "submission_confirmed" });
+        setSubmissionUnconfirmed(lifecycle.submissionUnconfirmed);
         setSubmitError(requestError.message || "The application could not be submitted. Please review the fields and try again.");
         if (evidenceOnly) restoreEvidenceFocus();
       }
@@ -1228,7 +1273,7 @@ export function VendorOnboardingPage({ notify, onOpenAuth, authRevision = 0 }) {
       const mutationSettled = Boolean(mutationToken) && activeMutationRef.current === mutationToken;
       if (mutationSettled) {
         activeMutationRef.current = null;
-        submissionLockRef.current = false;
+        transitionEvidenceLifecycle({ type: "mutation_settled" });
       }
       if (!submissionIsCurrent() && evidenceOnly && mutationSettled) {
         setLoading(false);
@@ -1237,7 +1282,7 @@ export function VendorOnboardingPage({ notify, onOpenAuth, authRevision = 0 }) {
         setEvidenceAccessRetryKey((value) => value + 1);
       }
       if (submissionIsCurrent()) {
-        submissionLockRef.current = false;
+        transitionEvidenceLifecycle({ type: "release_submission" });
         setLoading(false);
       }
     }

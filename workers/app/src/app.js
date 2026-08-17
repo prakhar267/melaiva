@@ -2131,7 +2131,7 @@ function buildApp() {
       c.header("Access-Control-Allow-Methods", "GET, HEAD, POST, PUT, PATCH, DELETE, OPTIONS");
       c.header(
         "Access-Control-Allow-Headers",
-        `Content-Type, X-Requested-With, X-Turnstile-Token, Idempotency-Key, ${VENDOR_APPLICATION_EVIDENCE_HEADER}, X-Melaiva-Admin-Vendor-Summary`,
+        `Content-Type, X-Requested-With, X-Turnstile-Token, Idempotency-Key, Cloudflare-Workers-Version-Key, ${VENDOR_APPLICATION_EVIDENCE_HEADER}, X-Melaiva-Admin-Vendor-Summary`,
       );
       c.header("Access-Control-Max-Age", "86400");
       return c.body(null, 204);
@@ -3629,9 +3629,6 @@ function buildApp() {
     if (user.role === "admin") {
       throw new ApiError(403, "role_not_allowed", "Administrator accounts cannot submit vendor evidence");
     }
-    if (c.req.header(VENDOR_APPLICATION_EVIDENCE_HEADER) !== String(VENDOR_APPLICATION_EVIDENCE_REVISION)) {
-      throw new ApiError(426, "client_upgrade_required", "Refresh Melaiva before submitting vendor evidence");
-    }
     const requestKey = idempotencyKey(c, { required: true });
     const input = await parseJson(c, vendorEvidenceCompletionSchema);
     const normalizedEvidence = {
@@ -3652,6 +3649,9 @@ function buildApp() {
     const requestHash = await canonicalRequestHash(normalizedRequest);
     const replay = await findIdempotentResult(db, scope, requestKey, user.id, requestHash);
     if (replay) return c.json({ data: replay.value, meta: { replayed: true } }, replay.status);
+    if (c.req.header(VENDOR_APPLICATION_EVIDENCE_HEADER) !== String(VENDOR_APPLICATION_EVIDENCE_REVISION)) {
+      throw new ApiError(426, "client_upgrade_required", "Refresh Melaiva before submitting vendor evidence");
+    }
     if (!(await hasVendorEvidenceSchema(db))) {
       throw new ApiError(
         503,

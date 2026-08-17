@@ -2,9 +2,16 @@ name: Deploy production
 
 on:
   workflow_dispatch:
+    inputs:
+      minimum_staging_soak_minutes:
+        description: Minimum age of the exact-SHA staging deployment
+        required: true
+        default: "15"
 
 permissions:
-  contents: read
+  actions: read
+  checks: read
+  contents: write
 
 concurrency:
   group: production
@@ -13,7 +20,7 @@ concurrency:
 jobs:
   deploy:
     runs-on: ubuntu-latest
-    timeout-minutes: 20
+    timeout-minutes: 25
     environment: production
     env:
       RELEASE_SHA: ${{ github.sha }}
@@ -27,11 +34,31 @@ jobs:
             package-lock.json
             workers/app/package-lock.json
 
-      - name: Require the protected main branch
-        run: test "$GITHUB_REF" = "refs/heads/main"
+      - name: Require protected main and successful exact-SHA CI
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          test "${GITHUB_REF}" = "refs/heads/main"
+          check_runs="$(gh api -H "Accept: application/vnd.github+json" \
+            "/repos/${GITHUB_REPOSITORY}/commits/${RELEASE_SHA}/check-runs?per_page=100")"
+          for required_check in validate deploy-staging CodeQL "Analyze (actions)" "Analyze (javascript-typescript)"; do
+            jq -e --arg name "${required_check}" '
+              [.check_runs[] | select(.name == $name)] |
+              sort_by(.started_at) | last | .conclusion == "success"
+            ' <<< "${check_runs}" >/dev/null
+          done
+
+      - name: Install web dependencies
+        run: npm ci
 
       - name: Build web app
-        run: npm ci && npm run build
+        run: npm run build
+
+      - name: Test web and release checks
+        run: |
+          npm run test:sites
+          node --check scripts/readiness-smoke.mjs
+          node --check scripts/production-smoke.mjs
 
       - name: Install API dependencies
         working-directory: workers/app
@@ -49,20 +76,122 @@ jobs:
         working-directory: workers/app
         run: npx wrangler deploy --env="" --dry-run --outdir dist/dry-run
 
-      - name: Deploy Cloudflare Worker
+      - name: Require exact-SHA staging provenance and soak
         working-directory: workers/app
         env:
           CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
           CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+          MINIMUM_STAGING_SOAK_MINUTES: ${{ inputs.minimum_staging_soak_minutes }}
+        run: |
+          [[ "${MINIMUM_STAGING_SOAK_MINUTES}" =~ ^(0|[1-9][0-9]*)$ ]]
+          deployments_json="$(npx wrangler deployments list --env staging --json)"
+          active_deployment="$(jq -cer 'sort_by(.created_on) | last' <<< "${deployments_json}")"
+          active_version_id="$(jq -er '
+            [.versions[] | select(.percentage == 100)] as $active |
+            if ($active | length) == 1 then $active[0].version_id
+            else error("expected exactly one 100% staging Worker version")
+            end
+          ' <<< "${active_deployment}")"
+          versions_json="$(npx wrangler versions list --env staging --json)"
+          tagged_count="$(jq -er --arg sha "${RELEASE_SHA}" --arg active "${active_version_id}" '
+            [.[] | select(.id == $active and .annotations["workers/tag"] == $sha)] | length
+          ' <<< "${versions_json}")"
+          test "${tagged_count}" = "1"
+          created_on="$(jq -er '.created_on' <<< "${active_deployment}")"
+          created_epoch="$(date -u -d "${created_on}" +%s)"
+          current_epoch="$(date -u +%s)"
+          minimum_seconds="$((10#${MINIMUM_STAGING_SOAK_MINUTES} * 60))"
+          test "$((current_epoch - created_epoch))" -ge "${minimum_seconds}"
+
+      - name: Verify exact staging readiness
+        env:
+          MELAIVA_SMOKE_BASE_URL: https://melaiva-staging.prakhargupta267.workers.dev
+          MELAIVA_SMOKE_EXPECTED_EVIDENCE_REVISION: "5"
+        run: node scripts/readiness-smoke.mjs
+
+      - name: Capture current production version
+        id: current
+        working-directory: workers/app
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+        run: |
+          deployments_json="$(npx wrangler deployments list --env="" --json)"
+          old_version_id="$(jq -er '
+            (sort_by(.created_on) | last | [.versions[] | select(.percentage == 100)]) as $active |
+            if ($active | length) == 1 then $active[0].version_id
+            else error("expected exactly one 100% production Worker version")
+            end
+          ' <<< "${deployments_json}")"
+          echo "old_version_id=${old_version_id}" >> "${GITHUB_OUTPUT}"
+          old_release_sha="$(git ls-remote origin refs/tags/production | awk '{print $1}')"
+          [[ "${old_release_sha}" =~ ^[0-9a-f]{40}$ ]]
+          echo "old_release_sha=${old_release_sha}" >> "${GITHUB_OUTPUT}"
+
+      - name: Upload immutable production candidate
+        id: candidate
+        working-directory: workers/app
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+        run: |
+          npx wrangler versions upload --env="" --strict \
+            --tag "${RELEASE_SHA}" \
+            --message "git=${RELEASE_SHA} run=${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}"
+          versions_json="$(npx wrangler versions list --env="" --json)"
+          new_version_id="$(jq -er --arg sha "${RELEASE_SHA}" '
+            [.[] | select(.annotations["workers/tag"] == $sha)] |
+            sort_by(.metadata.created_on) | last | .id
+          ' <<< "${versions_json}")"
+          test -n "${new_version_id}"
+          echo "new_version_id=${new_version_id}" >> "${GITHUB_OUTPUT}"
+
+      - name: Add candidate at zero percent
+        working-directory: workers/app
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+          OLD_VERSION_ID: ${{ steps.current.outputs.old_version_id }}
+          NEW_VERSION_ID: ${{ steps.candidate.outputs.new_version_id }}
         run: >-
-          npx wrangler deploy --env="" --strict
-          --tag "${RELEASE_SHA}"
-          --message "git=${RELEASE_SHA} run=${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}"
+          npx wrangler versions deploy --env="" --yes
+          "${OLD_VERSION_ID}@100" "${NEW_VERSION_ID}@0"
+          --message "pre-cutover git=${RELEASE_SHA} run=${GITHUB_RUN_ID}"
+
+      - name: Smoke exact candidate with a version override
+        env:
+          MELAIVA_SMOKE_BASE_URL: https://melaiva.prakhargupta267.workers.dev
+          MELAIVA_SMOKE_EXPECTED_EVIDENCE_REVISION: "5"
+          MELAIVA_SMOKE_WORKER_NAME: melaiva
+          MELAIVA_SMOKE_WORKER_VERSION_OVERRIDE: ${{ steps.candidate.outputs.new_version_id }}
+        run: |
+          for attempt in {1..10}; do
+            if node scripts/readiness-smoke.mjs; then exit 0; fi
+            if [[ "${attempt}" -eq 10 ]]; then exit 1; fi
+            sleep "$((attempt < 5 ? attempt : 5))"
+          done
+
+      - name: Cut over production atomically
+        working-directory: workers/app
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+          NEW_VERSION_ID: ${{ steps.candidate.outputs.new_version_id }}
+        run: >-
+          npx wrangler versions deploy --env="" --yes
+          "${NEW_VERSION_ID}@100"
+          --message "production git=${RELEASE_SHA} run=${GITHUB_RUN_ID}"
 
       - name: Verify deployed readiness
         env:
           MELAIVA_SMOKE_BASE_URL: https://melaiva.prakhargupta267.workers.dev
-        run: node scripts/readiness-smoke.mjs
+          MELAIVA_SMOKE_EXPECTED_EVIDENCE_REVISION: "5"
+        run: |
+          for attempt in {1..10}; do
+            if node scripts/readiness-smoke.mjs; then exit 0; fi
+            if [[ "${attempt}" -eq 10 ]]; then exit 1; fi
+            sleep "$((attempt < 5 ? attempt : 5))"
+          done
 
       - name: Assert and record production provenance
         id: provenance
@@ -78,6 +207,7 @@ jobs:
             else error("expected exactly one active Worker version")
             end
           ' <<< "${deployments_json}")"
+          test "${active_version_id}" = "${{ steps.candidate.outputs.new_version_id }}"
           versions_json="$(npx wrangler versions list --env="" --json)"
           active_release_count="$(jq -er --arg sha "${RELEASE_SHA}" --arg active "${active_version_id}" '
             [.[] | select(.id == $active and .annotations["workers/tag"] == $sha)] | length
@@ -89,4 +219,25 @@ jobs:
             echo "- Git SHA: \`${RELEASE_SHA}\`"
             echo "- Worker version: \`${active_version_id}\`"
             echo "- Worker: https://melaiva.prakhargupta267.workers.dev"
-          } >> "$GITHUB_STEP_SUMMARY"
+          } >> "${GITHUB_STEP_SUMMARY}"
+
+      - name: Advance deployed-production source tag
+        run: |
+          git tag --force production "${RELEASE_SHA}"
+          git push --force origin refs/tags/production
+          test "$(git ls-remote origin refs/tags/production | awk '{print $1}')" = "${RELEASE_SHA}"
+
+      - name: Roll back after a failed candidate or cutover check
+        if: failure() && steps.current.outputs.old_version_id != ''
+        working-directory: workers/app
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+          OLD_VERSION_ID: ${{ steps.current.outputs.old_version_id }}
+          OLD_RELEASE_SHA: ${{ steps.current.outputs.old_release_sha }}
+        run: |
+          npx wrangler versions deploy --env="" --yes \
+            "${OLD_VERSION_ID}@100" \
+            --message "automatic rollback after failed git=${RELEASE_SHA} run=${GITHUB_RUN_ID}"
+          git tag --force production "${OLD_RELEASE_SHA}"
+          git push --force origin refs/tags/production

@@ -78,6 +78,8 @@ Verification, marketplace operations, support, disputes, finance, moderation, an
 
 Current MVP boundary: after an award, the request owner and winning approved vendor can exchange private, text-only coordination messages beside the immutable accepted scope. Participant-private unread badges update from durable server cursors and clear only after the exact latest rendered message reaches the reader's viewport; the counterparty never sees a read receipt. An open, visible conversation still checks incrementally for new records and provides a manual refresh fallback. Existing history remains readable if partner approval changes, but new messages pause for both parties. Messages do not represent a contract, signature, invoice, booking confirmation, or payment; attachments, notifications, signatures, and payment-provider workflows remain future work.
 
+Current operator boundary: authorized administrators can review submitted vendor applications in a private oldest-first queue, inspect the exact submitted business/contact/service information, and record approve, reject, suspend, restore, or reopen decisions through scoped state transitions. Every decision requires an internal rationale, is protected against duplicate retries and stale concurrent reviews, and appears in immutable internal history. Marketplace approval does not claim government identity verification, KYC, legal certification, or guaranteed performance; staff MFA/Access and the actual evidence-review procedure remain launch gates.
+
 ### Vendor workspace
 
 - Registration, verification, organization/team, categories, locations, capacity, documents, portfolio, packages, price floors, availability, and lead preferences.
@@ -93,7 +95,8 @@ Current MVP boundary: after an award, the request owner and winning approved ven
 - Request: `draft → submitted → reviewed → matched → live → closed → awarded | expired | cancelled`
 - Offer: `draft → submitted → revised → shortlisted → accepted | rejected | withdrawn | expired`
 - Booking: `contract_pending → deposit_due → confirmed → active → completion_pending → completed | disputed | cancelled | refunded`
-- Vendor: `draft → submitted → needs_information → verified | rejected | suspended`
+- Vendor (current MVP): `pending → approved | rejected`, `approved ↔ suspended`, and `rejected → pending`
+- Vendor (target workflow): `draft → submitted → needs_information → verified | rejected | suspended`
 
 ## Metrics
 

@@ -14,7 +14,7 @@ const email = `release-${crypto.randomUUID()}@melaiva.invalid`;
 const password = `SmokeA1!${crypto.randomUUID()}`;
 const passwordVerifier = await derivePasswordVerifier(email, password);
 
-async function request(path, { method = "GET", cookie, body, headers = {} } = {}) {
+async function request(path, { method = "GET", cookie, body, headers = {}, expectedStatus } = {}) {
   const response = await fetch(`${baseUrl}${path}`, {
     method,
     headers: {
@@ -28,7 +28,7 @@ async function request(path, { method = "GET", cookie, body, headers = {} } = {}
     signal: AbortSignal.timeout(35_000),
   });
   const payload = response.status === 204 ? null : await response.json().catch(() => null);
-  if (!response.ok) {
+  if (expectedStatus === undefined ? !response.ok : response.status !== expectedStatus) {
     throw new Error(`${method} ${path} failed (${response.status}): ${payload?.error?.code || "unexpected_response"}`);
   }
   return { response, payload };
@@ -48,6 +48,10 @@ async function runSmoke() {
     if (!cookie) throw new Error("Registration did not issue a session cookie.");
 
     const identity = await request("/api/v1/auth/me", { cookie });
+    const forbiddenAdmin = await request("/api/v1/admin/vendors", { cookie, expectedStatus: 403 });
+    if (forbiddenAdmin.payload?.error?.code !== "role_not_allowed") {
+      throw new Error("A non-admin account did not receive the expected role boundary.");
+    }
     const auction = await request("/api/v1/auctions", {
       method: "POST",
       cookie,
@@ -112,6 +116,7 @@ async function runSmoke() {
     return {
       health: health.payload?.data?.status,
       role: identity.payload?.data?.user?.role,
+      adminBoundary: "non-admin-forbidden",
       requestLifecycle: "created-listed-closed-replayed-cancelled",
       closedOfferCount: closed.payload.data.bidCount,
       closeReplayUnchanged: closedReplay.payload.meta.unchanged,

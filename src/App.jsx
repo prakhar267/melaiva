@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useRef, useState } from "react";
+import { Component, lazy, Suspense, useCallback, useEffect, useRef, useState } from "react";
 import { BrowserRouter, Route, Routes } from "react-router-dom";
 import { AppShell } from "./components/Shell.jsx";
 import { HomePage } from "./pages/HomePage.jsx";
@@ -8,6 +8,42 @@ import { RequestPage } from "./pages/RequestPage.jsx";
 import { DashboardPage } from "./pages/DashboardPage.jsx";
 import { VendorOnboardingPage, VendorPage } from "./pages/VendorPage.jsx";
 import { AuthPage, LegalPage, NotFoundPage } from "./pages/MiscPages.jsx";
+
+const AdminVendorsPage = lazy(() => import("./pages/AdminVendorsPage.jsx")
+  .then((module) => ({ default: module.AdminVendorsPage })));
+
+function AdminRouteFallback() {
+  return <div className="admin-page page-surface"><div className="shell admin-route-loading" role="status">Loading secure operations…</div></div>;
+}
+
+class AdminRouteErrorBoundary extends Component {
+  constructor(props) {
+    super(props);
+    this.state = { failed: false };
+  }
+
+  static getDerivedStateFromError() {
+    return { failed: true };
+  }
+
+  render() {
+    if (!this.state.failed) return this.props.children;
+    return (
+      <div className="admin-page page-surface">
+        <div className="shell admin-access-state">
+          <section className="admin-access-card">
+            <div className="eyebrow">Staff workspace</div>
+            <h1>Operations could not be loaded</h1>
+            <p>The secure workspace asset may have changed during a release. Reload to request the current version.</p>
+            <div className="admin-access-card__actions">
+              <button className="button button--primary" type="button" onClick={() => window.location.reload()}>Reload operations</button>
+            </div>
+          </section>
+        </div>
+      </div>
+    );
+  }
+}
 
 function MelaivaApp() {
   const [toast, setToast] = useState(null);
@@ -40,6 +76,7 @@ function MelaivaApp() {
         <Route path="/dashboard" element={<DashboardPage notify={notify} onOpenAuth={() => setOpenAuth(true)} authRevision={authRevision} />} />
         <Route path="/vendor" element={<VendorPage notify={notify} onOpenAuth={() => setOpenAuth(true)} authRevision={authRevision} />} />
         <Route path="/vendor/onboarding" element={<VendorOnboardingPage notify={notify} onOpenAuth={() => setOpenAuth(true)} />} />
+        <Route path="/admin/vendors" element={<AdminRouteErrorBoundary key={authRevision}><Suspense fallback={<AdminRouteFallback />}><AdminVendorsPage notify={notify} onOpenAuth={() => setOpenAuth(true)} authRevision={authRevision} /></Suspense></AdminRouteErrorBoundary>} />
         <Route path="/auth" element={<AuthPage notify={notify} onAuthenticated={() => setAuthRevision((value) => value + 1)} />} />
         <Route path="/privacy" element={<LegalPage type="privacy" />} />
         <Route path="/terms" element={<LegalPage type="terms" />} />

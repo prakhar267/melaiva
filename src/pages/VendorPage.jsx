@@ -36,6 +36,7 @@ import { isServiceUnavailable, readApiResponse } from "../api.js";
 import { BookingMessages } from "../components/BookingMessages.jsx";
 import { formatUnreadMessageCount, targetScrollLeftForControl } from "../components/bookingMessages.js";
 import { useBookingInbox } from "../components/useBookingInbox.js";
+import { parsePublicWebsiteUrl } from "../security/publicWebsiteUrl.js";
 
 function categoryLabel(value) {
   return categories.find((category) => category.id === value)?.name || value?.replaceAll("_", " ") || "Service";
@@ -534,10 +535,9 @@ export function VendorOnboardingPage({ notify, onOpenAuth }) {
     if (Number(form.minBudget) < 1000) next.minBudget = "Enter a typical starting amount.";
     if (Number(form.maxBudget) < Number(form.minBudget)) next.maxBudget = "Maximum must be at least the minimum.";
     if (form.websiteUrl) {
-      try {
-        const protocol = new URL(form.websiteUrl).protocol;
-        if (!['http:', 'https:'].includes(protocol)) next.websiteUrl = "Use a complete http:// or https:// address.";
-      } catch { next.websiteUrl = "Use a complete website address."; }
+      if (!parsePublicWebsiteUrl(form.websiteUrl)) {
+        next.websiteUrl = "Use a public https:// website address; local and private destinations are not allowed.";
+      }
     }
     if (Object.keys(next).length) { setErrors(next); return; }
     setLoading(true); setSubmitError("");

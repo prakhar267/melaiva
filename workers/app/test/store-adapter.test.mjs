@@ -13,6 +13,8 @@ import {
   STORE_SCHEMA_V6_FINALIZE_SQL,
   STORE_SCHEMA_V6_MIGRATION_SQL,
   STORE_SCHEMA_V7_MIGRATION_SQL,
+  STORE_SCHEMA_V8_FINALIZE_SQL,
+  STORE_SCHEMA_V8_MIGRATION_SQL,
   STORE_SCHEMA_VERSION,
   createDurableDatabase,
   executeSql,
@@ -908,6 +910,154 @@ test("schema v7 baselines participant-local cursors at the exact thread head and
   );
 });
 
+test("schema v8 preserves reviewed vendors, resumes safely, and makes audit facts immutable", () => {
+  const sqlite = new DatabaseSync(":memory:");
+  sqlite.exec(`CREATE TABLE _sql_schema_migrations (
+    id INTEGER PRIMARY KEY,
+    applied_at TEXT NOT NULL DEFAULT (datetime('now'))
+  )`);
+  sqlite.exec(STORE_SCHEMA_V1_SQL);
+  sqlite.exec(STORE_SCHEMA_V2_MIGRATION_SQL);
+  sqlite.exec(STORE_SCHEMA_V3_MIGRATION_SQL);
+  sqlite.exec(STORE_SCHEMA_V4_MIGRATION_SQL);
+  sqlite.exec(STORE_SCHEMA_V5_MIGRATION_SQL);
+  sqlite.exec(STORE_SCHEMA_V6_MIGRATION_SQL);
+  sqlite.exec(STORE_SCHEMA_V7_MIGRATION_SQL);
+  sqlite.exec(`
+    INSERT INTO users
+      (id, name, email, password_hash, password_salt, password_iterations, role, status)
+    VALUES
+      ('review-admin', 'Review Admin', 'review-admin@example.com', 'hash', 'salt', 100000, 'admin', 'active'),
+      ('review-owner', 'Review Owner', 'review-owner@example.com', 'hash', 'salt', 100000, 'couple', 'active');
+    INSERT INTO vendors
+      (id, user_id, slug, business_name, legal_name, status, category, categories_json, city,
+       service_areas_json, description, min_budget, max_budget, currency, verified)
+    VALUES
+      ('review-vendor', 'review-owner', 'review-vendor', 'Review Vendor', 'Review Vendor Private Limited',
+       'suspended', 'photography', '["photography"]', 'Jaipur', '["Jaipur"]',
+       'A complete legacy reviewed vendor record that must survive the additive schema migration.',
+       100000, 500000, 'INR', 0);
+    INSERT INTO audit_events (actor_user_id, action, entity_type, entity_id, metadata_json, created_at)
+    VALUES
+      ('review-admin', 'vendor.reviewed', 'vendor', 'review-vendor',
+       '{"from":"pending","to":"approved","note":"Legacy approval rationale retained."}',
+       '2027-01-01T00:00:00.000Z'),
+      ('review-admin', 'vendor.reviewed', 'vendor', 'review-vendor',
+       '{"from":"approved","to":"suspended","note":"Legacy suspension rationale retained."}',
+       '2027-02-01T00:00:00.000Z');
+  `);
+
+  sqlite.exec(STORE_SCHEMA_V8_MIGRATION_SQL);
+
+  assert.equal(sqlite.prepare("SELECT MAX(id) AS version FROM _sql_schema_migrations").get().version, 8);
+  assert.deepEqual(
+    { ...sqlite.prepare("SELECT status, verified, review_revision FROM vendors WHERE id = 'review-vendor'").get() },
+    { status: "suspended", verified: 0, review_revision: 2 },
+  );
+  sqlite
+    .prepare("UPDATE vendors SET status = 'approved', verified = 1, updated_at = CURRENT_TIMESTAMP WHERE id = 'review-vendor'")
+    .run();
+  assert.equal(
+    sqlite.prepare("SELECT review_revision FROM vendors WHERE id = 'review-vendor'").get().review_revision,
+    3,
+  );
+  sqlite
+    .prepare(
+      `INSERT INTO audit_events (actor_user_id, action, entity_type, entity_id, metadata_json)
+       VALUES ('review-admin', 'vendor.reviewed', 'vendor', 'review-vendor',
+               '{"from":"suspended","to":"approved","note":"Old writer restoration remains compatible."}')`,
+    )
+    .run();
+  const firstAuditId = sqlite.prepare("SELECT MIN(id) AS id FROM audit_events").get().id;
+  assert.throws(
+    () => sqlite.prepare("UPDATE audit_events SET metadata_json = '{}' WHERE id = ?").run(firstAuditId),
+    /audit events are immutable/,
+  );
+  assert.throws(
+    () => sqlite.prepare("DELETE FROM audit_events WHERE id = ?").run(firstAuditId),
+    /audit events are immutable/,
+  );
+  sqlite.prepare("UPDATE audit_events SET actor_user_id = NULL WHERE id = ?").run(firstAuditId);
+  assert.throws(
+    () => sqlite.prepare("UPDATE audit_events SET actor_user_id = 'review-admin' WHERE id = ?").run(firstAuditId),
+    /actors can only be anonymized/,
+  );
+
+  sqlite.exec(STORE_SCHEMA_V8_FINALIZE_SQL);
+  assert.equal(sqlite.prepare("SELECT review_revision FROM vendors WHERE id = 'review-vendor'").get().review_revision, 3);
+  assert.equal(sqlite.prepare("SELECT COUNT(*) AS count FROM audit_events").get().count, 3);
+});
+
+test("schema v8 initialization resumes when the review revision column already exists", async () => {
+  const sqlite = new DatabaseSync(":memory:");
+  sqlite.exec(`CREATE TABLE _sql_schema_migrations (
+    id INTEGER PRIMARY KEY,
+    applied_at TEXT NOT NULL DEFAULT (datetime('now'))
+  )`);
+  sqlite.exec(STORE_SCHEMA_V1_SQL);
+  sqlite.exec(STORE_SCHEMA_V2_MIGRATION_SQL);
+  sqlite.exec(STORE_SCHEMA_V3_MIGRATION_SQL);
+  sqlite.exec(STORE_SCHEMA_V4_MIGRATION_SQL);
+  sqlite.exec(STORE_SCHEMA_V5_MIGRATION_SQL);
+  sqlite.exec(STORE_SCHEMA_V6_MIGRATION_SQL);
+  sqlite.exec(STORE_SCHEMA_V7_MIGRATION_SQL);
+  sqlite.exec(
+    `ALTER TABLE vendors ADD COLUMN review_revision INTEGER NOT NULL DEFAULT 0
+       CHECK (typeof(review_revision) = 'integer' AND review_revision >= 0)`,
+  );
+  const sql = {
+    exec(statement, ...args) {
+      const normalized = statement.trim().toUpperCase();
+      if (args.length > 0 || normalized.startsWith("SELECT") || normalized.startsWith("PRAGMA")) {
+        const rows = sqlite.prepare(statement).all(...args);
+        return { toArray: () => rows };
+      }
+      sqlite.exec(statement);
+      return { toArray: () => [] };
+    },
+  };
+  let initialized;
+  const ctx = {
+    storage: {
+      sql,
+      async getAlarm() { return 1; },
+      async setAlarm() {},
+    },
+    blockConcurrencyWhile(callback) {
+      initialized = callback();
+    },
+  };
+
+  new MelaivaStore(ctx, { ENVIRONMENT: "production" });
+  await initialized;
+
+  assert.equal(sqlite.prepare("SELECT MAX(id) AS version FROM _sql_schema_migrations").get().version, STORE_SCHEMA_VERSION);
+  assert.equal(
+    sqlite.prepare("SELECT COUNT(*) AS count FROM pragma_table_info('vendors') WHERE name = 'review_revision'").get().count,
+    1,
+  );
+  assert.deepEqual(
+    sqlite
+      .prepare(
+        `SELECT name FROM sqlite_master
+         WHERE type = 'trigger' AND name IN (
+           'vendors_review_revision_update',
+           'audit_events_identity_immutable_update',
+           'audit_events_actor_retention_update',
+           'audit_events_immutable_delete'
+         ) ORDER BY name`,
+      )
+      .all()
+      .map((row) => row.name),
+    [
+      "audit_events_actor_retention_update",
+      "audit_events_identity_immutable_update",
+      "audit_events_immutable_delete",
+      "vendors_review_revision_update",
+    ],
+  );
+});
+
 test("schema v7 initialization resumes partial cursor rows without resetting or failing on empty threads", async () => {
   const sqlite = createV3AwardDatabase();
   const populated = seedAcceptedAward(sqlite, "partial-read-state");
@@ -968,7 +1118,7 @@ test("schema v7 initialization resumes partial cursor rows without resetting or 
   new MelaivaStore(ctx, { ENVIRONMENT: "production" });
   await initialized;
 
-  assert.equal(sqlite.prepare("SELECT MAX(id) AS version FROM _sql_schema_migrations").get().version, 7);
+  assert.equal(sqlite.prepare("SELECT MAX(id) AS version FROM _sql_schema_migrations").get().version, STORE_SCHEMA_VERSION);
   assert.deepEqual(
     sqlite
       .prepare(

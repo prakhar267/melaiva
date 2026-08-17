@@ -114,7 +114,12 @@ async function onboardVendor(
   env,
   cookie,
   suffix,
-  { category = "photography", city = "Jaipur", serviceAreas = ["Jaipur", "Udaipur"] } = {},
+  {
+    category = "photography",
+    city = "Jaipur",
+    serviceAreas = ["Jaipur", "Udaipur"],
+    websiteUrl = `https://vendor-${suffix.toLowerCase()}.example.com`,
+  } = {},
 ) {
   const response = await requestJson(app, env, "/vendors/onboarding", {
     cookie,
@@ -130,11 +135,30 @@ async function onboardVendor(
       maxBudget: 500000,
       currency: "INR",
       phone: "+919999999999",
-      websiteUrl: `https://vendor-${suffix.toLowerCase()}.example`,
+      websiteUrl,
     },
   });
   assert.equal(response.status, 201, await response.clone().text());
   return (await response.json()).data;
+}
+
+let vendorReviewSequence = 0;
+function reviewVendor(
+  app,
+  env,
+  adminCookie,
+  vendorId,
+  status,
+  note = "Integration review decision recorded for test coverage.",
+  { expectedStatus = "pending", expectedRevision = 0 } = {},
+) {
+  vendorReviewSequence += 1;
+  return requestJson(app, env, `/admin/vendors/${vendorId}`, {
+    method: "PATCH",
+    cookie: adminCookie,
+    headers: { "idempotency-key": `vendor-review-test-${vendorReviewSequence}` },
+    body: { status, expectedStatus, expectedRevision, note },
+  });
 }
 
 function normalizedOfferTerms(overrides = {}) {
@@ -189,11 +213,7 @@ test("marketplace authorization and state transitions remain private, atomic, an
   assert.equal(pendingBrowse.status, 403);
 
   for (const profile of [profileOne, profileTwo, mismatchProfile]) {
-    const approval = await requestJson(app, env, `/admin/vendors/${profile.id}`, {
-      method: "PATCH",
-      cookie: admin.cookie,
-      body: { status: "approved", note: "Integration-test approval" },
-    });
+    const approval = await reviewVendor(app, env, admin.cookie, profile.id, "approved", "Integration-test approval completed.");
     assert.equal(approval.status, 200, await approval.clone().text());
   }
 
@@ -930,11 +950,7 @@ test("single-category creation preserves legacy replays and blocks ambiguous leg
   const admin = await register(app, env, { name: "Category Admin", email: "category-admin@example.com", verifier: "M".repeat(43) });
   db.sqlite.prepare("UPDATE users SET role = 'admin' WHERE id = ?").run(admin.user.id);
   const profile = await onboardVendor(app, env, vendor.cookie, "Category");
-  const approval = await requestJson(app, env, `/admin/vendors/${profile.id}`, {
-    method: "PATCH",
-    cookie: admin.cookie,
-    body: { status: "approved", note: "Category contract test" },
-  });
+  const approval = await reviewVendor(app, env, admin.cookie, profile.id, "approved", "Category contract review completed.");
   assert.equal(approval.status, 200, await approval.clone().text());
 
   const eventDate = new Date(Date.now() + 365 * 24 * 60 * 60 * 1000).toISOString().slice(0, 10);
@@ -1086,11 +1102,7 @@ test("vendor capability preserves the customer workspace and enforces linked sel
   const pendingFeed = await requestJson(app, env, "/auctions", { cookie: dual.cookie });
   assert.equal(pendingFeed.status, 403);
 
-  const approval = await requestJson(app, env, `/admin/vendors/${profile.id}`, {
-    method: "PATCH",
-    cookie: admin.cookie,
-    body: { status: "approved", note: "Dual capability test" },
-  });
+  const approval = await reviewVendor(app, env, admin.cookie, profile.id, "approved", "Dual capability review completed.");
   assert.equal(approval.status, 200, await approval.clone().text());
   const otherCreated = await requestJson(app, env, "/auctions", {
     cookie: otherCouple.cookie,
@@ -1169,11 +1181,7 @@ test("preferred-vendor validation and moderation changes are atomic against sele
     serviceAreas: ["Bengaluru"],
   });
   for (const profile of [invitedProfile, mismatchedProfile]) {
-    const approval = await requestJson(app, env, `/admin/vendors/${profile.id}`, {
-      method: "PATCH",
-      cookie: admin.cookie,
-      body: { status: "approved" },
-    });
+    const approval = await reviewVendor(app, env, admin.cookie, profile.id, "approved");
     assert.equal(approval.status, 200, await approval.clone().text());
   }
 
@@ -1279,11 +1287,15 @@ test("preferred-vendor validation and moderation changes are atomic against sele
   });
   assert.equal(closed.status, 200, await closed.clone().text());
 
-  const suspended = await requestJson(app, env, `/admin/vendors/${invitedProfile.id}`, {
-    method: "PATCH",
-    cookie: admin.cookie,
-    body: { status: "suspended", note: "Adversarial moderation race" },
-  });
+  const suspended = await reviewVendor(
+    app,
+    env,
+    admin.cookie,
+    invitedProfile.id,
+    "suspended",
+    "Adversarial moderation race review.",
+    { expectedStatus: "approved", expectedRevision: 1 },
+  );
   assert.equal(suspended.status, 200, await suspended.clone().text());
   assert.equal(db.sqlite.prepare("SELECT status FROM bids WHERE id = ?").get(bidId).status, "withdrawn");
   assert.equal(
@@ -1323,4 +1335,410 @@ test("preferred-vendor validation and moderation changes are atomic against sele
     db.sqlite.prepare("SELECT COUNT(*) AS count FROM audit_events WHERE action = 'auction.created'").get().count,
     2,
   );
+});
+
+test("admin vendor verification is private, paginated, reasoned, replay-safe, and reversible only through scoped transitions", async () => {
+  const db = new SqliteD1(STORE_SCHEMA_SQL);
+  const env = {
+    DB: db,
+    SESSION_SECRET,
+    PASSWORD_PEPPER: "admin-verification-password-pepper-with-at-least-thirty-two-characters",
+    ENVIRONMENT: "production",
+    COOKIE_SECURE: "true",
+  };
+  const app = buildApp();
+  const couple = await register(app, env, { name: "Queue Couple", email: "queue-couple@example.com", verifier: "N".repeat(43) });
+  const owner = await register(app, env, { name: "Queue Vendor Owner", email: "queue-owner@example.com", verifier: "O".repeat(43) });
+  const admin = await register(app, env, { name: "Queue Admin", email: "queue-admin@example.com", verifier: "P".repeat(43) });
+  const otherAdmin = await register(app, env, { name: "Other Queue Admin", email: "queue-admin-two@example.com", verifier: "Q".repeat(43) });
+  const unsafeWebsiteOwner = await register(app, env, { name: "Unsafe Website Owner", email: "unsafe-website@example.com", verifier: "R".repeat(43) });
+  db.sqlite.prepare("UPDATE users SET role = 'admin' WHERE id IN (?, ?)").run(admin.user.id, otherAdmin.user.id);
+  const profile = await onboardVendor(app, env, owner.cookie, "Queue");
+
+  const unsafeWebsiteBody = {
+    businessName: "Unsafe Website Vendor",
+    legalName: "Unsafe Website Vendor Private Limited",
+    category: "photography",
+    categories: ["photography"],
+    city: "Jaipur",
+    serviceAreas: ["Jaipur"],
+    description: "A sufficiently detailed vendor profile used to verify that operator-facing evidence links cannot target privileged local services.",
+    minBudget: 100000,
+    maxBudget: 500000,
+    currency: "INR",
+    phone: "+919999999999",
+  };
+  for (const websiteUrl of [
+    "https://127.0.0.1/private",
+    "https://[::1]/private",
+    "http://vendor.example.com",
+    "https://operator:secret@vendor.example.com",
+  ]) {
+    const unsafeWebsite = await requestJson(app, env, "/vendors/onboarding", {
+      cookie: unsafeWebsiteOwner.cookie,
+      body: { ...unsafeWebsiteBody, websiteUrl },
+    });
+    assert.equal(unsafeWebsite.status, 422, websiteUrl);
+  }
+
+  const anonymousQueue = await requestJson(app, env, "/admin/vendors");
+  assert.equal(anonymousQueue.status, 401);
+  const coupleQueue = await requestJson(app, env, "/admin/vendors", { cookie: couple.cookie });
+  assert.equal(coupleQueue.status, 403);
+  const ownerQueue = await requestJson(app, env, "/admin/vendors", { cookie: owner.cookie });
+  assert.equal(ownerQueue.status, 403);
+  const invalidQueue = await requestJson(app, env, "/admin/vendors?status=unknown", { cookie: admin.cookie });
+  assert.equal(invalidQueue.status, 422);
+
+  const pendingQueue = await requestJson(app, env, "/admin/vendors?status=pending&limit=50", { cookie: admin.cookie });
+  assert.equal(pendingQueue.status, 200, await pendingQueue.clone().text());
+  const pendingPayload = await pendingQueue.json();
+  assert.equal(pendingPayload.data.length, 1);
+  assert.equal(pendingPayload.data[0].id, profile.id);
+  assert.equal(pendingPayload.data[0].owner.email, "queue-owner@example.com");
+  assert.equal(pendingPayload.data[0].reviewRevision, 0);
+  assert.deepEqual(pendingPayload.meta.statusCounts, { pending: 1, approved: 0, rejected: 0, suspended: 0 });
+  assert.equal(pendingPayload.meta.total, 1);
+  assert.equal(pendingPayload.meta.nextCursor, null);
+
+  const privateHistory = await requestJson(app, env, `/admin/vendors/${profile.id}/reviews`, { cookie: couple.cookie });
+  assert.equal(privateHistory.status, 403);
+  const emptyHistory = await requestJson(app, env, `/admin/vendors/${profile.id}/reviews`, { cookie: admin.cookie });
+  assert.equal(emptyHistory.status, 200);
+  assert.deepEqual((await emptyHistory.json()).data, []);
+
+  const catalogBefore = await requestJson(app, env, "/catalog/vendors?search=Vendor%20Queue");
+  assert.equal(catalogBefore.status, 200);
+  assert.deepEqual((await catalogBefore.json()).data, []);
+
+  const noKey = await requestJson(app, env, `/admin/vendors/${profile.id}`, {
+    method: "PATCH",
+    cookie: admin.cookie,
+    body: { status: "approved", reason: "External portfolio and business evidence reviewed." },
+  });
+  assert.equal(noKey.status, 400);
+  assert.equal((await noKey.json()).error.code, "idempotency_key_required");
+  const noPreconditions = await requestJson(app, env, `/admin/vendors/${profile.id}`, {
+    method: "PATCH",
+    cookie: admin.cookie,
+    headers: { "idempotency-key": "queue-no-preconditions-0001" },
+    body: { status: "approved", reason: "External portfolio and business evidence reviewed." },
+  });
+  assert.equal(noPreconditions.status, 422);
+  const preconditionFields = (await noPreconditions.json()).error.details.map((detail) => detail.field);
+  assert.ok(preconditionFields.includes("expectedStatus"));
+  assert.ok(preconditionFields.includes("expectedRevision"));
+  const noReason = await requestJson(app, env, `/admin/vendors/${profile.id}`, {
+    method: "PATCH",
+    cookie: admin.cookie,
+    headers: { "idempotency-key": "queue-no-reason-0001" },
+    body: { status: "approved" },
+  });
+  assert.equal(noReason.status, 422);
+  const bidiReason = await requestJson(app, env, `/admin/vendors/${profile.id}`, {
+    method: "PATCH",
+    cookie: admin.cookie,
+    headers: { "idempotency-key": "queue-bidi-reason-0001" },
+    body: { status: "approved", reason: "Reviewed evidence\u202E safely" },
+  });
+  assert.equal(bidiReason.status, 422);
+  const invalidTransition = await requestJson(app, env, `/admin/vendors/${profile.id}`, {
+    method: "PATCH",
+    cookie: admin.cookie,
+    headers: { "idempotency-key": "queue-invalid-transition-0001" },
+    body: { status: "suspended", expectedStatus: "pending", expectedRevision: 0, reason: "Pending applications cannot be suspended." },
+  });
+  assert.equal(invalidTransition.status, 409);
+  assert.equal((await invalidTransition.json()).error.code, "invalid_status_transition");
+
+  const approvalBody = {
+    status: "approved",
+    expectedStatus: "pending",
+    expectedRevision: 0,
+    reason: "Public business details, portfolio quality, and service fit reviewed.",
+  };
+  const approve = () => requestJson(app, env, `/admin/vendors/${profile.id}`, {
+    method: "PATCH",
+    cookie: admin.cookie,
+    headers: { "idempotency-key": "queue-approve-review-0001" },
+    body: approvalBody,
+  });
+  const approved = await approve();
+  assert.equal(approved.status, 200, await approved.clone().text());
+  const approvedPayload = await approved.json();
+  assert.equal(approvedPayload.data.status, "approved");
+  assert.equal(approvedPayload.data.reviewRevision, 1);
+  assert.equal(approvedPayload.data.review.reason, approvalBody.reason);
+  const replayed = await approve();
+  assert.equal(replayed.status, 200, await replayed.clone().text());
+  assert.equal((await replayed.json()).meta.replayed, true);
+  assert.equal(db.sqlite.prepare("SELECT review_revision FROM vendors WHERE id = ?").get(profile.id).review_revision, 1);
+  assert.equal(
+    db.sqlite.prepare("SELECT COUNT(*) AS count FROM audit_events WHERE action = 'vendor.reviewed' AND entity_id = ?").get(profile.id).count,
+    1,
+  );
+  const reviewRateBucket = Math.floor(Math.floor(Date.now() / 1_000) / 3_600) * 3_600;
+  const reviewRateKey = createHash("sha256")
+    .update(`vendor-review:${admin.user.id}:unknown`)
+    .digest("base64url");
+  db.sqlite.prepare(
+    `INSERT INTO rate_limits (key, bucket_start, count, expires_at) VALUES (?, ?, 120, ?)
+     ON CONFLICT(key, bucket_start) DO UPDATE SET count = 120, expires_at = excluded.expires_at`,
+  ).run(reviewRateKey, reviewRateBucket, reviewRateBucket + 7_200);
+  const replayAtLimit = await approve();
+  assert.equal(replayAtLimit.status, 200, await replayAtLimit.clone().text());
+  assert.equal((await replayAtLimit.json()).meta.replayed, true);
+  assert.equal(db.sqlite.prepare("SELECT count FROM rate_limits WHERE key = ? AND bucket_start = ?").get(reviewRateKey, reviewRateBucket).count, 120);
+  const newDecisionAtLimit = await requestJson(app, env, `/admin/vendors/${profile.id}`, {
+    method: "PATCH",
+    cookie: admin.cookie,
+    headers: { "idempotency-key": "queue-rate-limited-new-decision-0001" },
+    body: { ...approvalBody, reason: "A new mutation must remain subject to the operator rate limit." },
+  });
+  assert.equal(newDecisionAtLimit.status, 429);
+  db.sqlite.prepare("DELETE FROM rate_limits WHERE key = ? AND bucket_start = ?").run(reviewRateKey, reviewRateBucket);
+  const keyConflict = await requestJson(app, env, `/admin/vendors/${profile.id}`, {
+    method: "PATCH",
+    cookie: admin.cookie,
+    headers: { "idempotency-key": "queue-approve-review-0001" },
+    body: { ...approvalBody, reason: "A different rationale must not reuse the same decision key." },
+  });
+  assert.equal(keyConflict.status, 409);
+  assert.equal((await keyConflict.json()).error.code, "idempotency_conflict");
+  const staleReject = await requestJson(app, env, `/admin/vendors/${profile.id}`, {
+    method: "PATCH",
+    cookie: otherAdmin.cookie,
+    headers: { "idempotency-key": "queue-stale-reject-0001" },
+    body: { status: "rejected", expectedStatus: "pending", expectedRevision: 0, reason: "This stale decision must not overwrite approval." },
+  });
+  assert.equal(staleReject.status, 409);
+  assert.equal((await staleReject.json()).error.code, "vendor_review_conflict");
+
+  const catalogApproved = await requestJson(app, env, "/catalog/vendors?search=Vendor%20Queue");
+  assert.equal(catalogApproved.status, 200);
+  const catalogApprovedData = (await catalogApproved.json()).data;
+  assert.equal(catalogApprovedData.length, 1);
+  assert.equal(catalogApprovedData[0].verified, true);
+  const approvedQueue = await requestJson(app, env, "/admin/vendors?status=approved", { cookie: admin.cookie });
+  assert.equal((await approvedQueue.json()).data[0].reviewRevision, 1);
+  const approvalHistory = await requestJson(app, env, `/admin/vendors/${profile.id}/reviews`, { cookie: admin.cookie });
+  const approvalHistoryPayload = await approvalHistory.json();
+  assert.equal(approvalHistoryPayload.data.length, 1);
+  assert.deepEqual(Object.keys(approvalHistoryPayload.data[0]).sort(), [
+    "createdAt", "fromStatus", "id", "legacy", "reason", "reviewer", "statusRevision", "toStatus",
+  ]);
+  assert.equal(approvalHistoryPayload.data[0].reviewer.email, "queue-admin@example.com");
+
+  const suspended = await requestJson(app, env, `/admin/vendors/${profile.id}`, {
+    method: "PATCH",
+    cookie: admin.cookie,
+    headers: { "idempotency-key": "queue-suspend-review-0001" },
+    body: { status: "suspended", expectedStatus: "approved", expectedRevision: 1, reason: "Partner access paused after an operational safety review." },
+  });
+  assert.equal(suspended.status, 200, await suspended.clone().text());
+  assert.equal((await suspended.json()).data.reviewRevision, 2);
+  assert.deepEqual((await (await requestJson(app, env, "/catalog/vendors?search=Vendor%20Queue")).json()).data, []);
+  const restored = await requestJson(app, env, `/admin/vendors/${profile.id}`, {
+    method: "PATCH",
+    cookie: admin.cookie,
+    headers: { "idempotency-key": "queue-restore-review-0001" },
+    body: { status: "approved", expectedStatus: "suspended", expectedRevision: 2, reason: "Restriction cleared after the documented safety review." },
+  });
+  assert.equal(restored.status, 200, await restored.clone().text());
+  assert.equal((await restored.json()).data.reviewRevision, 3);
+  const abaStaleSuspension = await requestJson(app, env, `/admin/vendors/${profile.id}`, {
+    method: "PATCH",
+    cookie: otherAdmin.cookie,
+    headers: { "idempotency-key": "queue-aba-stale-suspension-0001" },
+    body: {
+      status: "suspended",
+      expectedStatus: "approved",
+      expectedRevision: 1,
+      reason: "An approval observed before suspend and restore must not survive the ABA cycle.",
+    },
+  });
+  assert.equal(abaStaleSuspension.status, 409);
+  assert.equal((await abaStaleSuspension.json()).error.code, "vendor_review_conflict");
+  const rejectAfterApproval = await requestJson(app, env, `/admin/vendors/${profile.id}`, {
+    method: "PATCH",
+    cookie: admin.cookie,
+    headers: { "idempotency-key": "queue-invalid-reject-0001" },
+    body: { status: "rejected", expectedStatus: "approved", expectedRevision: 3, reason: "Approved partners must be suspended rather than rejected." },
+  });
+  assert.equal(rejectAfterApproval.status, 409);
+
+  const insertHistoricalReview = db.sqlite.prepare(
+    `INSERT INTO audit_events (actor_user_id, action, entity_type, entity_id, metadata_json, created_at)
+     VALUES (?, 'vendor.reviewed', 'vendor', ?, ?, ?)`,
+  );
+  for (let index = 0; index < 98; index += 1) {
+    insertHistoricalReview.run(
+      admin.user.id,
+      profile.id,
+      JSON.stringify({
+        reviewId: `history-review-${String(index).padStart(3, "0")}`,
+        from: index % 2 === 0 ? "approved" : "suspended",
+        to: index % 2 === 0 ? "suspended" : "approved",
+        reason: `Retained historical review record ${index} for bounded history disclosure coverage.`,
+        statusRevision: index + 4,
+      }),
+      `2027-02-01T00:${String(index % 60).padStart(2, "0")}:00.000Z`,
+    );
+  }
+  const truncatedHistory = await requestJson(app, env, `/admin/vendors/${profile.id}/reviews`, { cookie: admin.cookie });
+  const truncatedHistoryPayload = await truncatedHistory.json();
+  assert.equal(truncatedHistoryPayload.data.length, 100);
+  assert.equal(truncatedHistoryPayload.meta.truncated, true);
+
+  const insertPending = db.sqlite.prepare(
+    `INSERT INTO vendors
+     (id, slug, business_name, legal_name, status, category, categories_json, city, service_areas_json,
+      description, min_budget, max_budget, currency, verified, created_at)
+     VALUES (?, ?, ?, ?, 'pending', 'photography', '["photography"]', 'Jaipur', '["Jaipur"]',
+             'A synthetic pagination-only application with enough bounded descriptive content for queue coverage.',
+             100000, 500000, 'INR', 0, '2027-01-01T00:00:00.000Z')`,
+  );
+  for (let index = 0; index < 105; index += 1) {
+    const suffix = String(index).padStart(3, "0");
+    insertPending.run(`page-vendor-${suffix}`, `page-vendor-${suffix}`, `Page Vendor ${suffix}`, `Page Vendor ${suffix} Limited`);
+  }
+  const cursorPage = await requestJson(app, env, "/admin/vendors?status=pending&limit=50", { cookie: admin.cookie });
+  const cursorPagePayload = await cursorPage.json();
+  const moderatedCursorVendor = cursorPagePayload.data.at(-1);
+  assert.equal(moderatedCursorVendor.id, "page-vendor-049");
+  db.sqlite.prepare("UPDATE vendors SET status = 'approved', verified = 1 WHERE id = ?").run(moderatedCursorVendor.id);
+  const pageAfterModeratedCursor = await requestJson(
+    app,
+    env,
+    `/admin/vendors?status=pending&limit=50&cursor=${encodeURIComponent(cursorPagePayload.meta.nextCursor)}`,
+    { cookie: admin.cookie },
+  );
+  assert.equal(pageAfterModeratedCursor.status, 200, await pageAfterModeratedCursor.clone().text());
+  assert.equal((await pageAfterModeratedCursor.json()).data[0].id, "page-vendor-050");
+  db.sqlite.prepare("UPDATE vendors SET status = 'pending', verified = 0 WHERE id = ?").run(moderatedCursorVendor.id);
+  const missingCursor = await requestJson(app, env, "/admin/vendors?status=pending&cursor=missing-vendor", { cookie: admin.cookie });
+  assert.equal(missingCursor.status, 422);
+  const seen = new Set();
+  let cursor = null;
+  let reportedTotal = null;
+  do {
+    const page = await requestJson(
+      app,
+      env,
+      `/admin/vendors?status=pending&limit=50${cursor ? `&cursor=${encodeURIComponent(cursor)}` : ""}`,
+      { cookie: admin.cookie },
+    );
+    assert.equal(page.status, 200, await page.clone().text());
+    const pagePayload = await page.json();
+    reportedTotal = pagePayload.meta.total;
+    for (const vendor of pagePayload.data) {
+      assert.equal(seen.has(vendor.id), false, `duplicate paginated vendor ${vendor.id}`);
+      seen.add(vendor.id);
+    }
+    cursor = pagePayload.meta.nextCursor;
+  } while (cursor);
+  assert.equal(seen.size, 105);
+  assert.equal(reportedTotal, 105);
+
+  db.sqlite.prepare("UPDATE users SET status = 'suspended' WHERE id = ?").run(otherAdmin.user.id);
+  const revokedAdmin = await requestJson(app, env, "/admin/vendors", { cookie: otherAdmin.cookie });
+  assert.equal(revokedAdmin.status, 401);
+});
+
+test("concurrent vendor decisions elect one winner and failed audits roll back every effect", async () => {
+  const db = new SqliteD1(STORE_SCHEMA_SQL);
+  const env = {
+    DB: db,
+    SESSION_SECRET,
+    PASSWORD_PEPPER: "admin-race-password-pepper-with-at-least-thirty-two-characters",
+    ENVIRONMENT: "production",
+    COOKIE_SECURE: "true",
+  };
+  const app = buildApp();
+  const owner = await register(app, env, { name: "Race Vendor Owner", email: "race-owner@example.com", verifier: "R".repeat(43) });
+  const adminOne = await register(app, env, { name: "Race Admin One", email: "race-admin-one@example.com", verifier: "S".repeat(43) });
+  const adminTwo = await register(app, env, { name: "Race Admin Two", email: "race-admin-two@example.com", verifier: "T".repeat(43) });
+  db.sqlite.prepare("UPDATE users SET role = 'admin' WHERE id IN (?, ?)").run(adminOne.user.id, adminTwo.user.id);
+  const profile = await onboardVendor(app, env, owner.cookie, "Race");
+
+  let arrivals = 0;
+  let releaseReads;
+  const readsReleased = new Promise((resolve) => { releaseReads = resolve; });
+  db.beforeFirst = async (sql) => {
+    if (!/SELECT id, status,\s+review_revision AS review_revision\s+FROM vendors WHERE id/u.test(sql)) return;
+    arrivals += 1;
+    if (arrivals === 2) releaseReads();
+    await readsReleased;
+  };
+  const decide = (cookie, key, status, reason) => requestJson(app, env, `/admin/vendors/${profile.id}`, {
+    method: "PATCH",
+    cookie,
+    headers: { "idempotency-key": key },
+    body: { status, expectedStatus: "pending", expectedRevision: 0, reason },
+  });
+  const [first, second] = await Promise.all([
+    decide(adminOne.cookie, "race-admin-decision-0001", "approved", "Approval evidence reviewed by the first operator."),
+    decide(adminTwo.cookie, "race-admin-decision-0002", "rejected", "Rejection evidence reviewed by the second operator."),
+  ]);
+  db.beforeFirst = null;
+  assert.deepEqual([first.status, second.status].sort((a, b) => a - b), [200, 409]);
+  assert.equal(
+    db.sqlite.prepare("SELECT COUNT(*) AS count FROM audit_events WHERE action = 'vendor.reviewed' AND entity_id = ?").get(profile.id).count,
+    1,
+  );
+  assert.equal(db.sqlite.prepare("SELECT review_revision FROM vendors WHERE id = ?").get(profile.id).review_revision, 1);
+  assert.equal(db.sqlite.prepare("SELECT COUNT(*) AS count FROM idempotency_keys WHERE scope = ?").get(`vendor-review:${profile.id}`).count, 1);
+
+  const rollbackOwner = await register(app, env, { name: "Rollback Owner", email: "rollback-owner@example.com", verifier: "U".repeat(43) });
+  const rollbackProfile = await onboardVendor(app, env, rollbackOwner.cookie, "Rollback");
+  db.sqlite.exec(`
+    CREATE TRIGGER fail_vendor_review_audit
+    BEFORE INSERT ON audit_events
+    WHEN NEW.action = 'vendor.reviewed' AND NEW.entity_id = '${rollbackProfile.id}'
+    BEGIN
+      SELECT RAISE(ABORT, 'forced vendor review audit failure');
+    END;
+  `);
+  const failed = await requestJson(app, env, `/admin/vendors/${rollbackProfile.id}`, {
+    method: "PATCH",
+    cookie: adminOne.cookie,
+    headers: { "idempotency-key": "rollback-review-decision-0001" },
+    body: { status: "approved", expectedStatus: "pending", expectedRevision: 0, reason: "This forced failure must roll the complete decision back." },
+  });
+  assert.equal(failed.status, 500);
+  assert.deepEqual(
+    { ...db.sqlite.prepare("SELECT status, verified, review_revision FROM vendors WHERE id = ?").get(rollbackProfile.id) },
+    { status: "pending", verified: 0, review_revision: 0 },
+  );
+  assert.equal(db.sqlite.prepare("SELECT COUNT(*) AS count FROM audit_events WHERE entity_id = ?").get(rollbackProfile.id).count, 0);
+  assert.equal(db.sqlite.prepare("SELECT COUNT(*) AS count FROM idempotency_keys WHERE scope = ?").get(`vendor-review:${rollbackProfile.id}`).count, 0);
+  db.sqlite.exec("DROP TRIGGER fail_vendor_review_audit");
+  const retried = await requestJson(app, env, `/admin/vendors/${rollbackProfile.id}`, {
+    method: "PATCH",
+    cookie: adminOne.cookie,
+    headers: { "idempotency-key": "rollback-review-decision-0001" },
+    body: { status: "approved", expectedStatus: "pending", expectedRevision: 0, reason: "This forced failure must roll the complete decision back." },
+  });
+  assert.equal(retried.status, 200, await retried.clone().text());
+
+  const revokedOwner = await register(app, env, { name: "Revoked Boundary Owner", email: "revoked-owner@example.com", verifier: "V".repeat(43) });
+  const revokedProfile = await onboardVendor(app, env, revokedOwner.cookie, "RevokedBoundary");
+  db.beforeFirst = async (sql, args) => {
+    if (!/FROM vendors WHERE id = \? LIMIT 1/u.test(sql) || args[0] !== revokedProfile.id) return;
+    db.beforeFirst = null;
+    db.sqlite.prepare("UPDATE users SET status = 'suspended' WHERE id = ?").run(adminTwo.user.id);
+  };
+  const revokedAtWrite = await requestJson(app, env, `/admin/vendors/${revokedProfile.id}`, {
+    method: "PATCH",
+    cookie: adminTwo.cookie,
+    headers: { "idempotency-key": "revoked-admin-decision-0001" },
+    body: { status: "approved", expectedStatus: "pending", expectedRevision: 0, reason: "A revoked operator must lose the write race safely." },
+  });
+  assert.equal(revokedAtWrite.status, 409);
+  assert.equal((await revokedAtWrite.json()).error.code, "vendor_review_conflict");
+  assert.deepEqual(
+    { ...db.sqlite.prepare("SELECT status, verified, review_revision FROM vendors WHERE id = ?").get(revokedProfile.id) },
+    { status: "pending", verified: 0, review_revision: 0 },
+  );
+  assert.equal(db.sqlite.prepare("SELECT COUNT(*) AS count FROM audit_events WHERE entity_id = ?").get(revokedProfile.id).count, 0);
 });

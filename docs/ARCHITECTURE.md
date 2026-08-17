@@ -29,6 +29,7 @@ This shape is intentional for the free launch tier: it preserves relational cons
 - Each booking conversation has a stable, contiguous `stream_position`; message records cannot be deleted or renumbered, so the indexed latest position is also the exact message count without a per-poll table scan. Existing history pages backward with `cursor`; lightweight refresh pages forward with the mutually exclusive `after` cursor, and each response returns the authoritative poll cursor, message count, and current send permissions. Message timestamps remain display metadata and are never used as a synchronization watermark. A guarded schema-v5 rolling-deploy fallback keeps raw SQLite rowids private as cursor watermarks, exposes their per-booking insertion rank as `sequence`, and v6 backfills that same order so cursors and client merges remain stable through a deployment.
 - Message writes require idempotency, validate bounded plain text, atomically allocate the next per-booking stream position, recheck current participant and vendor approval state, and record only the message and booking identifiers—not message bodies—in audit metadata. During rolling deploys or rollback, schema v6 also assigns a position inside SQLite when an older Worker omits the new column.
 - Schema v7 keeps one private, monotonic exact-message cursor per booking participant. Existing threads baseline at the current stream head; an additive booking trigger creates empty participant cursors for awards written by v6 during a rollout or rollback. Unread totals range over the indexed stream and count only messages sent by someone other than the current participant. A participant can acknowledge only a message in their own thread, stale acknowledgements cannot move backward, administrators have no cursor, and no API exposes the counterparty's state. A paged summary endpoint returns only booking IDs, audience roles, indexed message counts, and optional local unread counts for inexpensive background refresh.
+- Schema v8 adds a monotonic vendor-review revision maintained by SQLite whenever any Worker version changes a vendor status. Operator decisions require a bounded rationale and idempotency key, follow a fixed transition graph, compare the expected status/revision, recheck the active admin role inside the conditional write, and append the decision audit in the same transaction. Audit facts cannot be changed or deleted; only an actor reference may be nulled during legitimate user anonymization. Older Workers remain compatible because the database trigger advances the revision even when their update statement does not know the new column.
 - Auction creation and bid acceptance require/replay an `Idempotency-Key` result.
 - A preferred vendor is attached only when the vendor remains approved and matches the brief's category and city at the atomic create boundary. Other matched vendors cannot see that preference.
 - Suspending or rejecting a vendor withdraws open proposals and makes unanswered direct invitations unavailable; award selection rechecks current vendor approval.
@@ -45,7 +46,7 @@ This shape is intentional for the free launch tier: it preserves relational cons
 - Requests: private structured briefs, optional explicit preferred-partner invitations, and date-bounded auctions.
 - Offers: vendor bids and customer shortlist/reject/accept decisions.
 - Awards: immutable accepted-scope handoffs plus private text coordination for the couple and winning vendor; attachments, contracts, signatures, invoices, notifications, and payments are deliberately out of scope.
-- Partners: vendor onboarding and manual approval state.
+- Partners: vendor onboarding plus a private, paginated operator queue for reasoned approval, rejection, suspension, restoration, and immutable review history. Marketplace approval is an operating decision, not KYC or a performance guarantee.
 - Reliability: rate limits, quotas, idempotency, fail-closed health checks, cleanup alarm, request IDs, safe telemetry.
 
 ## API boundaries
@@ -55,7 +56,7 @@ This shape is intentional for the free launch tier: it preserves relational cons
 - `/api/v1/vendors` and `/api/v1/vendors/onboarding`
 - `/api/v1/auctions`, `/api/v1/auctions/:id/status`, `/api/v1/auctions/:id/bids`, `/api/v1/auctions/:id/award`, `/api/v1/bookings`, `/api/v1/bookings/message-summary`, `/api/v1/bookings/:id/messages`, and `/api/v1/bookings/:id/messages/read`
 - `/api/v1/ai/plan`
-- `/api/v1/admin/*`
+- `/api/v1/admin/vendors`, `/api/v1/admin/vendors/:id`, and `/api/v1/admin/vendors/:id/reviews`
 
 JSON errors use a stable error code, human-safe message, and request ID. Mutations validate content type, body size, origin posture, authentication, authorization, schema, lengths, state transition, and rate limits.
 
@@ -102,5 +103,5 @@ Use an external synthetic monitor for `/health` because a Worker cannot reliably
 - CI gates frozen installs, frontend build, SPA fallback tests, syntax checks, SQLite integration/security tests, and a Wrangler bundle dry run. The protected default branch also requires CodeQL security analysis.
 - Production deployment remains a manual authenticated Wrangler release until least-privilege Cloudflare credentials are installed in the protected GitHub environment; the checked-in workflow cannot deploy without them.
 - Staging targets the separate `melaiva-staging` Worker and Durable Object namespace with production-strength runtime posture but AI, demo data, and Turnstile disabled until their integrations are ready.
-- `wrangler deploy` provisions the Durable Object class via Cloudflare migration `v1`; the class then applies its resumable internal SQLite schema migrations through schema version 7.
+- `wrangler deploy` provisions the Durable Object class via Cloudflare migration `v1`; the class then applies its resumable internal SQLite schema migrations through schema version 8.
 - Free-plan limits are capacity limits, not an enterprise SLA. A custom domain, production support, transactional email, payments, legal/KYC, and model usage need explicit operating budgets and vendor contracts.

@@ -1,6 +1,7 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 
+import { createIdempotencyKey } from "../src/api.js";
 import {
   marketplaceEmptyStateCopy,
   marketplaceRequestHref,
@@ -20,6 +21,24 @@ import {
   validateRequestDraft,
   writePendingRequestSubmission,
 } from "../src/components/requestSubmission.js";
+
+test("idempotency keys use cryptographic entropy and fail closed without it", () => {
+  let requestedBytes = 0;
+  const key = createIdempotencyKey("request", {
+    getRandomValues(bytes) {
+      requestedBytes = bytes.length;
+      bytes.fill(0xab);
+      return bytes;
+    },
+  });
+
+  assert.equal(requestedBytes, 16);
+  assert.equal(key, `request-${"ab".repeat(16)}`);
+  assert.throws(
+    () => createIdempotencyKey("request", {}),
+    /secure random generation is unavailable/i,
+  );
+});
 
 test("eligible partner counts fail closed when the response is absent or malformed", () => {
   for (const value of [null, undefined, "", -1, 1.5, Number.NaN, Number.POSITIVE_INFINITY, "not-a-count"]) {

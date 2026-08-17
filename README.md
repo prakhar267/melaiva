@@ -9,6 +9,7 @@ The launch build is a single Cloudflare Worker: it serves the React application,
 ## What is implemented
 
 - Responsive customer marketplace and vendor discovery
+- A versioned, expiring planner-to-request handoff that carries only validated user-entered celebration facts into an editable brief; generated plan prose and the overall celebration budget stay out of service-specific requests
 - Four-step, single-service private request builder with sealed offer workflow and explicit preferred-partner invitations
 - Customer dashboard backed by the signed-in user's requests, with a private sealed state and an explicit close-and-reveal decision
 - Vendor onboarding, opportunity feed, and normalized offer submission covering inclusions, exclusions, GST, travel, priced add-ons, delivery, cancellation, and validity

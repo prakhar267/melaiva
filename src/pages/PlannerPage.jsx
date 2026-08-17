@@ -1,5 +1,5 @@
 import { useState } from "react";
-import { Link } from "react-router-dom";
+import { useNavigate } from "react-router-dom";
 import {
   AlertTriangle,
   ArrowRight,
@@ -18,6 +18,7 @@ import {
 } from "lucide-react";
 import { cities, formatCurrency } from "../data.js";
 import { readApiResponse } from "../api.js";
+import { createPlannerRequestHandoff, PLANNER_HANDOFF_STATE_KEY } from "../components/plannerHandoff.js";
 
 const ceremonies = ["Engagement", "Haldi", "Mehendi", "Sangeet", "Wedding", "Reception"];
 const priorities = ["Guest experience", "Food", "Design & decor", "Photography", "Entertainment", "Low-waste choices"];
@@ -92,10 +93,12 @@ function PlannerForm({ onSubmit, loading }) {
     constraints: "",
   });
   const [errors, setErrors] = useState({});
+  const [handoffError, setHandoffError] = useState("");
 
   function update(key, value) {
     setForm((current) => ({ ...current, [key]: value }));
     setErrors((current) => ({ ...current, [key]: "" }));
+    setHandoffError("");
   }
 
   function toggle(key, value) {
@@ -109,12 +112,21 @@ function PlannerForm({ onSubmit, loading }) {
     event.preventDefault();
     const nextErrors = {};
     if (!form.eventDate) nextErrors.eventDate = "Choose an approximate date.";
+    else if (form.eventDate <= futureDateValue(0)) nextErrors.eventDate = "Choose a future celebration date.";
     if (!form.city) nextErrors.city = "Choose a celebration city.";
-    if (!form.guestCount || Number(form.guestCount) < 20) nextErrors.guestCount = "Enter at least 20 guests.";
+    if (!/^\d+$/.test(form.guestCount.trim()) || !Number.isInteger(Number(form.guestCount))) nextErrors.guestCount = "Enter guests as a whole number.";
+    else if (Number(form.guestCount) < 20) nextErrors.guestCount = "Enter at least 20 guests.";
+    else if (Number(form.guestCount) > 5000) nextErrors.guestCount = "Keep the estimate to 5,000 guests or fewer.";
     if (!form.budget || Number(form.budget) < 100000) nextErrors.budget = "Enter a realistic working budget.";
     if (!form.ceremonies.length) nextErrors.ceremonies = "Choose at least one event.";
     if (Object.keys(nextErrors).length) return setErrors(nextErrors);
-    onSubmit(form);
+    const requestHandoff = createPlannerRequestHandoff(form);
+    if (!requestHandoff) {
+      setHandoffError("Review the planning details before creating the blueprint.");
+      return;
+    }
+    setHandoffError("");
+    onSubmit(form, requestHandoff);
   }
 
   return (
@@ -154,13 +166,14 @@ function PlannerForm({ onSubmit, loading }) {
       </fieldset>
       <label className="field">
         <span>Anything we should work around? <small>Optional</small></span>
-        <textarea value={form.constraints} onChange={(event) => update("constraints", event.target.value)} rows="3" placeholder="Accessibility needs, travel constraints, venue already booked…" />
+        <textarea value={form.constraints} onChange={(event) => update("constraints", event.target.value)} maxLength={1000} rows="3" placeholder="Accessibility needs, travel constraints, venue already booked…" />
       </label>
       <button className="button button--primary button--wide button--large" type="submit" disabled={loading}>
         {loading ? <span className="button-loader" /> : <WandSparkles size={18} />}
         {loading ? "Building your first plan…" : "Create my planning blueprint"}
       </button>
-      <p className="planner-form__privacy"><Sparkles size={14} /> Your details are used only to build this plan.</p>
+      {handoffError && <p className="form-error" role="alert">{handoffError}</p>}
+      <p className="planner-form__privacy"><Sparkles size={14} /> Used to build this plan. If you continue, planning details prefill a request you can review before publishing.</p>
     </form>
   );
 }
@@ -169,7 +182,7 @@ function PlanLoading() {
   return <div className="plan-loading" aria-live="polite"><span className="plan-loading__orb"><Sparkles /></span><h2>Turning the details into decisions</h2><p>Balancing timing, budget and the moments you want to protect.</p><div className="plan-loading__bars"><span /><span /><span /></div></div>;
 }
 
-function PlanResult({ plan, onReset, notify }) {
+function PlanResult({ plan, onReset, onStartRequest, notify }) {
   const maxAmount = Math.max(...plan.budget.map((item) => Number(item.amount || 0)), 1);
   return (
     <div className="plan-result">
@@ -201,18 +214,21 @@ function PlanResult({ plan, onReset, notify }) {
         <div className="plan-advice"><div><Lightbulb size={18} /><h3>Smart moves</h3></div><ul>{plan.recommendations.map((item) => <li key={item}><Check size={15} />{item}</li>)}</ul></div>
         <div className="plan-advice plan-advice--risk"><div><AlertTriangle size={18} /><h3>Watch early</h3></div><ul>{plan.risks.map((item) => <li key={item}><span />{item}</li>)}</ul></div>
       </section>
-      <div className="plan-result__cta"><div><ClipboardCheck size={22} /><p><strong>Ready to turn the plan into real offers?</strong><span>We’ll translate it into a vendor-ready brief.</span></p></div><Link className="button button--primary" to="/request">Start a request <ArrowRight size={17} /></Link></div>
+      <div className="plan-result__cta"><div><ClipboardCheck size={22} /><p><strong>Ready to turn the plan into real offers?</strong><span>We’ll carry your planning details into a reviewable vendor brief.</span></p></div><button className="button button--primary" type="button" onClick={onStartRequest}>Start a request <ArrowRight size={17} /></button></div>
     </div>
   );
 }
 
 export function PlannerPage({ notify }) {
+  const navigate = useNavigate();
   const [loading, setLoading] = useState(false);
   const [plan, setPlan] = useState(null);
+  const [requestHandoff, setRequestHandoff] = useState(null);
   const [error, setError] = useState("");
 
-  async function generate(form) {
+  async function generate(form, requestHandoffForForm) {
     setLoading(true); setError(""); setPlan(null);
+    setRequestHandoff(requestHandoffForForm);
     const payload = {
       eventDate: form.eventDate,
       city: form.city,
@@ -249,7 +265,7 @@ export function PlannerPage({ notify }) {
       <section className="shell planner-layout">
         <div className="planner-form-card"><PlannerForm onSubmit={generate} loading={loading} />{error && <p className="form-error" role="alert">{error}</p>}</div>
         <aside className="planner-output" aria-live="polite">
-          {loading ? <PlanLoading /> : plan ? <PlanResult plan={plan} onReset={() => setPlan(null)} notify={notify} /> : (
+          {loading ? <PlanLoading /> : plan ? <PlanResult plan={plan} onReset={() => { setPlan(null); setRequestHandoff(null); }} onStartRequest={() => navigate("/request", { state: requestHandoff ? { [PLANNER_HANDOFF_STATE_KEY]: requestHandoff } : undefined })} notify={notify} /> : (
             <div className="planner-empty"><span><WandSparkles size={28} /></span><h2>Your blueprint will appear here</h2><p>You’ll get a sensible budget shape, a sequence of decisions and a few risks worth handling early.</p><ul><li><Check size={15} /> City-aware planning assumptions</li><li><Check size={15} /> Clear budget categories</li><li><Check size={15} /> No pressure to book</li></ul></div>
           )}
         </aside>

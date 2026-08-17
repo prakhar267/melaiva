@@ -1,4 +1,4 @@
-const STORE_SCHEMA_VERSION = 7;
+const STORE_SCHEMA_VERSION = 8;
 const MAINTENANCE_INTERVAL_MS = 60 * 60 * 1000;
 
 const STORE_SCHEMA_V1_SQL = `
@@ -647,7 +647,62 @@ INSERT OR IGNORE INTO _sql_schema_migrations (id) VALUES (7);
 PRAGMA optimize;
 `;
 
-const STORE_SCHEMA_SQL = `${STORE_SCHEMA_V1_SQL}\n${STORE_SCHEMA_V2_MIGRATION_SQL}\n${STORE_SCHEMA_V3_MIGRATION_SQL}\n${STORE_SCHEMA_V4_MIGRATION_SQL}\n${STORE_SCHEMA_V5_MIGRATION_SQL}\n${STORE_SCHEMA_V6_MIGRATION_SQL}\n${STORE_SCHEMA_V7_MIGRATION_SQL}`;
+const STORE_SCHEMA_V8_FINALIZE_SQL = `
+UPDATE vendors
+SET review_revision = (
+  SELECT COUNT(*)
+  FROM audit_events review_event
+  WHERE review_event.action = 'vendor.reviewed'
+    AND review_event.entity_type = 'vendor'
+    AND review_event.entity_id = vendors.id
+)
+WHERE review_revision = 0;
+
+DROP TRIGGER IF EXISTS vendors_review_revision_update;
+DROP TRIGGER IF EXISTS audit_events_immutable_update;
+DROP TRIGGER IF EXISTS audit_events_identity_immutable_update;
+DROP TRIGGER IF EXISTS audit_events_actor_retention_update;
+DROP TRIGGER IF EXISTS audit_events_immutable_delete;
+
+CREATE TRIGGER vendors_review_revision_update
+AFTER UPDATE OF status ON vendors
+WHEN OLD.status != NEW.status
+BEGIN
+  UPDATE vendors
+  SET review_revision = OLD.review_revision + 1
+  WHERE id = NEW.id;
+END;
+
+CREATE TRIGGER audit_events_identity_immutable_update
+BEFORE UPDATE OF id, action, entity_type, entity_id, metadata_json, created_at ON audit_events
+BEGIN
+  SELECT RAISE(ABORT, 'audit events are immutable');
+END;
+
+CREATE TRIGGER audit_events_actor_retention_update
+BEFORE UPDATE OF actor_user_id ON audit_events
+WHEN NEW.actor_user_id IS NOT NULL OR OLD.actor_user_id IS NULL
+BEGIN
+  SELECT RAISE(ABORT, 'audit event actors can only be anonymized');
+END;
+
+CREATE TRIGGER audit_events_immutable_delete
+BEFORE DELETE ON audit_events
+BEGIN
+  SELECT RAISE(ABORT, 'audit events are immutable');
+END;
+
+INSERT OR IGNORE INTO _sql_schema_migrations (id) VALUES (8);
+PRAGMA optimize;
+`;
+
+const STORE_SCHEMA_V8_MIGRATION_SQL = `
+ALTER TABLE vendors ADD COLUMN review_revision INTEGER NOT NULL DEFAULT 0
+  CHECK (typeof(review_revision) = 'integer' AND review_revision >= 0);
+${STORE_SCHEMA_V8_FINALIZE_SQL}
+`;
+
+const STORE_SCHEMA_SQL = `${STORE_SCHEMA_V1_SQL}\n${STORE_SCHEMA_V2_MIGRATION_SQL}\n${STORE_SCHEMA_V3_MIGRATION_SQL}\n${STORE_SCHEMA_V4_MIGRATION_SQL}\n${STORE_SCHEMA_V5_MIGRATION_SQL}\n${STORE_SCHEMA_V6_MIGRATION_SQL}\n${STORE_SCHEMA_V7_MIGRATION_SQL}\n${STORE_SCHEMA_V8_MIGRATION_SQL}`;
 
 const DEMO_CATALOG_SQL = `
 INSERT OR IGNORE INTO vendors
@@ -732,6 +787,18 @@ export class MelaivaStore {
       }
       if (version > 0 && version < 7) {
         this.sql.exec(STORE_SCHEMA_V7_MIGRATION_SQL).toArray();
+      }
+      if (version > 0 && version < 8) {
+        const vendorColumns = this.sql.exec("PRAGMA table_info(vendors)").toArray();
+        if (!vendorColumns.some((column) => column.name === "review_revision")) {
+          this.sql
+            .exec(
+              `ALTER TABLE vendors ADD COLUMN review_revision INTEGER NOT NULL DEFAULT 0
+                 CHECK (typeof(review_revision) = 'integer' AND review_revision >= 0)`,
+            )
+            .toArray();
+        }
+        this.sql.exec(STORE_SCHEMA_V8_FINALIZE_SQL).toArray();
       }
       if (env?.ENABLE_DEMO_CATALOG === "true" && env?.ENVIRONMENT !== "production") {
         this.sql.exec(DEMO_CATALOG_SQL).toArray();
@@ -871,6 +938,8 @@ export {
   STORE_SCHEMA_V6_FINALIZE_SQL,
   STORE_SCHEMA_V6_MIGRATION_SQL,
   STORE_SCHEMA_V7_MIGRATION_SQL,
+  STORE_SCHEMA_V8_FINALIZE_SQL,
+  STORE_SCHEMA_V8_MIGRATION_SQL,
   STORE_SCHEMA_VERSION,
   executeSql,
 };

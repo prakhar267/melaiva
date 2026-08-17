@@ -13,6 +13,7 @@ The launch build is a single Cloudflare Worker: it serves the React application,
 - Four-step, single-service private request builder with sealed offer workflow and explicit preferred-partner invitations
 - Customer dashboard backed by the signed-in user's requests, with a private sealed state and an explicit close-and-reveal decision
 - Vendor onboarding, opportunity feed, and normalized offer submission covering inclusions, exclusions, GST, travel, priced add-ons, delivery, cancellation, and validity
+- A private operator-only vendor review queue with oldest-first pagination, full submitted application context, explicit approve/reject/suspend/restore transitions, required internal rationale, retry-safe decisions, stale-review protection, and immutable decision history
 - Customer commercial-term comparison plus shortlist/reject/accept state transitions, with a review-and-acknowledge award dialog and exact offer counts
 - Immutable, access-scoped award handoffs shared with the couple and winning vendor, explicitly marked contract pending without implying signatures, booking, or payment
 - Award-linked, text-only conversations shared only with the request owner and winning vendor; participant-private unread badges stay in sync across workspaces without exposing read receipts, prior history remains readable while sending pauses for a non-approved partner, and administrators are read-only
@@ -22,6 +23,8 @@ The launch build is a single Cloudflare Worker: it serves the React application,
 - Isolated staging configuration, Git-provenanced releases, CodeQL merge protection, and read-only production readiness monitoring
 
 Post-award messages are coordination records, not contracts, signatures, invoices, booking confirmations, or payment evidence. Unread state is private to each participant and never shown to the counterparty as a receipt. Attachments, email notifications, signatures, and payments are not implemented.
+
+Marketplace approval records an internal operating decision; it is not a government identity check, legal certification, KYC result, or guarantee of vendor performance. Staff access remains an out-of-band role assignment and must be protected with Cloudflare Access/MFA before it is delegated beyond the founder.
 
 Demo vendor cards and workspace figures are clearly labelled examples. Production never represents them as verified businesses.
 

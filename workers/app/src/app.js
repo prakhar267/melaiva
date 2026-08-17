@@ -120,14 +120,39 @@ const passwordSchema = z
   });
 const passwordVerifierSchema = z.string().regex(/^[A-Za-z0-9_-]{43}$/, "Invalid password verifier");
 const inrSchema = z.literal("INR").default(DEFAULT_CURRENCY);
-const httpUrlSchema = z
+function isPrivateOrReservedHostname(value) {
+  const hostname = String(value || "").toLowerCase().replace(/^\[|\]$/gu, "").replace(/\.$/u, "");
+  if (!hostname || !hostname.includes(".")) return true;
+  if (["localhost", "0.0.0.0"].includes(hostname)) return true;
+  if ([".localhost", ".local", ".internal", ".home", ".lan", ".corp", ".onion", ".test", ".example", ".invalid", ".arpa"]
+    .some((suffix) => hostname.endsWith(suffix))) return true;
+  if (hostname.includes(":")) return true;
+  const octets = hostname.split(".").map(Number);
+  if (octets.length !== 4 || octets.some((octet) => !Number.isInteger(octet) || octet < 0 || octet > 255)) return false;
+  const [first, second] = octets;
+  return first === 0
+    || first === 10
+    || first === 127
+    || (first === 100 && second >= 64 && second <= 127)
+    || (first === 169 && second === 254)
+    || (first === 172 && second >= 16 && second <= 31)
+    || (first === 192 && [0, 2, 168].includes(second))
+    || (first === 198 && [18, 19, 51].includes(second))
+    || (first === 203 && second === 0 && octets[2] === 113)
+    || first >= 224;
+}
+
+const publicWebsiteUrlSchema = z
   .string()
   .url()
   .max(300)
   .refine((value) => {
-    const protocol = new URL(value).protocol;
-    return protocol === "https:" || protocol === "http:";
-  }, "Only http:// and https:// URLs are allowed");
+    const url = new URL(value);
+    return url.protocol === "https:"
+      && !url.username
+      && !url.password
+      && !isPrivateOrReservedHostname(url.hostname);
+  }, "Use a public https:// website address; local, private, and reserved destinations are not allowed");
 
 function validateCredentialInput(value, context) {
   const hasPassword = typeof value.password === "string";
@@ -300,12 +325,41 @@ const auctionStatusSchema = z
   .object({ status: z.enum(["closed", "cancelled"]) })
   .strict();
 
+const VENDOR_STATUSES = Object.freeze(["pending", "approved", "rejected", "suspended"]);
+const VENDOR_REVIEW_TRANSITIONS = Object.freeze({
+  pending: Object.freeze(["approved", "rejected"]),
+  approved: Object.freeze(["suspended"]),
+  rejected: Object.freeze(["pending"]),
+  suspended: Object.freeze(["approved"]),
+});
+const vendorStatusSchema = z.enum(VENDOR_STATUSES);
+const vendorReviewReasonSchema = z
+  .string()
+  .trim()
+  .min(10)
+  .max(1_000)
+  .refine(
+    (reason) => !/[\u0000-\u0008\u000B\u000C\u000E-\u001F\u007F\u202A-\u202E\u2066-\u2069]/u.test(reason),
+    "Review reasons cannot contain control or bidirectional formatting characters",
+  );
 const vendorReviewSchema = z
   .object({
-    status: z.enum(["approved", "rejected", "suspended"]),
-    note: z.string().trim().max(1_000).optional(),
+    status: vendorStatusSchema,
+    expectedStatus: vendorStatusSchema,
+    expectedRevision: z.number().int().min(0).max(1_000_000_000),
+    reason: vendorReviewReasonSchema.optional(),
+    note: vendorReviewReasonSchema.optional(),
   })
-  .strict();
+  .strict()
+  .superRefine((value, context) => {
+    if (Boolean(value.reason) === Boolean(value.note)) {
+      context.addIssue({
+        code: "custom",
+        path: ["reason"],
+        message: "Provide exactly one review reason",
+      });
+    }
+  });
 
 const vendorOnboardingSchema = z
   .object({
@@ -320,7 +374,7 @@ const vendorOnboardingSchema = z
     maxBudget: z.number().int().positive(),
     currency: inrSchema,
     phone: z.string().trim().min(7).max(24),
-    websiteUrl: httpUrlSchema.optional(),
+    websiteUrl: publicWebsiteUrlSchema.optional(),
     instagramHandle: z.string().trim().regex(/^@?[A-Za-z0-9._]{1,30}$/).optional(),
   })
   .strict()
@@ -979,6 +1033,40 @@ function mapVendor(row) {
     imageUrl: row.image_url || null,
     verified: Boolean(row.verified),
   };
+}
+
+function mapAdminVendor(row) {
+  return {
+    id: row.id,
+    slug: row.slug,
+    businessName: row.business_name,
+    legalName: row.legal_name,
+    status: row.status,
+    category: row.category,
+    categories: safeJsonArray(row.categories_json),
+    city: row.city,
+    serviceAreas: safeJsonArray(row.service_areas_json),
+    description: row.description,
+    minBudget: Number(row.min_budget),
+    maxBudget: Number(row.max_budget),
+    currency: row.currency,
+    phone: row.phone,
+    websiteUrl: row.website_url,
+    instagramHandle: row.instagram_handle,
+    owner: row.user_id ? { id: row.user_id, name: row.owner_name, email: row.owner_email } : null,
+    reviewRevision: row.review_revision === null || row.review_revision === undefined
+      ? null
+      : Math.max(0, Number(row.review_revision) || 0),
+    reviewCount: Math.max(0, Number(row.review_count) || 0),
+    lastReviewedAt: row.last_reviewed_at || null,
+    createdAt: row.created_at,
+    updatedAt: row.updated_at,
+  };
+}
+
+async function hasVendorReviewRevision(db) {
+  const result = await db.prepare("PRAGMA table_info(vendors)").all();
+  return (result.results || []).some((column) => column.name === "review_revision");
 }
 
 function filterFallbackVendors({ category, city, search }) {
@@ -3089,82 +3177,281 @@ function buildApp() {
     const user = await currentUser(c);
     if (user.role !== "admin") throw new ApiError(403, "role_not_allowed", "Administrator access is required");
     const requestedStatus = c.req.query("status") || "pending";
-    const status = z.enum(["pending", "approved", "rejected", "suspended"]).safeParse(requestedStatus);
+    const status = vendorStatusSchema.safeParse(requestedStatus);
     if (!status.success) throw new ApiError(422, "validation_failed", "Unknown vendor status");
-    const result = await requireDatabase(c.env)
+    const limit = parsePositiveInt(c.req.query("limit"), 50, 100);
+    const cursor = c.req.query("cursor") || null;
+    if (cursor && !/^[A-Za-z0-9-]{1,100}$/.test(cursor)) {
+      throw new ApiError(422, "invalid_cursor", "Vendor queue cursor is invalid");
+    }
+    const db = requireDatabase(c.env);
+    const revisionAvailable = await hasVendorReviewRevision(db);
+    let cursorRow = null;
+    if (cursor) {
+      cursorRow = await db
+        .prepare("SELECT id, created_at FROM vendors WHERE id = ? LIMIT 1")
+        .bind(cursor)
+        .first();
+      if (!cursorRow) throw new ApiError(422, "invalid_cursor", "Vendor queue cursor is invalid");
+    }
+    const cursorCondition = cursorRow ? "AND (v.created_at > ? OR (v.created_at = ? AND v.id > ?))" : "";
+    const cursorBinds = cursorRow ? [cursorRow.created_at, cursorRow.created_at, cursorRow.id] : [];
+    const result = await db
       .prepare(
         `SELECT v.id, v.slug, v.business_name, v.legal_name, v.status, v.category, v.categories_json,
                 v.city, v.service_areas_json, v.description, v.min_budget, v.max_budget, v.currency,
-                v.phone, v.website_url, v.instagram_handle, v.created_at,
-                u.id AS user_id, u.name AS owner_name, u.email AS owner_email
+                v.phone, v.website_url, v.instagram_handle, v.created_at, v.updated_at,
+                ${revisionAvailable ? "v.review_revision" : "NULL"} AS review_revision,
+                u.id AS user_id, u.name AS owner_name, u.email AS owner_email,
+                (
+                  SELECT COUNT(*) FROM audit_events review_event
+                  WHERE review_event.action = 'vendor.reviewed'
+                    AND review_event.entity_type = 'vendor'
+                    AND review_event.entity_id = v.id
+                ) AS review_count,
+                (
+                  SELECT review_event.created_at FROM audit_events review_event
+                  WHERE review_event.action = 'vendor.reviewed'
+                    AND review_event.entity_type = 'vendor'
+                    AND review_event.entity_id = v.id
+                  ORDER BY review_event.id DESC LIMIT 1
+                ) AS last_reviewed_at
          FROM vendors v LEFT JOIN users u ON u.id = v.user_id
-         WHERE v.status = ? ORDER BY v.created_at ASC LIMIT 100`,
+         WHERE v.status = ? ${cursorCondition}
+         ORDER BY v.created_at ASC, v.id ASC LIMIT ?`,
       )
-      .bind(status.data)
+      .bind(status.data, ...cursorBinds, limit + 1)
       .all();
+    const rows = result.results || [];
+    const hasMore = rows.length > limit;
+    const pageRows = rows.slice(0, limit);
+    const countResult = await db
+      .prepare("SELECT status, COUNT(*) AS count FROM vendors GROUP BY status")
+      .all();
+    const statusCounts = Object.fromEntries(VENDOR_STATUSES.map((vendorStatus) => [vendorStatus, 0]));
+    for (const row of countResult.results || []) {
+      if (Object.hasOwn(statusCounts, row.status)) statusCounts[row.status] = Number(row.count || 0);
+    }
     return c.json({
-      data: (result.results || []).map((row) => ({
-        id: row.id,
-        slug: row.slug,
-        businessName: row.business_name,
-        legalName: row.legal_name,
-        status: row.status,
-        category: row.category,
-        categories: safeJsonArray(row.categories_json),
-        city: row.city,
-        serviceAreas: safeJsonArray(row.service_areas_json),
-        description: row.description,
-        minBudget: Number(row.min_budget),
-        maxBudget: Number(row.max_budget),
-        currency: row.currency,
-        phone: row.phone,
-        websiteUrl: row.website_url,
-        instagramHandle: row.instagram_handle,
-        owner: row.user_id ? { id: row.user_id, name: row.owner_name, email: row.owner_email } : null,
+      data: pageRows.map(mapAdminVendor),
+      meta: {
+        limit,
+        total: statusCounts[status.data],
+        nextCursor: hasMore ? pageRows[pageRows.length - 1]?.id || null : null,
+        statusCounts,
+      },
+    });
+  });
+
+  app.get(`${API_PREFIX}/admin/vendors/:id/reviews`, async (c) => {
+    const user = await currentUser(c);
+    if (user.role !== "admin") throw new ApiError(403, "role_not_allowed", "Administrator access is required");
+    const db = requireDatabase(c.env);
+    const vendor = await db.prepare("SELECT id FROM vendors WHERE id = ? LIMIT 1").bind(c.req.param("id")).first();
+    if (!vendor) throw new ApiError(404, "vendor_not_found", "Vendor not found");
+    const result = await db
+      .prepare(
+        `SELECT review_event.id, review_event.actor_user_id, review_event.created_at,
+                reviewer.name AS reviewer_name, reviewer.email AS reviewer_email,
+                json_extract(review_event.metadata_json, '$.reviewId') AS review_id,
+                json_extract(review_event.metadata_json, '$.from') AS from_status,
+                json_extract(review_event.metadata_json, '$.to') AS to_status,
+                COALESCE(
+                  json_extract(review_event.metadata_json, '$.reason'),
+                  json_extract(review_event.metadata_json, '$.note')
+                ) AS reason,
+                json_extract(review_event.metadata_json, '$.statusRevision') AS status_revision
+         FROM audit_events review_event
+         LEFT JOIN users reviewer ON reviewer.id = review_event.actor_user_id
+         WHERE review_event.action = 'vendor.reviewed'
+           AND review_event.entity_type = 'vendor'
+           AND review_event.entity_id = ?
+         ORDER BY review_event.id DESC
+         LIMIT 101`,
+      )
+      .bind(vendor.id)
+      .all();
+    const rows = result.results || [];
+    const truncated = rows.length > 100;
+    return c.json({
+      data: rows.slice(0, 100).map((row) => ({
+        id: row.review_id || `audit-${row.id}`,
+        fromStatus: row.from_status || null,
+        toStatus: row.to_status || null,
+        reason: row.reason || null,
+        statusRevision: row.status_revision === null ? null : Math.max(0, Number(row.status_revision) || 0),
+        reviewer: row.actor_user_id
+          ? { id: row.actor_user_id, name: row.reviewer_name || "Former operator", email: row.reviewer_email || null }
+          : null,
         createdAt: row.created_at,
+        legacy: !row.review_id || !row.reason,
       })),
+      meta: { truncated },
     });
   });
 
   app.patch(`${API_PREFIX}/admin/vendors/:id`, async (c) => {
     const user = await currentUser(c);
     if (user.role !== "admin") throw new ApiError(403, "role_not_allowed", "Administrator access is required");
+    const requestKey = idempotencyKey(c, { required: true });
     const input = await parseJson(c, vendorReviewSchema);
     const db = requireDatabase(c.env);
-    const vendor = await db.prepare("SELECT id, status FROM vendors WHERE id = ? LIMIT 1").bind(c.req.param("id")).first();
+    const reason = input.reason || input.note;
+    const revisionAvailable = await hasVendorReviewRevision(db);
+    const scope = `vendor-review:${c.req.param("id")}`;
+    const normalizedRequest = {
+      status: input.status,
+      expectedStatus: input.expectedStatus ?? null,
+      expectedRevision: input.expectedRevision ?? null,
+      reason,
+    };
+    const requestHash = await canonicalRequestHash(normalizedRequest);
+    const replay = await findIdempotentResult(db, scope, requestKey, user.id, requestHash);
+    if (replay) return c.json({ data: replay.value, meta: { replayed: true } }, replay.status);
+    if (!revisionAvailable) {
+      throw new ApiError(503, "vendor_review_migration_required", "Vendor reviews are temporarily paused during a database upgrade");
+    }
+    await enforceRateLimit(c, `vendor-review:${user.id}`, 120, 60 * 60);
+    const vendor = await db
+      .prepare(
+        `SELECT id, status, ${revisionAvailable ? "review_revision" : "0"} AS review_revision
+         FROM vendors WHERE id = ? LIMIT 1`,
+      )
+      .bind(c.req.param("id"))
+      .first();
     if (!vendor) throw new ApiError(404, "vendor_not_found", "Vendor not found");
+    const currentRevision = Math.max(0, Number(vendor.review_revision) || 0);
+    if (
+      input.expectedStatus !== vendor.status
+      || input.expectedRevision !== currentRevision
+    ) {
+      throw new ApiError(409, "vendor_review_conflict", "This application changed; refresh before deciding", {
+        currentStatus: vendor.status,
+        currentRevision,
+      });
+    }
+    if (!VENDOR_REVIEW_TRANSITIONS[vendor.status]?.includes(input.status)) {
+      throw new ApiError(409, "invalid_status_transition", "This vendor status cannot make the requested transition", {
+        currentStatus: vendor.status,
+        allowedStatuses: VENDOR_REVIEW_TRANSITIONS[vendor.status] || [],
+      });
+    }
+    const reviewId = crypto.randomUUID();
+    const reviewedAt = new Date().toISOString();
+    const nextRevision = revisionAvailable ? currentRevision + 1 : currentRevision;
+    const responseValue = {
+      id: vendor.id,
+      status: input.status,
+      verified: input.status === "approved",
+      reviewRevision: nextRevision,
+      reviewedAt,
+      review: {
+        id: reviewId,
+        fromStatus: vendor.status,
+        toStatus: input.status,
+        reason,
+        statusRevision: nextRevision,
+        reviewer: { id: user.id, name: user.name, email: user.email },
+        createdAt: reviewedAt,
+        legacy: false,
+      },
+    };
+    const update = revisionAvailable
+      ? db
+          .prepare(
+            `UPDATE vendors
+             SET status = ?, verified = ?, updated_at = ?
+             WHERE id = ? AND status = ? AND review_revision = ?
+               AND EXISTS (
+                 SELECT 1 FROM users active_admin
+                 WHERE active_admin.id = ? AND active_admin.role = 'admin' AND active_admin.status = 'active'
+               )`,
+          )
+          .bind(input.status, input.status === "approved" ? 1 : 0, reviewedAt, vendor.id, vendor.status, currentRevision, user.id)
+      : db
+          .prepare(
+            `UPDATE vendors
+             SET status = ?, verified = ?, updated_at = ?
+             WHERE id = ? AND status = ?
+               AND EXISTS (
+                 SELECT 1 FROM users active_admin
+                 WHERE active_admin.id = ? AND active_admin.role = 'admin' AND active_admin.status = 'active'
+               )`,
+          )
+          .bind(input.status, input.status === "approved" ? 1 : 0, reviewedAt, vendor.id, vendor.status, user.id);
+    const metadata = JSON.stringify({
+      reviewId,
+      from: vendor.status,
+      to: input.status,
+      reason,
+      statusRevision: nextRevision,
+    });
     const statements = [
+      update,
       db
-        .prepare("UPDATE vendors SET status = ?, verified = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?")
-        .bind(input.status, input.status === "approved" ? 1 : 0, vendor.id),
+        .prepare(
+          `INSERT INTO audit_events (actor_user_id, action, entity_type, entity_id, metadata_json, created_at)
+           SELECT ?, 'vendor.reviewed', 'vendor', ?, ?, ? WHERE changes() = 1`,
+        )
+        .bind(user.id, vendor.id, metadata, reviewedAt),
     ];
+    statements.push(
+      await conditionalIdempotencyStatement(db, scope, requestKey, user.id, requestHash, 200, responseValue),
+    );
+    const reviewGuard = `EXISTS (
+      SELECT 1 FROM audit_events review_event
+      WHERE review_event.action = 'vendor.reviewed'
+        AND review_event.entity_type = 'vendor'
+        AND review_event.entity_id = ?
+        AND json_extract(review_event.metadata_json, '$.reviewId') = ?
+    )`;
     if (["rejected", "suspended"].includes(input.status)) {
       statements.push(
         db
           .prepare(
             `UPDATE bids SET status = 'withdrawn', updated_at = CURRENT_TIMESTAMP
-             WHERE vendor_id = ? AND status IN ('submitted', 'shortlisted')`,
+             WHERE vendor_id = ? AND status IN ('submitted', 'shortlisted') AND ${reviewGuard}`,
           )
-          .bind(vendor.id),
+          .bind(vendor.id, vendor.id, reviewId),
         db
           .prepare(
             `UPDATE auction_vendor_invites
              SET status = 'unavailable', updated_at = CURRENT_TIMESTAMP
-             WHERE vendor_id = ? AND status IN ('invited', 'responded')`,
+             WHERE vendor_id = ? AND status IN ('invited', 'responded') AND ${reviewGuard}`,
           )
-          .bind(vendor.id),
+          .bind(vendor.id, vendor.id, reviewId),
       );
     }
-    statements.push(
-      db
+    let results;
+    try {
+      results = await db.batch(statements);
+    } catch (error) {
+      if (isUniqueConstraint(error)) {
+        const concurrentReplay = await findIdempotentResult(db, scope, requestKey, user.id, requestHash);
+        if (concurrentReplay) {
+          return c.json({ data: concurrentReplay.value, meta: { replayed: true } }, concurrentReplay.status);
+        }
+      }
+      throw error;
+    }
+    if (Number(results?.[0]?.meta?.changes || 0) !== 1) {
+      const concurrentReplay = await findIdempotentResult(db, scope, requestKey, user.id, requestHash);
+      if (concurrentReplay) {
+        return c.json({ data: concurrentReplay.value, meta: { replayed: true } }, concurrentReplay.status);
+      }
+      const current = await db
         .prepare(
-          `INSERT INTO audit_events (actor_user_id, action, entity_type, entity_id, metadata_json)
-           VALUES (?, 'vendor.reviewed', 'vendor', ?, ?)`,
+          `SELECT status, ${revisionAvailable ? "review_revision" : "0"} AS review_revision
+           FROM vendors WHERE id = ? LIMIT 1`,
         )
-        .bind(user.id, vendor.id, JSON.stringify({ from: vendor.status, to: input.status, note: input.note || null })),
-    );
-    await db.batch(statements);
-    return c.json({ data: { id: vendor.id, status: input.status, verified: input.status === "approved" } });
+        .bind(vendor.id)
+        .first();
+      throw new ApiError(409, "vendor_review_conflict", "This application changed; refresh before deciding", {
+        currentStatus: current?.status || null,
+        currentRevision: Math.max(0, Number(current?.review_revision) || 0),
+      });
+    }
+    return c.json({ data: responseValue });
   });
 
   app.post(`${API_PREFIX}/leads`, async (c) => {

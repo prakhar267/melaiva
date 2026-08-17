@@ -1,6 +1,7 @@
 import { Link, useNavigate } from "react-router-dom";
 import { ArrowLeft, ArrowRight, FileQuestion, LockKeyhole, ShieldCheck, Sparkles } from "lucide-react";
 import { AuthPanel } from "../components/Shell.jsx";
+import { readApiResponse } from "../api.js";
 
 export function AuthPage({ notify, onAuthenticated }) {
   const navigate = useNavigate();
@@ -19,10 +20,10 @@ export function AuthPage({ notify, onAuthenticated }) {
             notify({ title: mode === "login" ? "Welcome back" : "Your account is ready", message: "Opening your planning space now." });
             try {
               const response = await fetch("/api/v1/auth/me", { credentials: "include" });
-              const payload = response.ok ? await response.json() : {};
-              navigate(payload.data?.vendor ? "/vendor" : "/dashboard");
+              const payload = await readApiResponse(response, "Your account destination could not be loaded.");
+              navigate(payload.data?.user?.role === "admin" ? "/admin/vendors" : payload.data?.vendor ? "/vendor" : "/dashboard");
             } catch {
-              navigate("/dashboard");
+              navigate(user?.role === "admin" ? "/admin/vendors" : "/dashboard");
             }
           }} />
         </section>

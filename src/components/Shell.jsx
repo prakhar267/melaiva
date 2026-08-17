@@ -10,6 +10,7 @@ import {
   Sparkles,
   X,
 } from "lucide-react";
+import { readApiResponse } from "../api.js";
 import { derivePasswordVerifier, normalizeAuthEmail, passwordKdf } from "../security/passwordVerifier.js";
 
 const navItems = [
@@ -199,7 +200,7 @@ export function AuthModal({ open, onClose, notify, onAuthenticated }) {
   );
 }
 
-function Header({ onOpenAuth, authenticated, accountPath }) {
+function Header({ onOpenAuth, authenticated, accountPath, accountLabel }) {
   const [drawerOpen, setDrawerOpen] = useState(false);
   const location = useLocation();
   const drawerRef = useRef(null);
@@ -255,7 +256,7 @@ function Header({ onOpenAuth, authenticated, accountPath }) {
           <div className="site-header__actions">
             <NavLink className="vendor-link" to="/vendor">For vendors</NavLink>
             {authenticated
-              ? <Link className="button button--small button--outline header-login" to={accountPath}>My account</Link>
+              ? <Link className="button button--small button--outline header-login" to={accountPath}>{accountLabel}</Link>
               : <button className="button button--small button--outline header-login" onClick={onOpenAuth}>Sign in</button>}
             <button ref={menuButtonRef} className="icon-button menu-button" onClick={() => setDrawerOpen(true)} aria-label="Open menu" aria-expanded={drawerOpen}>
               <Menu size={22} />
@@ -280,7 +281,7 @@ function Header({ onOpenAuth, authenticated, accountPath }) {
           </nav>
           <div className="mobile-drawer__footer">
             {authenticated
-              ? <Link className="button button--primary button--wide" to={accountPath} onClick={() => setDrawerOpen(false)} tabIndex={drawerOpen ? 0 : -1}>Open my account</Link>
+              ? <Link className="button button--primary button--wide" to={accountPath} onClick={() => setDrawerOpen(false)} tabIndex={drawerOpen ? 0 : -1}>{accountLabel === "Operations" ? "Open operations" : "Open my account"}</Link>
               : <button className="button button--primary button--wide" onClick={() => { setDrawerOpen(false); onOpenAuth(); }} tabIndex={drawerOpen ? 0 : -1}>Sign in or join</button>}
             <p>Plan with clarity. Celebrate with heart.</p>
           </div>
@@ -330,16 +331,28 @@ export function AppShell({ children, toast, dismissToast, openAuth, setOpenAuth,
   const location = useLocation();
   const [authenticated, setAuthenticated] = useState(false);
   const [accountPath, setAccountPath] = useState("/dashboard");
+  const [accountLabel, setAccountLabel] = useState("My account");
   useEffect(() => {
     const controller = new AbortController();
     fetch("/api/v1/auth/me", { credentials: "include", signal: controller.signal })
       .then(async (response) => {
-        const payload = response.ok ? await response.json().catch(() => ({})) : {};
+        const payload = await readApiResponse(response, "Your account session could not be checked.");
         if (controller.signal.aborted) return;
-        setAuthenticated(response.ok);
-        setAccountPath(payload.data?.vendor ? "/vendor" : "/dashboard");
+        setAuthenticated(true);
+        if (payload.data?.user?.role === "admin") {
+          setAccountPath("/admin/vendors");
+          setAccountLabel("Operations");
+        } else {
+          setAccountPath(payload.data?.vendor ? "/vendor" : "/dashboard");
+          setAccountLabel("My account");
+        }
       })
-      .catch(() => { if (!controller.signal.aborted) setAuthenticated(false); });
+      .catch(() => {
+        if (controller.signal.aborted) return;
+        setAuthenticated(false);
+        setAccountPath("/dashboard");
+        setAccountLabel("My account");
+      });
     return () => controller.abort();
   }, [authRevision]);
   useEffect(() => {
@@ -351,6 +364,7 @@ export function AppShell({ children, toast, dismissToast, openAuth, setOpenAuth,
       "/dashboard": "My planning space | Melaiva",
       "/vendor": "Partner workspace | Melaiva",
       "/vendor/onboarding": "Join the partner network | Melaiva",
+      "/admin/vendors": "Vendor verification | Melaiva operations",
       "/auth": "Sign in | Melaiva",
       "/privacy": "Privacy policy | Melaiva",
       "/terms": "Terms of service | Melaiva",
@@ -365,10 +379,15 @@ export function AppShell({ children, toast, dismissToast, openAuth, setOpenAuth,
 
   return (
     <>
-      <Header onOpenAuth={() => setOpenAuth(true)} authenticated={authenticated} accountPath={accountPath} />
+      <Header onOpenAuth={() => setOpenAuth(true)} authenticated={authenticated} accountPath={accountPath} accountLabel={accountLabel} />
       <main id="main-content">{children}</main>
       <Footer />
-      <AuthModal open={openAuth} onClose={() => setOpenAuth(false)} notify={notify} onAuthenticated={(mode, user) => { setAuthenticated(true); setAccountPath("/dashboard"); onAuthenticated?.(mode, user); }} />
+      <AuthModal open={openAuth} onClose={() => setOpenAuth(false)} notify={notify} onAuthenticated={(mode, user) => {
+        setAuthenticated(true);
+        setAccountPath(user?.role === "admin" ? "/admin/vendors" : "/dashboard");
+        setAccountLabel(user?.role === "admin" ? "Operations" : "My account");
+        onAuthenticated?.(mode, user);
+      }} />
       <ToastRegion toast={toast} onDismiss={dismissToast} />
     </>
   );

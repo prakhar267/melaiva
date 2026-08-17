@@ -1805,7 +1805,7 @@ test("v0.10 onboarding stays additive while required evidence and admin review r
   const app = buildApp();
   const config = await requestJson(app, env, "/auth/config");
   assert.equal(config.status, 200);
-  assert.equal((await config.json()).data.vendorApplicationEvidenceRevision, 3);
+  assert.equal((await config.json()).data.vendorApplicationEvidenceRevision, 4);
 
   const owner = await register(app, env, {
     name: "Old Client Vendor Owner",

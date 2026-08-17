@@ -1,4 +1,4 @@
-const STORE_SCHEMA_VERSION = 8;
+const STORE_SCHEMA_VERSION = 9;
 const MAINTENANCE_INTERVAL_MS = 60 * 60 * 1000;
 
 const STORE_SCHEMA_V1_SQL = `
@@ -702,19 +702,381 @@ ALTER TABLE vendors ADD COLUMN review_revision INTEGER NOT NULL DEFAULT 0
 ${STORE_SCHEMA_V8_FINALIZE_SQL}
 `;
 
-const STORE_SCHEMA_SQL = `${STORE_SCHEMA_V1_SQL}\n${STORE_SCHEMA_V2_MIGRATION_SQL}\n${STORE_SCHEMA_V3_MIGRATION_SQL}\n${STORE_SCHEMA_V4_MIGRATION_SQL}\n${STORE_SCHEMA_V5_MIGRATION_SQL}\n${STORE_SCHEMA_V6_MIGRATION_SQL}\n${STORE_SCHEMA_V7_MIGRATION_SQL}\n${STORE_SCHEMA_V8_MIGRATION_SQL}`;
+const STORE_SCHEMA_V9_FINALIZE_SQL = `
+CREATE TABLE IF NOT EXISTS vendor_application_evidence (
+  vendor_id TEXT PRIMARY KEY REFERENCES vendors(id) ON DELETE RESTRICT,
+  evidence_revision INTEGER NOT NULL DEFAULT 1
+    CHECK (typeof(evidence_revision) = 'integer' AND evidence_revision = 1),
+  portfolio_urls_json TEXT NOT NULL
+    CHECK (
+      json_valid(portfolio_urls_json)
+      AND json_type(portfolio_urls_json) = 'array'
+      AND json_array_length(portfolio_urls_json) BETWEEN 1 AND 5
+      AND length(portfolio_urls_json) <= 2000
+    ),
+  reference_urls_json TEXT NOT NULL
+    CHECK (
+      json_valid(reference_urls_json)
+      AND json_type(reference_urls_json) = 'array'
+      AND json_array_length(reference_urls_json) BETWEEN 1 AND 3
+      AND length(reference_urls_json) <= 1200
+    ),
+  registration_type TEXT NOT NULL
+    CHECK (registration_type IN ('gstin', 'cin', 'udyam', 'not_registered')),
+  registration_reference TEXT,
+  attested INTEGER NOT NULL CHECK (attested = 1),
+  attested_at TEXT NOT NULL CHECK (length(attested_at) BETWEEN 20 AND 35),
+  created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+  CHECK (
+    (registration_type = 'not_registered' AND registration_reference IS NULL)
+    OR (
+      registration_type = 'gstin'
+      AND registration_reference IS NOT NULL
+      AND length(registration_reference) = 15
+      AND substr(registration_reference, 1, 2) NOT GLOB '*[^0-9]*'
+      AND substr(registration_reference, 3, 5) NOT GLOB '*[^A-Z]*'
+      AND substr(registration_reference, 8, 4) NOT GLOB '*[^0-9]*'
+      AND substr(registration_reference, 12, 1) GLOB '[A-Z]'
+      AND substr(registration_reference, 13, 1) GLOB '[1-9A-Z]'
+      AND substr(registration_reference, 14, 1) = 'Z'
+      AND substr(registration_reference, 15, 1) GLOB '[0-9A-Z]'
+    )
+    OR (
+      registration_type = 'cin'
+      AND registration_reference IS NOT NULL
+      AND length(registration_reference) = 21
+      AND substr(registration_reference, 1, 1) GLOB '[LU]'
+      AND substr(registration_reference, 2, 5) NOT GLOB '*[^0-9]*'
+      AND substr(registration_reference, 7, 2) NOT GLOB '*[^A-Z]*'
+      AND substr(registration_reference, 9, 4) NOT GLOB '*[^0-9]*'
+      AND substr(registration_reference, 13, 3) NOT GLOB '*[^A-Z]*'
+      AND substr(registration_reference, 16, 6) NOT GLOB '*[^0-9]*'
+    )
+    OR (
+      registration_type = 'udyam'
+      AND registration_reference IS NOT NULL
+      AND length(registration_reference) = 19
+      AND substr(registration_reference, 1, 6) = 'UDYAM-'
+      AND substr(registration_reference, 7, 2) NOT GLOB '*[^A-Z]*'
+      AND substr(registration_reference, 9, 1) = '-'
+      AND substr(registration_reference, 10, 2) NOT GLOB '*[^0-9]*'
+      AND substr(registration_reference, 12, 1) = '-'
+      AND substr(registration_reference, 13, 7) NOT GLOB '*[^0-9]*'
+    )
+  )
+);
+
+CREATE TRIGGER IF NOT EXISTS vendor_application_evidence_validate_insert
+BEFORE INSERT ON vendor_application_evidence
+WHEN
+  EXISTS (
+    SELECT 1 FROM json_each(NEW.portfolio_urls_json) item
+    WHERE item.type != 'text'
+      OR length(CAST(item.value AS TEXT)) NOT BETWEEN 10 AND 300
+      OR substr(CAST(item.value AS TEXT), 1, 8) != 'https://'
+      OR trim(CAST(item.value AS TEXT)) != CAST(item.value AS TEXT)
+      OR instr(CAST(item.value AS TEXT), '#') != 0
+      OR instr(substr(CAST(item.value AS TEXT), 9), '/') = 0
+      OR substr(
+        substr(CAST(item.value AS TEXT), 9),
+        1,
+        instr(substr(CAST(item.value AS TEXT), 9), '/') - 1
+      ) GLOB '*.'
+      OR instr(
+        substr(
+          substr(CAST(item.value AS TEXT), 9),
+          1,
+          instr(substr(CAST(item.value AS TEXT), 9), '/') - 1
+        ),
+        '.:'
+      ) != 0
+      OR lower(substr(
+        substr(CAST(item.value AS TEXT), 9),
+        1,
+        instr(substr(CAST(item.value AS TEXT), 9), '/') - 1
+      )) GLOB 'xn--*'
+      OR lower(substr(
+        substr(CAST(item.value AS TEXT), 9),
+        1,
+        instr(substr(CAST(item.value AS TEXT), 9), '/') - 1
+      )) GLOB '*.xn--*'
+  )
+  OR EXISTS (
+    SELECT 1 FROM json_each(NEW.reference_urls_json) item
+    WHERE item.type != 'text'
+      OR length(CAST(item.value AS TEXT)) NOT BETWEEN 10 AND 300
+      OR substr(CAST(item.value AS TEXT), 1, 8) != 'https://'
+      OR trim(CAST(item.value AS TEXT)) != CAST(item.value AS TEXT)
+      OR instr(CAST(item.value AS TEXT), '#') != 0
+      OR instr(substr(CAST(item.value AS TEXT), 9), '/') = 0
+      OR substr(
+        substr(CAST(item.value AS TEXT), 9),
+        1,
+        instr(substr(CAST(item.value AS TEXT), 9), '/') - 1
+      ) GLOB '*.'
+      OR instr(
+        substr(
+          substr(CAST(item.value AS TEXT), 9),
+          1,
+          instr(substr(CAST(item.value AS TEXT), 9), '/') - 1
+        ),
+        '.:'
+      ) != 0
+      OR lower(substr(
+        substr(CAST(item.value AS TEXT), 9),
+        1,
+        instr(substr(CAST(item.value AS TEXT), 9), '/') - 1
+      )) GLOB 'xn--*'
+      OR lower(substr(
+        substr(CAST(item.value AS TEXT), 9),
+        1,
+        instr(substr(CAST(item.value AS TEXT), 9), '/') - 1
+      )) GLOB '*.xn--*'
+  )
+  OR (
+    SELECT COUNT(*) FROM json_each(NEW.portfolio_urls_json)
+  ) != (
+    SELECT COUNT(DISTINCT CAST(item.value AS TEXT)) FROM json_each(NEW.portfolio_urls_json) item
+  )
+  OR (
+    SELECT COUNT(*) FROM json_each(NEW.reference_urls_json)
+  ) != (
+    SELECT COUNT(DISTINCT CAST(item.value AS TEXT)) FROM json_each(NEW.reference_urls_json) item
+  )
+  OR EXISTS (
+    SELECT 1
+    FROM json_each(NEW.portfolio_urls_json) portfolio
+    JOIN json_each(NEW.reference_urls_json) reference
+      ON CAST(reference.value AS TEXT) = CAST(portfolio.value AS TEXT)
+  )
+BEGIN
+  SELECT RAISE(ABORT, 'vendor application evidence URLs must be normalized unique public HTTPS URLs');
+END;
+
+CREATE TRIGGER IF NOT EXISTS vendor_application_evidence_vendor_state_insert
+BEFORE INSERT ON vendor_application_evidence
+WHEN NOT EXISTS (
+  SELECT 1
+  FROM vendors vendor
+  WHERE vendor.id = NEW.vendor_id
+    AND vendor.status IN ('pending', 'rejected')
+)
+BEGIN
+  SELECT RAISE(ABORT, 'vendor application evidence requires a pending or rejected vendor');
+END;
+
+CREATE TRIGGER IF NOT EXISTS vendor_application_evidence_immutable_update
+BEFORE UPDATE ON vendor_application_evidence
+BEGIN
+  SELECT RAISE(ABORT, 'vendor application evidence is immutable');
+END;
+
+CREATE TRIGGER IF NOT EXISTS vendor_application_evidence_immutable_delete
+BEFORE DELETE ON vendor_application_evidence
+BEGIN
+  SELECT RAISE(ABORT, 'vendor application evidence is immutable');
+END;
+
+CREATE TRIGGER IF NOT EXISTS vendors_evidence_approval_guard
+BEFORE UPDATE OF status ON vendors
+WHEN OLD.status != NEW.status
+  AND NEW.status = 'approved'
+  AND (
+    (
+      NEW.evidence_required = 1
+      AND NOT EXISTS (
+        SELECT 1 FROM vendor_application_evidence evidence
+        WHERE evidence.vendor_id = NEW.id
+      )
+    )
+    OR EXISTS (
+      SELECT 1
+      FROM vendor_application_evidence evidence
+      WHERE evidence.vendor_id = NEW.id
+        AND evidence.evidence_revision != NEW.evidence_reviewed_revision
+    )
+  )
+BEGIN
+  SELECT RAISE(ABORT, 'vendor evidence must be completed and acknowledged before approval');
+END;
+
+CREATE TRIGGER IF NOT EXISTS audit_events_vendor_review_sensitive_insert
+BEFORE INSERT ON audit_events
+WHEN NEW.action = 'vendor.reviewed'
+  AND NEW.entity_type = 'vendor'
+  AND (
+    lower(COALESCE(json_extract(NEW.metadata_json, '$.reason'), json_extract(NEW.metadata_json, '$.note'), ''))
+      LIKE '%http://%'
+    OR lower(COALESCE(json_extract(NEW.metadata_json, '$.reason'), json_extract(NEW.metadata_json, '$.note'), ''))
+      LIKE '%https://%'
+    OR lower(COALESCE(json_extract(NEW.metadata_json, '$.reason'), json_extract(NEW.metadata_json, '$.note'), ''))
+      LIKE '%www.%'
+    OR lower(COALESCE(json_extract(NEW.metadata_json, '$.reason'), json_extract(NEW.metadata_json, '$.note'), ''))
+      GLOB '*[a-z0-9].[a-z][a-z]*'
+    OR lower(COALESCE(json_extract(NEW.metadata_json, '$.reason'), json_extract(NEW.metadata_json, '$.note'), ''))
+      GLOB '*[0-9].[0-9].[0-9].[0-9]*'
+    OR (' ' || upper(COALESCE(
+      json_extract(NEW.metadata_json, '$.reason'), json_extract(NEW.metadata_json, '$.note'), ''
+    )) || ' ') GLOB '*[^A-Z0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9][^A-Z0-9]*'
+    OR (' ' || upper(COALESCE(
+      json_extract(NEW.metadata_json, '$.reason'), json_extract(NEW.metadata_json, '$.note'), ''
+    )) || ' ') GLOB '*[^A-Z0-9][0-9][0-9][0-9][0-9] [0-9][0-9][0-9][0-9] [0-9][0-9][0-9][0-9][^A-Z0-9]*'
+    OR (' ' || upper(COALESCE(
+      json_extract(NEW.metadata_json, '$.reason'), json_extract(NEW.metadata_json, '$.note'), ''
+    )) || ' ') GLOB '*[^A-Z0-9][0-9][0-9][0-9][0-9]-[0-9][0-9][0-9][0-9]-[0-9][0-9][0-9][0-9][^A-Z0-9]*'
+    OR (
+      (' ' || lower(COALESCE(
+        json_extract(NEW.metadata_json, '$.reason'), json_extract(NEW.metadata_json, '$.note'), ''
+      )) || ' ') GLOB '*[^a-z0-9]pan[^a-z0-9]*'
+      AND (
+        (' ' || upper(COALESCE(
+          json_extract(NEW.metadata_json, '$.reason'), json_extract(NEW.metadata_json, '$.note'), ''
+        )) || ' ') GLOB '*[^A-Z0-9][A-Z][A-Z][A-Z][A-Z][A-Z][0-9][0-9][0-9][0-9][A-Z][^A-Z0-9]*'
+        OR (' ' || upper(COALESCE(
+          json_extract(NEW.metadata_json, '$.reason'), json_extract(NEW.metadata_json, '$.note'), ''
+        )) || ' ') GLOB '*[^A-Z0-9][A-Z][A-Z][A-Z][A-Z][A-Z] [0-9][0-9][0-9][0-9] [A-Z][^A-Z0-9]*'
+        OR (' ' || upper(COALESCE(
+          json_extract(NEW.metadata_json, '$.reason'), json_extract(NEW.metadata_json, '$.note'), ''
+        )) || ' ') GLOB '*[^A-Z0-9][A-Z] [A-Z] [A-Z] [A-Z] [A-Z] [0-9] [0-9] [0-9] [0-9] [A-Z][^A-Z0-9]*'
+      )
+    )
+    OR (
+      (' ' || lower(COALESCE(
+        json_extract(NEW.metadata_json, '$.reason'), json_extract(NEW.metadata_json, '$.note'), ''
+      )) || ' ') GLOB '*[^a-z0-9]passport[^a-z0-9]*'
+      AND (
+        (' ' || upper(COALESCE(
+          json_extract(NEW.metadata_json, '$.reason'), json_extract(NEW.metadata_json, '$.note'), ''
+        )) || ' ') GLOB '*[^A-Z0-9][A-Z][0-9][0-9][0-9][0-9][0-9][0-9][0-9][^A-Z0-9]*'
+        OR (' ' || upper(COALESCE(
+          json_extract(NEW.metadata_json, '$.reason'), json_extract(NEW.metadata_json, '$.note'), ''
+        )) || ' ') GLOB '*[^A-Z0-9][A-Z] [0-9] [0-9] [0-9] [0-9] [0-9] [0-9] [0-9][^A-Z0-9]*'
+      )
+    )
+    OR (' ' || upper(COALESCE(
+      json_extract(NEW.metadata_json, '$.reason'), json_extract(NEW.metadata_json, '$.note'), ''
+    )) || ' ') GLOB '*[^A-Z0-9][0-9][0-9][A-Z][A-Z][A-Z][A-Z][A-Z][0-9][0-9][0-9][0-9][A-Z][A-Z0-9]Z[A-Z0-9][^A-Z0-9]*'
+    OR (' ' || upper(COALESCE(
+      json_extract(NEW.metadata_json, '$.reason'), json_extract(NEW.metadata_json, '$.note'), ''
+    )) || ' ') GLOB '*[^A-Z0-9][LU][0-9][0-9][0-9][0-9][0-9][A-Z][A-Z][0-9][0-9][0-9][0-9][A-Z][A-Z][A-Z][0-9][0-9][0-9][0-9][0-9][0-9][^A-Z0-9]*'
+    OR (' ' || upper(COALESCE(
+      json_extract(NEW.metadata_json, '$.reason'), json_extract(NEW.metadata_json, '$.note'), ''
+    )) || ' ') GLOB '*[^A-Z0-9]UDYAM-[A-Z][A-Z]-[0-9][0-9]-[0-9][0-9][0-9][0-9][0-9][0-9][0-9][^A-Z0-9]*'
+    OR (
+      (
+        lower(COALESCE(json_extract(NEW.metadata_json, '$.reason'), json_extract(NEW.metadata_json, '$.note'), ''))
+          LIKE '%aadhaar%'
+        OR lower(COALESCE(json_extract(NEW.metadata_json, '$.reason'), json_extract(NEW.metadata_json, '$.note'), ''))
+          LIKE '%aadhar%'
+      )
+      AND upper(replace(replace(replace(replace(replace(
+        COALESCE(json_extract(NEW.metadata_json, '$.reason'), json_extract(NEW.metadata_json, '$.note'), ''),
+        ' ', ''), '-', ''), char(9), ''), char(10), ''), char(13), ''))
+        GLOB '*[0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9]*'
+    )
+    OR (
+      (' ' || lower(COALESCE(
+        json_extract(NEW.metadata_json, '$.reason'), json_extract(NEW.metadata_json, '$.note'), ''
+      )) || ' ') GLOB '*[^a-z0-9]pan[^a-z0-9]*'
+      AND upper(replace(replace(replace(replace(replace(
+        COALESCE(json_extract(NEW.metadata_json, '$.reason'), json_extract(NEW.metadata_json, '$.note'), ''),
+        ' ', ''), '-', ''), char(9), ''), char(10), ''), char(13), ''))
+        GLOB '*[A-Z][A-Z][A-Z][A-Z][A-Z][0-9][0-9][0-9][0-9][A-Z]*'
+    )
+    OR (
+      (' ' || lower(COALESCE(
+        json_extract(NEW.metadata_json, '$.reason'), json_extract(NEW.metadata_json, '$.note'), ''
+      )) || ' ') GLOB '*[^a-z0-9]passport[^a-z0-9]*'
+      AND upper(replace(replace(replace(replace(replace(
+        COALESCE(json_extract(NEW.metadata_json, '$.reason'), json_extract(NEW.metadata_json, '$.note'), ''),
+        ' ', ''), '-', ''), char(9), ''), char(10), ''), char(13), ''))
+        GLOB '*[A-Z][0-9][0-9][0-9][0-9][0-9][0-9][0-9]*'
+    )
+    OR upper(replace(replace(replace(replace(replace(
+      COALESCE(json_extract(NEW.metadata_json, '$.reason'), json_extract(NEW.metadata_json, '$.note'), ''),
+      ' ', ''), '-', ''), char(9), ''), char(10), ''), char(13), ''))
+      GLOB '*[0-9][0-9][A-Z][A-Z][A-Z][A-Z][A-Z][0-9][0-9][0-9][0-9][A-Z][A-Z0-9]Z[A-Z0-9]*'
+    OR upper(replace(replace(replace(replace(replace(
+      COALESCE(json_extract(NEW.metadata_json, '$.reason'), json_extract(NEW.metadata_json, '$.note'), ''),
+      ' ', ''), '-', ''), char(9), ''), char(10), ''), char(13), ''))
+      GLOB '*[LU][0-9][0-9][0-9][0-9][0-9][A-Z][A-Z][0-9][0-9][0-9][0-9][A-Z][A-Z][A-Z][0-9][0-9][0-9][0-9][0-9][0-9]*'
+    OR upper(replace(replace(replace(replace(replace(
+      COALESCE(json_extract(NEW.metadata_json, '$.reason'), json_extract(NEW.metadata_json, '$.note'), ''),
+      ' ', ''), '-', ''), char(9), ''), char(10), ''), char(13), ''))
+      GLOB '*UDYAM[A-Z][A-Z][0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9]*'
+    OR EXISTS (
+      SELECT 1
+      FROM vendor_application_evidence evidence
+      WHERE evidence.vendor_id = NEW.entity_id
+        AND (
+          (
+            evidence.registration_reference IS NOT NULL
+            AND instr(
+              upper(replace(replace(replace(replace(replace(
+                COALESCE(json_extract(NEW.metadata_json, '$.reason'), json_extract(NEW.metadata_json, '$.note'), ''),
+                ' ', ''), '-', ''), char(9), ''), char(10), ''), char(13), '')),
+              upper(replace(evidence.registration_reference, '-', ''))
+            ) != 0
+          )
+          OR EXISTS (
+            SELECT 1 FROM json_each(evidence.portfolio_urls_json) url
+            WHERE instr(
+              lower(replace(replace(replace(replace(
+                COALESCE(json_extract(NEW.metadata_json, '$.reason'), json_extract(NEW.metadata_json, '$.note'), ''),
+                ' ', ''), char(9), ''), char(10), ''), char(13), '')),
+              lower(substr(
+                substr(CAST(url.value AS TEXT), 9),
+                1,
+                instr(substr(CAST(url.value AS TEXT), 9), '/') - 1
+              ))
+            ) != 0
+          )
+          OR EXISTS (
+            SELECT 1 FROM json_each(evidence.reference_urls_json) url
+            WHERE instr(
+              lower(replace(replace(replace(replace(
+                COALESCE(json_extract(NEW.metadata_json, '$.reason'), json_extract(NEW.metadata_json, '$.note'), ''),
+                ' ', ''), char(9), ''), char(10), ''), char(13), '')),
+              lower(substr(
+                substr(CAST(url.value AS TEXT), 9),
+                1,
+                instr(substr(CAST(url.value AS TEXT), 9), '/') - 1
+              ))
+            ) != 0
+          )
+        )
+    )
+  )
+BEGIN
+  SELECT RAISE(ABORT, 'vendor review reasons must not contain evidence addresses or identity references');
+END;
+
+INSERT OR IGNORE INTO _sql_schema_migrations (id) VALUES (9);
+PRAGMA optimize;
+`;
+
+const STORE_SCHEMA_V9_MIGRATION_SQL = `
+ALTER TABLE vendors ADD COLUMN evidence_required INTEGER NOT NULL DEFAULT 1
+  CHECK (evidence_required IN (0, 1));
+UPDATE vendors SET evidence_required = 0 WHERE evidence_required = 1;
+ALTER TABLE vendors ADD COLUMN evidence_reviewed_revision INTEGER NOT NULL DEFAULT 0
+  CHECK (typeof(evidence_reviewed_revision) = 'integer' AND evidence_reviewed_revision >= 0);
+${STORE_SCHEMA_V9_FINALIZE_SQL}
+`;
+
+const STORE_SCHEMA_SQL = `${STORE_SCHEMA_V1_SQL}\n${STORE_SCHEMA_V2_MIGRATION_SQL}\n${STORE_SCHEMA_V3_MIGRATION_SQL}\n${STORE_SCHEMA_V4_MIGRATION_SQL}\n${STORE_SCHEMA_V5_MIGRATION_SQL}\n${STORE_SCHEMA_V6_MIGRATION_SQL}\n${STORE_SCHEMA_V7_MIGRATION_SQL}\n${STORE_SCHEMA_V8_MIGRATION_SQL}\n${STORE_SCHEMA_V9_MIGRATION_SQL}`;
 
 const DEMO_CATALOG_SQL = `
 INSERT OR IGNORE INTO vendors
   (id, slug, business_name, legal_name, status, category, categories_json, city, service_areas_json,
-   description, min_budget, max_budget, currency, rating, review_count, verified)
+   description, min_budget, max_budget, currency, rating, review_count, verified, evidence_required)
 VALUES
   ('demo-venue-udaipur', 'the-lakehouse-udaipur', 'The Lakehouse Udaipur', 'Demo listing',
    'approved', 'venues', '["venues","hospitality"]', 'Udaipur', '["Udaipur","Jaipur"]',
-   'Development-only demonstration listing. Not a real or verified business.', 1200000, 4500000, 'INR', 0, 0, 0),
+   'Development-only demonstration listing. Not a real or verified business.', 1200000, 4500000, 'INR', 0, 0, 0, 0),
   ('demo-photo-delhi', 'moonlit-stories', 'Moonlit Stories', 'Demo listing',
    'approved', 'photography', '["photography","cinematography"]', 'Delhi NCR', '["Delhi NCR","Jaipur","Goa"]',
-   'Development-only demonstration listing. Not a real or verified business.', 250000, 750000, 'INR', 0, 0, 0);
+   'Development-only demonstration listing. Not a real or verified business.', 250000, 750000, 'INR', 0, 0, 0, 0);
 `;
 
 function jsonResponse(body, status = 200) {
@@ -740,6 +1102,59 @@ function executeSql(sqlStorage, statement) {
   return { success: true, results: rows, meta };
 }
 
+const VENDOR_EVIDENCE_TRIGGER_NAMES = Object.freeze([
+  "vendor_application_evidence_validate_insert",
+  "vendor_application_evidence_vendor_state_insert",
+  "vendor_application_evidence_immutable_update",
+  "vendor_application_evidence_immutable_delete",
+  "vendors_evidence_approval_guard",
+  "audit_events_vendor_review_sensitive_insert",
+]);
+
+function runStorageTransaction(storage, callback) {
+  return typeof storage.transactionSync === "function" ? storage.transactionSync(callback) : callback();
+}
+
+function assertVendorEvidenceSchemaReady(sqlStorage) {
+  const migration = sqlStorage
+    .exec("SELECT id FROM _sql_schema_migrations WHERE id = 9 LIMIT 1")
+    .toArray()[0];
+  const vendorColumns = new Set(sqlStorage.exec("PRAGMA table_info(vendors)").toArray().map((column) => column.name));
+  const evidenceColumns = new Set(
+    sqlStorage.exec("PRAGMA table_info(vendor_application_evidence)").toArray().map((column) => column.name),
+  );
+  const triggers = new Map(
+    sqlStorage
+      .exec(
+        `SELECT name, sql FROM sqlite_master
+         WHERE type = 'trigger' AND name IN (${VENDOR_EVIDENCE_TRIGGER_NAMES.map(() => "?").join(", ")})`,
+        ...VENDOR_EVIDENCE_TRIGGER_NAMES,
+      )
+      .toArray()
+      .map((trigger) => [trigger.name, String(trigger.sql || "")]),
+  );
+  const approvalGuard = triggers.get("vendors_evidence_approval_guard") || "";
+  const stateGuard = triggers.get("vendor_application_evidence_vendor_state_insert") || "";
+  const ready = Boolean(migration)
+    && vendorColumns.has("evidence_required")
+    && vendorColumns.has("evidence_reviewed_revision")
+    && [
+      "vendor_id",
+      "evidence_revision",
+      "portfolio_urls_json",
+      "reference_urls_json",
+      "registration_type",
+      "registration_reference",
+      "attested",
+      "attested_at",
+    ].every((column) => evidenceColumns.has(column))
+    && VENDOR_EVIDENCE_TRIGGER_NAMES.every((name) => triggers.has(name))
+    && approvalGuard.includes("NEW.evidence_required = 1")
+    && approvalGuard.includes("evidence.evidence_revision != NEW.evidence_reviewed_revision")
+    && stateGuard.includes("vendor.status IN ('pending', 'rejected')");
+  if (!ready) throw new Error("vendor evidence schema v9 is incomplete");
+}
+
 export class MelaivaStore {
   constructor(ctx, env) {
     this.ctx = ctx;
@@ -757,7 +1172,10 @@ export class MelaivaStore {
         .toArray()[0] || {};
       const version = Number(versionRow.version || 0);
       if (version === 0) {
-        this.sql.exec(STORE_SCHEMA_SQL).toArray();
+        runStorageTransaction(ctx.storage, () => {
+          this.sql.exec(STORE_SCHEMA_SQL).toArray();
+          assertVendorEvidenceSchemaReady(this.sql);
+        });
       } else if (version < 2) {
         const idempotencyColumns = this.sql.exec("PRAGMA table_info(idempotency_keys)").toArray();
         if (!idempotencyColumns.some((column) => column.name === "request_hash")) {
@@ -799,6 +1217,53 @@ export class MelaivaStore {
             .toArray();
         }
         this.sql.exec(STORE_SCHEMA_V8_FINALIZE_SQL).toArray();
+      }
+      if (version > 0 && version < 9) {
+        runStorageTransaction(ctx.storage, () => {
+          const vendorColumns = this.sql.exec("PRAGMA table_info(vendors)").toArray();
+          if (!vendorColumns.some((column) => column.name === "evidence_required")) {
+            this.sql
+              .exec(
+                `ALTER TABLE vendors ADD COLUMN evidence_required INTEGER NOT NULL DEFAULT 1
+                   CHECK (evidence_required IN (0, 1))`,
+              )
+              .toArray();
+          }
+          this.sql.exec("UPDATE vendors SET evidence_required = 0 WHERE evidence_required = 1").toArray();
+          if (!vendorColumns.some((column) => column.name === "evidence_reviewed_revision")) {
+            this.sql
+              .exec(
+                `ALTER TABLE vendors ADD COLUMN evidence_reviewed_revision INTEGER NOT NULL DEFAULT 0
+                   CHECK (typeof(evidence_reviewed_revision) = 'integer' AND evidence_reviewed_revision >= 0)`,
+              )
+              .toArray();
+          }
+          this.sql.exec(STORE_SCHEMA_V9_FINALIZE_SQL).toArray();
+          assertVendorEvidenceSchemaReady(this.sql);
+        });
+      }
+      if (version === 9) {
+        runStorageTransaction(ctx.storage, () => {
+          const vendorColumns = this.sql.exec("PRAGMA table_info(vendors)").toArray();
+          if (!vendorColumns.some((column) => column.name === "evidence_required")) {
+            this.sql
+              .exec(
+                `ALTER TABLE vendors ADD COLUMN evidence_required INTEGER NOT NULL DEFAULT 1
+                   CHECK (evidence_required IN (0, 1))`,
+              )
+              .toArray();
+          }
+          if (!vendorColumns.some((column) => column.name === "evidence_reviewed_revision")) {
+            this.sql
+              .exec(
+                `ALTER TABLE vendors ADD COLUMN evidence_reviewed_revision INTEGER NOT NULL DEFAULT 0
+                   CHECK (typeof(evidence_reviewed_revision) = 'integer' AND evidence_reviewed_revision >= 0)`,
+              )
+              .toArray();
+          }
+          this.sql.exec(STORE_SCHEMA_V9_FINALIZE_SQL).toArray();
+          assertVendorEvidenceSchemaReady(this.sql);
+        });
       }
       if (env?.ENABLE_DEMO_CATALOG === "true" && env?.ENVIRONMENT !== "production") {
         this.sql.exec(DEMO_CATALOG_SQL).toArray();
@@ -849,11 +1314,16 @@ export class MelaivaStore {
       }
       return jsonResponse({ error: "unsupported_operation" }, 400);
     } catch (error) {
-      const code = /unique constraint failed|SQLITE_CONSTRAINT_(?:UNIQUE|PRIMARYKEY)/i.test(
-        String(error?.message || error),
-      )
+      const message = String(error?.message || error);
+      const code = /unique constraint failed|SQLITE_CONSTRAINT_(?:UNIQUE|PRIMARYKEY)/i.test(message)
         ? "unique_constraint"
-        : "storage_error";
+        : /vendor application evidence requires a pending or rejected vendor/i.test(message)
+          ? "vendor_evidence_state_conflict"
+          : /vendor evidence must be completed and acknowledged before approval/i.test(message)
+            ? "vendor_evidence_approval_conflict"
+            : /vendor review reasons must not contain evidence addresses or identity references/i.test(message)
+              ? "vendor_review_sensitive_content"
+              : "storage_error";
       return jsonResponse({ error: "storage_error", code }, 409);
     }
   }
@@ -940,6 +1410,8 @@ export {
   STORE_SCHEMA_V7_MIGRATION_SQL,
   STORE_SCHEMA_V8_FINALIZE_SQL,
   STORE_SCHEMA_V8_MIGRATION_SQL,
+  STORE_SCHEMA_V9_FINALIZE_SQL,
+  STORE_SCHEMA_V9_MIGRATION_SQL,
   STORE_SCHEMA_VERSION,
   executeSql,
 };

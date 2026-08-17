@@ -113,7 +113,7 @@ const faqs = [
   },
   {
     question: "How do you verify vendors?",
-    answer: "We review business identity, portfolio evidence, references and service standards. Verification is renewed, and couple feedback informs continued eligibility.",
+    answer: "Marketplace approval records a human review of submitted business disclosures, public work samples and public review or reference links, plus any alternate checks staff document. It is not KYC, legal certification or a guarantee of performance.",
   },
   {
     question: "Can I use Melaiva for just one service?",
@@ -285,8 +285,8 @@ export function HomePage({ notify }) {
         <div className="shell">
           <div className="proof-intro"><div className="eyebrow">Trust is a product decision</div><h2>Signals you can inspect, not claims you have to accept.</h2><p>Melaiva is being built around a clear review standard. When evidence is not available, the interface says so.</p></div>
           <div className="proof-stats">
-            <div><strong>Identity review</strong><span>Business and contact details checked before a verification badge appears.</span></div>
-            <div><strong>Portfolio evidence</strong><span>Work samples and service claims reviewed for category relevance.</span></div>
+            <div><strong>Business review</strong><span>Registration disclosures and account details reviewed before marketplace approval.</span></div>
+            <div><strong>Public evidence</strong><span>Submitted work samples and public references reviewed for service fit.</span></div>
             <div><strong>Written scope</strong><span>Offers separate inclusions, exclusions, terms and total price.</span></div>
             <div><strong>Private by default</strong><span>Direct contact stays protected until there is mutual interest.</span></div>
           </div>

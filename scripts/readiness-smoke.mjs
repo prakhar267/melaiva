@@ -25,6 +25,12 @@ if (health?.data?.status !== "ok" || health?.data?.database !== "ok" || health?.
   throw new Error("Health response did not report all required services as healthy.");
 }
 
+const authConfigResponse = await request("/api/v1/auth/config");
+const authConfig = JSON.parse(authConfigResponse.body);
+if (authConfig?.data?.vendorApplicationEvidenceRevision !== 1) {
+  throw new Error("Vendor application evidence capability is unavailable or at the wrong revision.");
+}
+
 const catalogResponse = await request("/api/v1/catalog/vendors?limit=1");
 const catalog = JSON.parse(catalogResponse.body);
 if (!Array.isArray(catalog?.data) || catalog?.meta?.source !== "database") {
@@ -36,12 +42,18 @@ if (!home.response.headers.get("content-type")?.includes("text/html") || !home.b
   throw new Error("Home page did not return the production application shell.");
 }
 
+const vendorOnboarding = await request("/vendor/onboarding", { accept: "text/html" });
+if (!vendorOnboarding.response.headers.get("content-type")?.includes("text/html") || !vendorOnboarding.body.includes("id=\"root\"")) {
+  throw new Error("Vendor onboarding did not return the production application shell.");
+}
+
 console.log(JSON.stringify({
   origin: baseUrl,
   version: health.data.version,
   services: {
     database: health.data.database,
     authentication: health.data.authentication,
+    vendorApplicationEvidence: "revision-1",
     catalog: "ok",
     applicationShell: "ok",
   },

@@ -30,6 +30,8 @@ This shape is intentional for the free launch tier: it preserves relational cons
 - Message writes require idempotency, validate bounded plain text, atomically allocate the next per-booking stream position, recheck current participant and vendor approval state, and record only the message and booking identifiers—not message bodies—in audit metadata. During rolling deploys or rollback, schema v6 also assigns a position inside SQLite when an older Worker omits the new column.
 - Schema v7 keeps one private, monotonic exact-message cursor per booking participant. Existing threads baseline at the current stream head; an additive booking trigger creates empty participant cursors for awards written by v6 during a rollout or rollback. Unread totals range over the indexed stream and count only messages sent by someone other than the current participant. A participant can acknowledge only a message in their own thread, stale acknowledgements cannot move backward, administrators have no cursor, and no API exposes the counterparty's state. A paged summary endpoint returns only booking IDs, audience roles, indexed message counts, and optional local unread counts for inexpensive background refresh.
 - Schema v8 adds a monotonic vendor-review revision maintained by SQLite whenever any Worker version changes a vendor status. Operator decisions require a bounded rationale and idempotency key, follow a fixed transition graph, compare the expected status/revision, recheck the active admin role inside the conditional write, and append the decision audit in the same transaction. Audit facts cannot be changed or deleted; only an actor reference may be nulled during legitimate user anonymization. Older Workers remain compatible because the database trigger advances the revision even when their update statement does not know the new column.
+- Schema v9 stores one immutable evidence revision per vendor application: one to five canonical public portfolio URLs, one to three distinct public review/reference URLs, a narrow GSTIN/CIN/Udyam registration disclosure or an explicit `not_registered` declaration, and a server-time applicant attestation. URLs are never fetched or embedded by the service. List reads expose counts/type only; full evidence is retrieved only for one selected admin record and is never copied into audit metadata.
+- Evidence-backed approval requires the operator to acknowledge the exact evidence revision. SQLite records the reviewed revision in the same conditional transaction and blocks any pending/suspended-to-approved change whose evidence revision is newer, so a rolled-back schema-v8 Worker fails closed instead of approving unseen evidence. Evidence-less legacy applications remain operable and visibly distinct, and pending/rejected owners can attach their first evidence snapshot through a dedicated completion endpoint.
 - Auction creation and bid acceptance require/replay an `Idempotency-Key` result.
 - A preferred vendor is attached only when the vendor remains approved and matches the brief's category and city at the atomic create boundary. Other matched vendors cannot see that preference.
 - Suspending or rejecting a vendor withdraws open proposals and makes unanswered direct invitations unavailable; award selection rechecks current vendor approval.
@@ -46,14 +48,14 @@ This shape is intentional for the free launch tier: it preserves relational cons
 - Requests: private structured briefs, optional explicit preferred-partner invitations, and date-bounded auctions.
 - Offers: vendor bids and customer shortlist/reject/accept decisions.
 - Awards: immutable accepted-scope handoffs plus private text coordination for the couple and winning vendor; attachments, contracts, signatures, invoices, notifications, and payments are deliberately out of scope.
-- Partners: vendor onboarding plus a private, paginated operator queue for reasoned approval, rejection, suspension, restoration, and immutable review history. Marketplace approval is an operating decision, not KYC or a performance guarantee.
+- Partners: evidence-backed vendor onboarding plus a private, paginated operator queue for reasoned approval, rejection, suspension, restoration, and immutable review history. Marketplace approval is an operating decision, not KYC, business-registration verification, or a performance guarantee.
 - Reliability: rate limits, quotas, idempotency, fail-closed health checks, cleanup alarm, request IDs, safe telemetry.
 
 ## API boundaries
 
 - `/health` and `/api/v1/health`
 - `/api/v1/auth/*`
-- `/api/v1/vendors` and `/api/v1/vendors/onboarding`
+- `/api/v1/vendors`, `/api/v1/vendors/onboarding`, and `/api/v1/vendors/onboarding/evidence`
 - `/api/v1/auctions`, `/api/v1/auctions/:id/status`, `/api/v1/auctions/:id/bids`, `/api/v1/auctions/:id/award`, `/api/v1/bookings`, `/api/v1/bookings/message-summary`, `/api/v1/bookings/:id/messages`, and `/api/v1/bookings/:id/messages/read`
 - `/api/v1/ai/plan`
 - `/api/v1/admin/vendors`, `/api/v1/admin/vendors/:id`, and `/api/v1/admin/vendors/:id/reviews`
@@ -103,5 +105,5 @@ Use an external synthetic monitor for `/health` because a Worker cannot reliably
 - CI gates frozen installs, frontend build, SPA fallback tests, syntax checks, SQLite integration/security tests, and a Wrangler bundle dry run. The protected default branch also requires CodeQL security analysis.
 - Production deployment remains a manual authenticated Wrangler release until least-privilege Cloudflare credentials are installed in the protected GitHub environment; the checked-in workflow cannot deploy without them.
 - Staging targets the separate `melaiva-staging` Worker and Durable Object namespace with production-strength runtime posture but AI, demo data, and Turnstile disabled until their integrations are ready.
-- `wrangler deploy` provisions the Durable Object class via Cloudflare migration `v1`; the class then applies its resumable internal SQLite schema migrations through schema version 8.
+- `wrangler deploy` provisions the Durable Object class via Cloudflare migration `v1`; the class then applies its resumable internal SQLite schema migrations through schema version 9.
 - Free-plan limits are capacity limits, not an enterprise SLA. A custom domain, production support, transactional email, payments, legal/KYC, and model usage need explicit operating budgets and vendor contracts.

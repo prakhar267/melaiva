@@ -12,6 +12,8 @@ import {
   FileCheck2,
   History,
   IndianRupee,
+  Landmark,
+  Link2,
   LoaderCircle,
   LockKeyhole,
   Mail,
@@ -31,13 +33,23 @@ import { categories, formatCurrency } from "../data.js";
 import {
   ADMIN_VENDOR_STATUSES,
   adjustAdminStatusCounts,
+  adminVendorDecisionAcknowledgement,
+  adminVendorEvidenceState,
+  adminVendorEvidenceSummaryLabel,
   adminVendorActions,
   adminVendorStatusConfig,
   adminVendorStatusLabel,
+  isAdminVendorActionAllowed,
   normalizeAdminStatusCounts,
+  normalizeAdminVendorSummary,
   normalizeAdminVendorStatus,
   validateAdminReviewReason,
 } from "../components/adminVendors.js";
+import {
+  ADMIN_VENDOR_SUMMARY_HEADERS,
+  checkVendorApplicationEvidenceCompatibility,
+  supportsAdminVendorSummaryContract,
+} from "../components/vendorApplicationCompatibility.js";
 import { parsePublicWebsiteUrl } from "../security/publicWebsiteUrl.js";
 
 function categoryLabel(value) {
@@ -57,16 +69,50 @@ function formatDate(value, withTime = false) {
   });
 }
 
-function normalizeVendor(vendor) {
+function normalizeVendorDetail(vendor) {
   const revisionValue = vendor?.revision ?? vendor?.reviewRevision;
-  const revision = Number(revisionValue);
+  const revision = revisionValue === null || revisionValue === undefined ? Number.NaN : Number(revisionValue);
+  const evidenceRevision = Number(vendor?.evidenceSummary?.revision);
+  const evidenceSummary = vendor?.evidenceSummary && Number.isInteger(evidenceRevision) && evidenceRevision >= 1
+    ? {
+        revision: evidenceRevision,
+        portfolioUrlCount: Math.max(0, Number(vendor.evidenceSummary.portfolioUrlCount) || 0),
+        referenceUrlCount: Math.max(0, Number(vendor.evidenceSummary.referenceUrlCount) || 0),
+        registrationType: vendor.evidenceSummary.registrationType || null,
+        declarationOnly: Boolean(vendor.evidenceSummary.declarationOnly),
+      }
+    : null;
+  const detailEvidenceRevision = Number(vendor?.evidence?.revision);
+  const evidence = vendor?.evidence && Number.isInteger(detailEvidenceRevision) && detailEvidenceRevision >= 1
+    ? {
+        revision: detailEvidenceRevision,
+        portfolioUrls: Array.isArray(vendor.evidence.portfolioUrls) ? vendor.evidence.portfolioUrls : [],
+        referenceUrls: Array.isArray(vendor.evidence.referenceUrls) ? vendor.evidence.referenceUrls : [],
+        registrationType: vendor.evidence.registrationType || null,
+        registrationReference: vendor.evidence.registrationReference || null,
+        attested: vendor.evidence.attested === true,
+        attestedAt: vendor.evidence.attestedAt || null,
+      }
+    : null;
   return {
     ...vendor,
     categories: Array.isArray(vendor?.categories) ? vendor.categories : [],
     serviceAreas: Array.isArray(vendor?.serviceAreas) ? vendor.serviceAreas : [],
     owner: vendor?.owner || null,
     revision: Number.isInteger(revision) && revision >= 0 ? revision : null,
+    evidenceRequired: vendor?.evidenceRequired === false ? false : true,
+    evidenceSummary,
+    evidence,
   };
+}
+
+function registrationLabel(type) {
+  return {
+    gstin: "GSTIN",
+    cin: "Corporate identity number (CIN)",
+    udyam: "Udyam registration",
+    not_registered: "No formal business registration declared",
+  }[type] || "Not provided";
 }
 
 function normalizeReview(review) {
@@ -157,7 +203,7 @@ function DecisionDialog({ decision, busy, error, onClose, onSubmit }) {
 
   function submit(event) {
     event.preventDefault();
-    const nextError = validateAdminReviewReason(reason);
+    const nextError = validateAdminReviewReason(reason, decision.vendor);
     setValidationError(nextError);
     if (nextError || !acknowledged) return;
     dialogRef.current?.focus();
@@ -188,6 +234,7 @@ function DecisionDialog({ decision, busy, error, onClose, onSubmit }) {
         <dl className="admin-decision-dialog__summary">
           <div><dt>Business</dt><dd>{decision.vendor.businessName}</dd></div>
           <div><dt>Status change</dt><dd>{adminVendorStatusLabel(decision.vendor.status)} → {adminVendorStatusLabel(decision.action.targetStatus)}</dd></div>
+          {decision.vendor.evidence && <div><dt>Evidence snapshot</dt><dd>Revision {decision.vendor.evidence.revision} · {decision.vendor.evidence.portfolioUrls.length + decision.vendor.evidence.referenceUrls.length} submitted link{decision.vendor.evidence.portfolioUrls.length + decision.vendor.evidence.referenceUrls.length === 1 ? "" : "s"}</dd></div>}
         </dl>
         <label className="field admin-decision-dialog__reason">
           <span>Internal review reason</span>
@@ -211,7 +258,7 @@ function DecisionDialog({ decision, busy, error, onClose, onSubmit }) {
         <label className="admin-decision-dialog__acknowledgement">
           <input type="checkbox" checked={acknowledged} onChange={(event) => setAcknowledged(event.target.checked)} disabled={busy} />
           <span><Check size={14} /></span>
-          <strong>{decision.action.acknowledgement}</strong>
+          <strong>{adminVendorDecisionAcknowledgement(decision.action, decision.vendor)}</strong>
         </label>
         {error && <p className="form-error admin-decision-dialog__error" role="alert">{error}</p>}
         <div className="admin-decision-dialog__actions">
@@ -265,8 +312,14 @@ function ReviewHistory({ reviews, truncated, loading, error, onRetry }) {
 function VendorDetail({ vendor, history, historyTruncated, historyLoading, historyError, onRetryHistory, onDecision }) {
   const actions = adminVendorActions(vendor.status);
   const revisionReady = Number.isInteger(vendor.revision);
+  const evidenceState = adminVendorEvidenceState(vendor);
+  const evidenceBlocksApproval = evidenceState === "required";
   const instagramHandle = String(vendor.instagramHandle || "").replace(/^@/, "");
   const website = parsePublicWebsiteUrl(vendor.websiteUrl);
+  const portfolioLinks = (vendor.evidence?.portfolioUrls || []).map(parsePublicWebsiteUrl).filter(Boolean);
+  const referenceLinks = (vendor.evidence?.referenceUrls || []).map(parsePublicWebsiteUrl).filter(Boolean);
+  const evidenceLinkCount = (vendor.evidence?.portfolioUrls?.length || 0) + (vendor.evidence?.referenceUrls?.length || 0);
+  const safeEvidenceLinkCount = portfolioLinks.length + referenceLinks.length;
   return (
     <article className="admin-vendor-detail" id="admin-vendor-detail" aria-labelledby={`admin-vendor-${vendor.id}`}>
       <header className="admin-vendor-detail__header">
@@ -278,6 +331,8 @@ function VendorDetail({ vendor, history, historyTruncated, historyLoading, histo
       </header>
 
       {!revisionReady && <div className="admin-detail-warning" role="alert"><CircleAlert size={18} /><p><strong>This application cannot be changed safely.</strong><span>The server did not return a review revision. Refresh before making a decision.</span></p></div>}
+      {!vendor.evidence && evidenceState === "required" && <div className="admin-detail-warning" id="admin-evidence-required-warning" role="alert"><CircleAlert size={18} /><p><strong>Structured evidence is still required</strong><span>This application cannot be approved until the partner submits the required public work, reference and business evidence.</span></p></div>}
+      {!vendor.evidence && evidenceState === "legacy" && <div className="admin-detail-warning admin-detail-warning--legacy" role="note"><CircleAlert size={18} /><p><strong>Legacy application without structured evidence</strong><span>This record predates evidence capture. Complete and document suitable work, reference and business checks before any approval; do not treat the missing snapshot as reviewed.</span></p></div>}
 
       <div className="admin-detail-grid">
         <section className="admin-detail-section">
@@ -313,25 +368,49 @@ function VendorDetail({ vendor, history, historyTruncated, historyLoading, histo
         </section>
 
         <section className="admin-detail-section admin-detail-section--wide">
-          <div className="admin-detail-section__heading"><span><FileCheck2 size={18} /></span><div><h3>Approach and evidence links</h3><p>Review claims against independent evidence before approval.</p></div></div>
+          <div className="admin-detail-section__heading"><span><Building2 size={18} /></span><div><h3>Business introduction and public profiles</h3><p>Applicant-written context and optional public business profiles.</p></div></div>
           <p className="admin-vendor-description">{vendor.description || "No description was provided."}</p>
           <div className="admin-evidence-links">
-            {website && <a className="button button--small button--outline" href={website.href} target="_blank" rel="noopener noreferrer">Open {website.hostname} <ExternalLink size={14} /></a>}
-            {instagramHandle && <a className="button button--small button--outline" href={`https://www.instagram.com/${instagramHandle}/`} target="_blank" rel="noopener noreferrer">Open Instagram <ExternalLink size={14} /></a>}
+            {website && <a className="button button--small button--outline" href={website.href} target="_blank" rel="noopener noreferrer" referrerPolicy="no-referrer">Open {website.hostname} <ExternalLink size={14} /></a>}
+            {instagramHandle && <a className="button button--small button--outline" href={`https://www.instagram.com/${instagramHandle}/`} target="_blank" rel="noopener noreferrer" referrerPolicy="no-referrer">Open Instagram <ExternalLink size={14} /></a>}
             {vendor.websiteUrl && !website && <span className="admin-evidence-link-blocked"><ShieldAlert size={15} /> Website link blocked because it is not a public HTTPS destination.</span>}
-            {!vendor.websiteUrl && !instagramHandle && <span>No evidence links were submitted.</span>}
+            {!vendor.websiteUrl && !instagramHandle && <span>No optional public profiles were submitted.</span>}
           </div>
+        </section>
+
+        <section className="admin-detail-section admin-detail-section--wide">
+          <div className="admin-detail-section__heading"><span><FileCheck2 size={18} /></span><div><h3>Submitted review evidence</h3><p>Untrusted applicant-supplied links and business-registration disclosure. Submitted does not mean verified.</p></div></div>
+          {vendor.evidence ? (
+            <div className="admin-application-evidence">
+              <dl className="admin-detail-list admin-application-evidence__summary">
+                <div><dt>Evidence snapshot</dt><dd>Revision {vendor.evidence.revision}</dd></div>
+                <div><dt>Applicant attestation</dt><dd>{vendor.evidence.attested ? `Recorded ${formatDate(vendor.evidence.attestedAt, true)}` : "Not recorded"}</dd></div>
+                <div><dt>Business registration</dt><dd>{registrationLabel(vendor.evidence.registrationType)}</dd></div>
+                <div><dt>Submitted reference</dt><dd>{vendor.evidence.registrationReference || "Declaration only"}</dd></div>
+              </dl>
+              {vendor.evidence.registrationType === "not_registered" && <div className="admin-evidence-declaration"><Landmark size={17} /><p><strong>Declaration only</strong><span>No government business-registration reference was submitted. Complete appropriate alternate business and identity checks before approval.</span></p></div>}
+              <div className="admin-evidence-groups">
+                <section><h4><Link2 size={15} /> Portfolio or work samples <small>{portfolioLinks.length}</small></h4><div>{portfolioLinks.map((link, index) => <a className="button button--small button--outline" href={link.href} target="_blank" rel="noopener noreferrer" referrerPolicy="no-referrer" key={`portfolio-${link.href}`}>Work sample {index + 1} · {link.hostname} <ExternalLink size={13} /></a>)}</div></section>
+                <section><h4><Link2 size={15} /> Public review or reference links <small>{referenceLinks.length}</small></h4><div>{referenceLinks.map((link, index) => <a className="button button--small button--outline" href={link.href} target="_blank" rel="noopener noreferrer" referrerPolicy="no-referrer" key={`reference-${link.href}`}>Reference {index + 1} · {link.hostname} <ExternalLink size={13} /></a>)}</div></section>
+              </div>
+              {safeEvidenceLinkCount !== evidenceLinkCount && <div className="admin-evidence-link-blocked"><ShieldAlert size={15} /> {evidenceLinkCount - safeEvidenceLinkCount} submitted link{evidenceLinkCount - safeEvidenceLinkCount === 1 ? " was" : "s were"} blocked because the destination is not safe to open.</div>}
+              <div className="admin-evidence-external-warning"><ShieldAlert size={16} /><span>These external destinations are controlled by the applicant or another site. Check the hostname before opening and never enter Melaiva credentials there.</span></div>
+            </div>
+          ) : evidenceState === "legacy"
+            ? <div className="admin-history-state"><CircleAlert size={18} /> No structured evidence snapshot is attached to this legacy application.</div>
+            : <div className="admin-history-state admin-history-state--error"><CircleAlert size={18} /> Required structured evidence has not been submitted. Approval remains unavailable.</div>}
         </section>
       </div>
 
       <ReviewHistory reviews={history} truncated={historyTruncated} loading={historyLoading} error={historyError} onRetry={onRetryHistory} />
 
       <section className="admin-decision-panel" aria-labelledby="admin-decision-panel-heading">
-        <div><div className="eyebrow">Current review decision</div><h3 id="admin-decision-panel-heading">Choose the next accountable state.</h3><p>Every decision requires a reason and is checked against the application revision you reviewed.</p></div>
+        <div><div className="eyebrow">Current review decision</div><h3 id="admin-decision-panel-heading">Choose the next accountable state.</h3><p>Every decision requires a reason and is checked against the application revision you reviewed.</p>{evidenceBlocksApproval && <p className="admin-decision-panel__blocked" id="admin-evidence-approval-blocked"><CircleAlert size={14} /> Approval is unavailable until structured evidence is submitted.</p>}</div>
         <div className="admin-decision-panel__actions">
           {actions.map((action) => {
             const ActionIcon = action.tone === "danger" ? Ban : action.tone === "neutral" ? RotateCcw : ShieldCheck;
-            return <button key={action.id} className={`button ${action.tone === "danger" ? "admin-button--danger" : action.tone === "neutral" ? "button--outline" : "button--primary"}`} type="button" disabled={!revisionReady} onClick={() => onDecision(action)}><ActionIcon size={16} /> {action.label}</button>;
+            const actionAllowed = isAdminVendorActionAllowed(action, vendor);
+            return <button key={action.id} className={`button ${action.tone === "danger" ? "admin-button--danger" : action.tone === "neutral" ? "button--outline" : "button--primary"}`} type="button" disabled={!revisionReady || !actionAllowed} aria-describedby={!actionAllowed ? "admin-evidence-approval-blocked" : undefined} onClick={() => onDecision(action)}><ActionIcon size={16} /> {action.label}</button>;
           })}
         </div>
       </section>
@@ -346,6 +425,7 @@ export function AdminVendorsPage({ notify, onOpenAuth, authRevision = 0 }) {
   const statusConfig = adminVendorStatusConfig(status);
   const [access, setAccess] = useState("checking");
   const [accessError, setAccessError] = useState("");
+  const [accessRetryKey, setAccessRetryKey] = useState(0);
   const [adminUser, setAdminUser] = useState(null);
   const [vendors, setVendors] = useState([]);
   const [statusCounts, setStatusCounts] = useState(() => normalizeAdminStatusCounts());
@@ -357,6 +437,10 @@ export function AdminVendorsPage({ notify, onOpenAuth, authRevision = 0 }) {
   const [refreshKey, setRefreshKey] = useState(0);
   const [query, setQuery] = useState("");
   const [selectedId, setSelectedId] = useState(null);
+  const [detailVendor, setDetailVendor] = useState(null);
+  const [detailLoading, setDetailLoading] = useState(false);
+  const [detailError, setDetailError] = useState("");
+  const [detailRefreshKey, setDetailRefreshKey] = useState(0);
   const [history, setHistory] = useState([]);
   const [historyTruncated, setHistoryTruncated] = useState(false);
   const [historyLoading, setHistoryLoading] = useState(false);
@@ -375,6 +459,8 @@ export function AdminVendorsPage({ notify, onOpenAuth, authRevision = 0 }) {
   const clearPrivateState = useCallback(() => {
     setVendors([]);
     setSelectedId(null);
+    setDetailVendor(null);
+    setDetailError("");
     setHistory([]);
     setHistoryTruncated(false);
     setDecision(null);
@@ -406,6 +492,11 @@ export function AdminVendorsPage({ notify, onOpenAuth, authRevision = 0 }) {
     setAccess("checking"); setAccessError(""); clearPrivateState();
     async function checkAccess() {
       try {
+        const compatible = await checkVendorApplicationEvidenceCompatibility({ signal: controller.signal });
+        if (controller.signal.aborted) return;
+        if (!compatible) {
+          setAdminUser(null); setAccess("upgrade"); return;
+        }
         const response = await fetch("/api/v1/auth/me", { credentials: "include", signal: controller.signal });
         const payload = await readApiResponse(response, "Administrator access could not be checked.");
         if (controller.signal.aborted) return;
@@ -417,26 +508,34 @@ export function AdminVendorsPage({ notify, onOpenAuth, authRevision = 0 }) {
         if (error?.name === "AbortError" || controller.signal.aborted) return;
         if (Number(error?.status) === 401) setAccess("guest");
         else if (Number(error?.status) === 403) setAccess("forbidden");
-        else { setAccessError(error.message || "Administrator access could not be checked."); setAccess("error"); }
+        else { setAccessError(error.message || "Secure staff-tool compatibility could not be checked."); setAccess("error"); }
       }
     }
     checkAccess();
     return () => controller.abort();
-  }, [authRevision, clearPrivateState]);
+  }, [accessRetryKey, authRevision, clearPrivateState]);
 
   useEffect(() => {
     if (access !== "ready") return undefined;
     loadMoreControllerRef.current?.abort();
     loadMoreControllerRef.current = null;
     const controller = new AbortController();
-    setLoadingMore(false); setQueueLoading(true); setQueueError(""); setVendors([]); setSelectedId(null); setHistory([]); setHistoryTruncated(false); setDecision(null); setDecisionError(""); setQuery(""); setNextCursor(null); setTotal(0);
+    setLoadingMore(false); setQueueLoading(true); setQueueError(""); setVendors([]); setSelectedId(null); setDetailVendor(null); setDetailError(""); setHistory([]); setHistoryTruncated(false); setDecision(null); setDecisionError(""); setQuery(""); setNextCursor(null); setTotal(0);
     async function loadQueue() {
       try {
+        const compatible = await checkVendorApplicationEvidenceCompatibility({ signal: controller.signal });
+        if (controller.signal.aborted) return;
+        if (!compatible) {
+          clearPrivateState(); setAdminUser(null); setAccess("upgrade"); return;
+        }
         const params = new URLSearchParams({ status, limit: "50" });
-        const response = await fetch(`/api/v1/admin/vendors?${params}`, { credentials: "include", signal: controller.signal });
+        const response = await fetch(`/api/v1/admin/vendors?${params}`, { credentials: "include", headers: ADMIN_VENDOR_SUMMARY_HEADERS, signal: controller.signal });
         const payload = await readApiResponse(response, "Vendor applications could not be loaded.");
         if (controller.signal.aborted) return;
-        const data = Array.isArray(payload.data) ? payload.data.map(normalizeVendor) : [];
+        if (!supportsAdminVendorSummaryContract(payload, response.headers.get("x-melaiva-admin-vendor-summary"))) {
+          clearPrivateState(); setAdminUser(null); setAccess("upgrade"); return;
+        }
+        const data = Array.isArray(payload.data) ? payload.data.map(normalizeAdminVendorSummary) : [];
         setVendors(data);
         setStatusCounts(normalizeAdminStatusCounts(payload.meta?.statusCounts));
         setTotal(Number.isInteger(Number(payload.meta?.total)) ? Number(payload.meta.total) : data.length);
@@ -450,9 +549,32 @@ export function AdminVendorsPage({ notify, onOpenAuth, authRevision = 0 }) {
     }
     loadQueue();
     return () => controller.abort();
-  }, [access, applyAccessError, refreshKey, status]);
+  }, [access, applyAccessError, clearPrivateState, refreshKey, status]);
 
-  const selectedVendor = vendors.find((vendor) => vendor.id === selectedId) || null;
+  const selectedSummary = vendors.find((vendor) => vendor.id === selectedId) || null;
+  const selectedVendor = detailVendor?.id === selectedId ? detailVendor : null;
+
+  useEffect(() => {
+    if (access !== "ready" || !selectedId) {
+      setDetailVendor(null); setDetailError(""); setDetailLoading(false); return undefined;
+    }
+    const controller = new AbortController();
+    setDetailVendor(null); setDetailLoading(true); setDetailError("");
+    async function loadDetail() {
+      try {
+        const response = await fetch(`/api/v1/admin/vendors/${encodeURIComponent(selectedId)}`, { credentials: "include", signal: controller.signal });
+        const payload = await readApiResponse(response, "Application detail could not be loaded.");
+        if (!controller.signal.aborted && payload.data?.id === selectedId) setDetailVendor(normalizeVendorDetail(payload.data));
+      } catch (error) {
+        if (error?.name === "AbortError" || controller.signal.aborted) return;
+        if (!applyAccessError(error)) setDetailError(error.message || "Application detail could not be loaded.");
+      } finally {
+        if (!controller.signal.aborted) setDetailLoading(false);
+      }
+    }
+    loadDetail();
+    return () => controller.abort();
+  }, [access, applyAccessError, detailRefreshKey, selectedId]);
 
   useEffect(() => {
     if (access !== "ready" || !selectedId) {
@@ -482,7 +604,7 @@ export function AdminVendorsPage({ notify, onOpenAuth, authRevision = 0 }) {
   const visibleVendors = useMemo(() => {
     const normalizedQuery = query.trim().toLowerCase();
     if (!normalizedQuery) return vendors;
-    return vendors.filter((vendor) => [vendor.businessName, vendor.legalName, vendor.category, vendor.city, vendor.owner?.name, vendor.owner?.email]
+    return vendors.filter((vendor) => [vendor.businessName, vendor.category, vendor.city]
       .filter(Boolean).join(" ").toLowerCase().includes(normalizedQuery));
   }, [query, vendors]);
 
@@ -494,11 +616,19 @@ export function AdminVendorsPage({ notify, onOpenAuth, authRevision = 0 }) {
     loadMoreControllerRef.current = controller;
     setLoadingMore(true); setQueueError("");
     try {
+      const compatible = await checkVendorApplicationEvidenceCompatibility({ signal: controller.signal });
+      if (controller.signal.aborted || activeStatusRef.current !== requestedStatus) return;
+      if (!compatible) {
+        clearPrivateState(); setAdminUser(null); setAccess("upgrade"); return;
+      }
       const params = new URLSearchParams({ status: requestedStatus, limit: "50", cursor: nextCursor });
-      const response = await fetch(`/api/v1/admin/vendors?${params}`, { credentials: "include", signal: controller.signal });
+      const response = await fetch(`/api/v1/admin/vendors?${params}`, { credentials: "include", headers: ADMIN_VENDOR_SUMMARY_HEADERS, signal: controller.signal });
       const payload = await readApiResponse(response, "More applications could not be loaded.");
       if (controller.signal.aborted || activeStatusRef.current !== requestedStatus) return;
-      const nextVendors = (Array.isArray(payload.data) ? payload.data : []).map(normalizeVendor);
+      if (!supportsAdminVendorSummaryContract(payload, response.headers.get("x-melaiva-admin-vendor-summary"))) {
+        clearPrivateState(); setAdminUser(null); setAccess("upgrade"); return;
+      }
+      const nextVendors = (Array.isArray(payload.data) ? payload.data : []).map(normalizeAdminVendorSummary);
       setVendors((current) => {
         const known = new Set(current.map((vendor) => vendor.id));
         return [...current, ...nextVendors.filter((vendor) => !known.has(vendor.id))];
@@ -519,6 +649,8 @@ export function AdminVendorsPage({ notify, onOpenAuth, authRevision = 0 }) {
 
   function selectVendor(vendor) {
     setSelectedId(vendor.id);
+    setDetailVendor(null);
+    setDetailError("");
     if (window.matchMedia?.("(max-width: 860px)")?.matches) {
       const behavior = window.matchMedia?.("(prefers-reduced-motion: reduce)")?.matches ? "auto" : "smooth";
       window.requestAnimationFrame(() => detailRef.current?.scrollIntoView({ block: "start", behavior }));
@@ -526,7 +658,7 @@ export function AdminVendorsPage({ notify, onOpenAuth, authRevision = 0 }) {
   }
 
   function openDecision(action) {
-    if (!selectedVendor || !Number.isInteger(selectedVendor.revision)) return;
+    if (!selectedVendor || !Number.isInteger(selectedVendor.revision) || !isAdminVendorActionAllowed(action, selectedVendor)) return;
     setDecisionError("");
     setDecision({ vendor: selectedVendor, action, idempotencyKey: createIdempotencyKey("vendor-review") });
   }
@@ -537,11 +669,17 @@ export function AdminVendorsPage({ notify, onOpenAuth, authRevision = 0 }) {
   }, [decisionBusy]);
 
   async function submitDecision({ reason, idempotencyKey }) {
-    if (!decision || decisionBusy) return;
+    if (!decision || decisionBusy || !isAdminVendorActionAllowed(decision.action, decision.vendor)) return;
     setDecisionBusy(true); setDecisionError("");
     const reviewedVendor = decision.vendor;
     const targetStatus = decision.action.targetStatus;
+    let mutationStarted = false;
     try {
+      const compatible = await checkVendorApplicationEvidenceCompatibility();
+      if (!compatible) {
+        clearPrivateState(); setAdminUser(null); setAccess("upgrade"); return;
+      }
+      mutationStarted = true;
       const response = await fetch(`/api/v1/admin/vendors/${encodeURIComponent(reviewedVendor.id)}`, {
         method: "PATCH",
         headers: { "Content-Type": "application/json", "Idempotency-Key": idempotencyKey },
@@ -551,6 +689,12 @@ export function AdminVendorsPage({ notify, onOpenAuth, authRevision = 0 }) {
           expectedStatus: reviewedVendor.status,
           expectedRevision: reviewedVendor.revision,
           reason,
+          ...(targetStatus === "approved" && reviewedVendor.evidence
+            ? {
+                evidenceAcknowledged: true,
+                expectedEvidenceRevision: reviewedVendor.evidence.revision,
+              }
+            : {}),
         }),
       });
       const payload = await readApiResponse(response, "The review decision could not be saved.");
@@ -572,6 +716,7 @@ export function AdminVendorsPage({ notify, onOpenAuth, authRevision = 0 }) {
         ? normalizeAdminStatusCounts(payload.meta.statusCounts)
         : adjustAdminStatusCounts(current, reviewedVendor.status, targetStatus));
       setSelectedId(nextVendor?.id || null);
+      setDetailVendor(null);
       setHistory([]);
       setHistoryTruncated(false);
       setDecision(null);
@@ -581,9 +726,13 @@ export function AdminVendorsPage({ notify, onOpenAuth, authRevision = 0 }) {
       });
       window.setTimeout(() => (nextVendor ? queueItemRefs.current.get(nextVendor.id) : queueHeadingRef.current)?.focus?.(), 0);
     } catch (error) {
+      if (!mutationStarted) {
+        setDecisionError("Secure review compatibility could not be confirmed. No decision was saved.");
+        return;
+      }
       if (applyAccessError(error)) return;
       if ([409, 412].includes(Number(error?.status))) {
-        setDecision(null); setSelectedId(null); setRefreshKey((value) => value + 1);
+        setDecision(null); setSelectedId(null); setDetailVendor(null); setRefreshKey((value) => value + 1);
         notify({ type: "warning", title: "Application changed", message: "The queue is refreshing so you can review the latest version." });
       } else {
         setDecisionError(error.message || "The review decision could not be saved.");
@@ -593,20 +742,21 @@ export function AdminVendorsPage({ notify, onOpenAuth, authRevision = 0 }) {
 
   if (access === "checking") return <AdminAccessState icon={LoaderCircle} eyebrow="Staff workspace" title="Checking administrator access" message="Confirming your secure session before loading partner information." />;
   if (access === "guest") return <AdminAccessState icon={LockKeyhole} eyebrow="Staff-only workspace" title="Sign in with an administrator account" message="Vendor applications contain private business and account details."><button className="button button--primary" type="button" onClick={onOpenAuth}>Sign in</button><Link className="button button--outline" to="/">Return home</Link></AdminAccessState>;
-  if (access === "forbidden") return <AdminAccessState icon={ShieldAlert} eyebrow="Access restricted" title="Administrator access is required" message="This account cannot view or change partner verification records."><Link className="button button--primary" to="/dashboard">Open my account</Link><Link className="button button--outline" to="/">Return home</Link></AdminAccessState>;
-  if (access === "error") return <AdminAccessState icon={CircleAlert} eyebrow="Access check unavailable" title="The staff workspace could not be opened" message={accessError}><button className="button button--primary" type="button" onClick={() => window.location.reload()}><RefreshCw size={16} /> Try again</button></AdminAccessState>;
+  if (access === "forbidden") return <AdminAccessState icon={ShieldAlert} eyebrow="Access restricted" title="Administrator access is required" message="This account cannot view or change private partner review records."><Link className="button button--primary" to="/dashboard">Open my account</Link><Link className="button button--outline" to="/">Return home</Link></AdminAccessState>;
+  if (access === "upgrade") return <AdminAccessState icon={ShieldAlert} eyebrow="Staff tools temporarily paused" title="Refresh after the secure review upgrade" message="This version cannot confirm the protected vendor-review contract. No application data was loaded and no decision can be saved."><button className="button button--primary" type="button" onClick={() => setAccessRetryKey((value) => value + 1)}><RefreshCw size={16} /> Check again</button><Link className="button button--outline" to="/">Return home</Link></AdminAccessState>;
+  if (access === "error") return <AdminAccessState icon={CircleAlert} eyebrow="Access check unavailable" title="The staff workspace could not be opened" message={accessError}><button className="button button--primary" type="button" onClick={() => setAccessRetryKey((value) => value + 1)}><RefreshCw size={16} /> Try again</button></AdminAccessState>;
 
   return (
     <div className="admin-page page-surface">
       <section className="admin-hero">
         <div className="shell admin-hero__inner">
-          <div><div className="eyebrow eyebrow--light"><ShieldCheck size={15} /> Melaiva operations</div><h1>Vendor verification</h1><p>Review every application against real evidence before publishing a verified partner.</p></div>
+          <div><div className="eyebrow eyebrow--light"><ShieldCheck size={15} /> Melaiva operations</div><h1>Vendor review</h1><p>Review the exact submitted evidence before granting marketplace approval.</p></div>
           <div className="admin-hero__session"><span><UserRound size={17} /></span><div><small>Signed in as administrator</small><strong>{adminUser?.name || adminUser?.email}</strong></div></div>
         </div>
       </section>
 
       <div className="shell admin-shell">
-        <div className="admin-trust-note"><ShieldCheck size={18} /><p><strong>Private operations data</strong><span>Use application contact details only for authorised verification and partner support.</span></p></div>
+        <div className="admin-trust-note"><ShieldCheck size={18} /><p><strong>Private operations data</strong><span>Use application details and submitted evidence only for authorised partner review and support.</span></p></div>
 
         <nav className="admin-status-nav" aria-label="Vendor application status">
           {ADMIN_VENDOR_STATUSES.map((item) => {
@@ -645,6 +795,7 @@ export function AdminVendorsPage({ notify, onOpenAuth, authRevision = 0 }) {
                     <span className="admin-queue-card__top"><AdminStatus status={vendor.status} /><small><CalendarDays size={13} /> {formatDate(vendor.createdAt)}</small></span>
                     <strong>{vendor.businessName}</strong>
                     <span className="admin-queue-card__meta"><span><Store size={14} /> {categoryLabel(vendor.category)}</span><span><MapPin size={14} /> {vendor.city}</span></span>
+                    <span className={`admin-queue-card__evidence ${vendor.evidenceSummary ? "is-ready" : "is-legacy"}`}><FileCheck2 size={14} />{vendor.evidenceSummary ? `${vendor.evidenceSummary.portfolioUrlCount + vendor.evidenceSummary.referenceUrlCount} submitted evidence link${vendor.evidenceSummary.portfolioUrlCount + vendor.evidenceSummary.referenceUrlCount === 1 ? "" : "s"} · Revision ${vendor.evidenceSummary.revision}` : "Legacy · no structured evidence"}</span>
                     <span className="admin-queue-card__action">Review application <ArrowRight size={15} /></span>
                   </button>
                 ))}
@@ -656,9 +807,13 @@ export function AdminVendorsPage({ notify, onOpenAuth, authRevision = 0 }) {
           </section>
 
           <div className="admin-detail-column" ref={detailRef}>
-            {selectedVendor
-              ? <VendorDetail vendor={selectedVendor} history={history} historyTruncated={historyTruncated} historyLoading={historyLoading} historyError={historyError} onRetryHistory={() => setHistoryRefreshKey((value) => value + 1)} onDecision={openDecision} />
-              : <section className="admin-detail-empty" id="admin-vendor-detail"><span><FileCheck2 size={28} /></span><div className="eyebrow">Evidence-backed review</div><h2>Select an application</h2><p>Open one queue item to inspect submitted details, decision history and the available accountable state changes.</p></section>}
+            {selectedId && detailLoading
+              ? <section className="admin-detail-empty" id="admin-vendor-detail" role="status"><span><LoaderCircle className="spin-icon" size={28} /></span><div className="eyebrow">Private application detail</div><h2>Loading {selectedSummary?.businessName || "application"}</h2><p>Retrieving the selected application and its evidence snapshot.</p></section>
+              : selectedId && detailError
+                ? <section className="admin-detail-empty" id="admin-vendor-detail" role="alert"><span><CircleAlert size={28} /></span><div className="eyebrow">Detail unavailable</div><h2>This application could not be opened</h2><p>{detailError}</p><button className="button button--primary" type="button" onClick={() => setDetailRefreshKey((value) => value + 1)}><RefreshCw size={15} /> Retry application</button></section>
+                : selectedVendor
+                  ? <VendorDetail vendor={selectedVendor} history={history} historyTruncated={historyTruncated} historyLoading={historyLoading} historyError={historyError} onRetryHistory={() => setHistoryRefreshKey((value) => value + 1)} onDecision={openDecision} />
+                  : <section className="admin-detail-empty" id="admin-vendor-detail"><span><FileCheck2 size={28} /></span><div className="eyebrow">Evidence-backed review</div><h2>Select an application</h2><p>Open one queue item to retrieve its private details, submitted evidence and decision history.</p></section>}
           </div>
         </div>
       </div>

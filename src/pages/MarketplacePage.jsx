@@ -81,7 +81,7 @@ function FilterPanel({ draft, setDraft, onApply, onClear, mobile, onClose }) {
       <label className="check-row">
         <input type="checkbox" checked={draft.verified} onChange={(event) => setDraft((current) => ({ ...current, verified: event.target.checked }))} />
         <span className="custom-check"><Check size={13} /></span>
-        <span><strong>Melaiva verified only</strong><small>Identity and work reviewed</small></span>
+        <span><strong>Marketplace reviewed only</strong><small>Business disclosure and work reviewed</small></span>
       </label>
       <div className="filter-panel__actions">
         <button className="button button--primary button--wide" onClick={onApply}>Show matches</button>
@@ -102,7 +102,7 @@ function VendorCard({ vendor, saved, onSave, onCompare, compared, view, demo }) 
         <span className="vendor-card__monogram">{vendor.initials}</span>
         <span className="vendor-card__category">{vendor.categoryLabel}</span>
         <SaveButton saved={saved} onClick={onSave} label={vendor.name} />
-        {demo ? <span className="verified-badge verified-badge--demo"><Sparkles size={14} /> Example listing</span> : vendor.verified && <span className="verified-badge"><BadgeCheck size={15} /> Verified</span>}
+        {demo ? <span className="verified-badge verified-badge--demo"><Sparkles size={14} /> Example listing</span> : vendor.verified && <span className="verified-badge"><BadgeCheck size={15} /> Marketplace reviewed</span>}
       </div>
       <div className="vendor-card__body">
         <div className="vendor-card__title">

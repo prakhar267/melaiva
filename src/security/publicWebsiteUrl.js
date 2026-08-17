@@ -24,8 +24,16 @@ export function parsePublicWebsiteUrl(value) {
   try {
     const url = new URL(String(value || "").trim());
     if (url.protocol !== "https:" || url.username || url.password || privateOrReservedHostname(url.hostname)) return null;
+    const hostname = url.hostname.replace(/\.$/u, "");
+    if (hostname.split(".").some((label) => label.startsWith("xn--"))) return null;
+    url.hostname = hostname;
+    url.hash = "";
     return { href: url.href, hostname: url.hostname.replace(/^www\./u, "") };
   } catch {
     return null;
   }
+}
+
+export function normalizePublicWebsiteUrl(value) {
+  return parsePublicWebsiteUrl(value)?.href || null;
 }

@@ -296,7 +296,7 @@ export function RequestPage({ notify, onOpenAuth }) {
       setVendorResolution({ status: "loading", vendor: null, message: "" });
       try {
         const response = await fetch(`/api/v1/catalog/vendors/${encodeURIComponent(vendorParam)}`, { credentials: "include", signal: controller.signal });
-        const payload = await readApiResponse(response, "The selected partner could not be verified.");
+        const payload = await readApiResponse(response, "The selected partner could not be checked.");
         if (payload.meta?.source === "demo" || !payload.data?.id || payload.data?.slug?.toLowerCase() !== vendorParam.toLowerCase()) {
           if (!controller.signal.aborted) {
             setVendorResolution({ status: "unavailable", vendor: null, message: "The live catalog could not confirm this exact partner. Try again or explicitly continue with open matching." });

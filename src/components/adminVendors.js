@@ -298,13 +298,23 @@ export function informationRequestFieldLabel(value) {
   return ADMIN_INFORMATION_REQUEST_FIELDS.find((field) => field.id === value)?.label || "Requested evidence";
 }
 
+export function focusFirstInvalidAdminDecisionControl(container) {
+  const target = container?.querySelector?.(
+    'input[aria-invalid="true"]:not(:disabled), select[aria-invalid="true"]:not(:disabled), textarea[aria-invalid="true"]:not(:disabled), button[aria-invalid="true"]:not(:disabled)',
+  );
+  if (!target || typeof target.focus !== "function") return false;
+  target.focus();
+  return true;
+}
+
 export function validateAdminInformationRequest({ requestedFields, applicantMessage } = {}, vendor) {
   const errors = {};
-  const normalizedFields = Array.isArray(requestedFields)
-    ? [...new Set(requestedFields.filter((field) => INFORMATION_REQUEST_FIELD_IDS.has(field)))]
-    : [];
+  const fieldValues = Array.isArray(requestedFields) ? requestedFields : [];
+  const normalizedFields = fieldValues.filter((field) => INFORMATION_REQUEST_FIELD_IDS.has(field));
   const message = String(applicantMessage || "").trim();
   if (!normalizedFields.length) errors.requestedFields = "Choose at least one evidence area for the applicant to update.";
+  else if (normalizedFields.length !== fieldValues.length) errors.requestedFields = "Choose only the listed evidence areas.";
+  else if (new Set(normalizedFields).size !== normalizedFields.length) errors.requestedFields = "Choose each evidence area only once.";
   if (message.length < 20) errors.applicantMessage = "Add applicant-visible instructions of at least 20 characters.";
   else if (message.length > 1_000) errors.applicantMessage = "Keep applicant-visible instructions to 1,000 characters or fewer.";
   else if (/[\u0000-\u0008\u000B\u000C\u000E-\u001F\u007F\u202A-\u202E\u2066-\u2069]/u.test(message)) {

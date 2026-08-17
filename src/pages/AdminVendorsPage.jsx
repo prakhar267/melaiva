@@ -41,6 +41,7 @@ import {
   adminVendorActions,
   adminVendorStatusConfig,
   adminVendorStatusLabel,
+  focusFirstInvalidAdminDecisionControl,
   isAdminVendorActionAllowed,
   normalizeAdminStatusCounts,
   normalizeAdminVendorSummary,
@@ -277,7 +278,7 @@ function DecisionDialog({ decision, busy, blocked = false, unconfirmed = false, 
     setValidationError(nextError);
     setInformationErrors(nextInformationErrors);
     if (nextError || Object.keys(nextInformationErrors).length || !acknowledged) {
-      window.requestAnimationFrame(() => dialogRef.current?.querySelector('[aria-invalid="true"]')?.focus());
+      window.requestAnimationFrame(() => focusFirstInvalidAdminDecisionControl(dialogRef.current));
       return;
     }
     dialogRef.current?.focus();

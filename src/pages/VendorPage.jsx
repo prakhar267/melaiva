@@ -54,6 +54,7 @@ import {
   validateVendorEvidence,
   vendorEvidenceCompletionEligibility,
   vendorEvidenceConflictState,
+  vendorEvidenceContextRefreshDecision,
   vendorEvidenceContextsMatch,
   vendorEvidenceFieldRequested,
   vendorEvidenceServerFieldErrors,
@@ -687,6 +688,7 @@ export function VendorOnboardingPage({ notify, onOpenAuth, authRevision = 0 }) {
   const dirtyRef = useRef(false);
   const loadedVendorIdRef = useRef(null);
   const evidenceReadSequenceRef = useRef(0);
+  const evidenceContextRef = useRef(null);
 
   useEffect(() => {
     const controller = new AbortController();
@@ -708,13 +710,17 @@ export function VendorOnboardingPage({ notify, onOpenAuth, authRevision = 0 }) {
     if (!evidenceOnly) {
       setEvidenceAccess("eligible");
       setEvidenceVendorStatus(null);
+      evidenceContextRef.current = null;
       setEvidenceContext(null);
       return undefined;
     }
     if (compatibility !== "ready") {
       setEvidenceAccess("checking");
       setEvidenceVendorStatus(null);
-      setEvidenceContext(null);
+      if (!dirtyRef.current) {
+        evidenceContextRef.current = null;
+        setEvidenceContext(null);
+      }
       return undefined;
     }
     const controller = new AbortController();
@@ -724,15 +730,33 @@ export function VendorOnboardingPage({ notify, onOpenAuth, authRevision = 0 }) {
       try {
         const result = await readVendorEvidenceCompletionAccess({ signal: controller.signal });
         if (!controller.signal.aborted && readSequence === evidenceReadSequenceRef.current) {
+          if (!result.context && dirtyRef.current) {
+            setEvidenceAccess(result.state);
+            setEvidenceVendorStatus(result.vendorStatus);
+            return;
+          }
+          const refreshDecision = vendorEvidenceContextRefreshDecision({
+            currentContext: evidenceContextRef.current,
+            incomingContext: result.context,
+            dirty: dirtyRef.current,
+            formInitialized: formInitializedRef.current,
+            loadedVendorId: loadedVendorIdRef.current,
+          });
+          if (refreshDecision.conflict) {
+            const preservedContext = evidenceContextRef.current;
+            setEvidenceAccess(preservedContext
+              ? vendorEvidenceCompletionEligibility(preservedContext)
+              : result.state);
+            setEvidenceVendorStatus(preservedContext?.effectiveStatus || result.vendorStatus);
+            setEvidenceConflict({ kind: "application_changed", latest: result });
+            setSubmitError("");
+            return;
+          }
           setEvidenceAccess(result.state);
           setEvidenceVendorStatus(result.vendorStatus);
+          evidenceContextRef.current = result.context;
           setEvidenceContext(result.context);
-          const accountChanged = Boolean(
-            result.context?.vendorId
-            && loadedVendorIdRef.current
-            && result.context.vendorId !== loadedVendorIdRef.current,
-          );
-          if (result.context && (accountChanged || (!formInitializedRef.current && !dirtyRef.current))) {
+          if (refreshDecision.shouldResetForm) {
             setForm((current) => ({ ...current, ...prefillVendorEvidence(result.context) }));
             formInitializedRef.current = true;
             dirtyRef.current = false;
@@ -805,6 +829,7 @@ export function VendorOnboardingPage({ notify, onOpenAuth, authRevision = 0 }) {
         || (expectedVendorId && result.context?.vendorId && result.context.vendorId !== expectedVendorId)) return;
       setEvidenceAccess(result.state);
       setEvidenceVendorStatus(result.vendorStatus);
+      evidenceContextRef.current = result.context;
       setEvidenceContext(result.context);
       if (["eligible", "revision"].includes(result.state) && result.context) {
         loadedVendorIdRef.current = result.context.vendorId;

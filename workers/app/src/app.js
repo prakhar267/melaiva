@@ -454,9 +454,11 @@ const ADMIN_VENDOR_SUMMARY_HEADER = "X-Melaiva-Admin-Vendor-Summary";
 const VENDOR_EVIDENCE_REQUIRED_TRIGGERS = Object.freeze([
   "vendor_application_evidence_validate_insert",
   "vendor_application_evidence_vendor_state_insert_v10",
+  "vendor_application_evidence_active_request_insert_v10",
   "vendor_application_evidence_immutable_update",
   "vendor_application_evidence_immutable_delete",
   "vendor_application_evidence_mirror_insert_v10",
+  "vendor_application_evidence_revisions_compatibility_insert_v10",
   "vendor_application_evidence_revisions_validate_insert",
   "vendor_application_evidence_revisions_state_insert",
   "vendor_application_evidence_revisions_apply_insert",
@@ -941,7 +943,8 @@ function isVendorEvidenceStateConflict(error) {
 
 function isVendorEvidenceRevisionConflict(error) {
   return error?.code === "vendor_evidence_revision_conflict"
-    || /vendor evidence revision requires the active owner and an information request/i.test(String(error?.message || error));
+    || /vendor evidence revision requires the active owner and an information request|legacy vendor evidence cannot resolve an active information request/i
+      .test(String(error?.message || error));
 }
 
 function isVendorInformationRequestConflict(error) {
@@ -3711,7 +3714,7 @@ function buildApp() {
       },
       currentInformationRequest: null,
     };
-    const insertEvidence = nextEvidenceRevision === 1
+    const insertEvidence = nextEvidenceRevision === 1 && !vendor.information_requested
       ? db
         .prepare(
           `INSERT INTO vendor_application_evidence

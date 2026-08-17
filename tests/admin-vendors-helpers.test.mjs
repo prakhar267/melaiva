@@ -1,5 +1,6 @@
 import test from "node:test";
 import assert from "node:assert/strict";
+import { readFileSync } from "node:fs";
 import {
   adjustAdminStatusCounts,
   classifyAdminVendorDecisionFailure,
@@ -7,6 +8,7 @@ import {
   adminVendorEvidenceState,
   adminVendorEvidenceSummaryLabel,
   adminVendorActions,
+  focusFirstInvalidAdminDecisionControl,
   isAdminVendorActionAllowed,
   normalizeAdminStatusCounts,
   normalizeAdminVendorSummary,
@@ -215,10 +217,13 @@ test("information requests require safe applicant-visible instructions separate 
       registrationReference: "UDYAM-RJ-12-1234567",
     },
   };
-  assert.deepEqual(validateAdminInformationRequest({
+  const applicantMessage = "Please replace the inaccessible work sample and add a current public review.";
+  assert.deepEqual(validateAdminInformationRequest({ requestedFields: ["portfolio", "references"], applicantMessage }, vendor), {});
+  assert.match(validateAdminInformationRequest({
     requestedFields: ["portfolio", "portfolio", "references"],
-    applicantMessage: "Please replace the inaccessible work sample and add a current public review.",
-  }, vendor), {});
+    applicantMessage,
+  }, vendor).requestedFields, /only once/i);
+  assert.match(validateAdminInformationRequest({ requestedFields: ["portfolio", "unknown"], applicantMessage }, vendor).requestedFields, /only the listed/i);
   assert.match(validateAdminInformationRequest({ requestedFields: [], applicantMessage: "Please update the evidence supplied." }, vendor).requestedFields, /at least one/i);
   for (const applicantMessage of [
     "Open https://private.example.com and replace this item.",
@@ -228,6 +233,41 @@ test("information requests require safe applicant-visible instructions separate 
   ]) {
     assert.match(validateAdminInformationRequest({ requestedFields: ["portfolio"], applicantMessage }, vendor).applicantMessage, /address|identity|registration|evidence/i, applicantMessage);
   }
+});
+
+test("decision validation focuses the first enabled invalid control instead of an invalid group", () => {
+  let selector = "";
+  let focusCount = 0;
+  const container = {
+    querySelector(value) {
+      selector = value;
+      return { focus: () => { focusCount += 1; } };
+    },
+  };
+  assert.equal(focusFirstInvalidAdminDecisionControl(container), true);
+  assert.equal(focusCount, 1);
+  assert.match(selector, /input\[aria-invalid="true"\]:not\(:disabled\)/u);
+  assert.match(selector, /textarea\[aria-invalid="true"\]:not\(:disabled\)/u);
+  assert.doesNotMatch(selector, /fieldset/u);
+  assert.equal(focusFirstInvalidAdminDecisionControl({ querySelector: () => null }), false);
+});
+
+test("custom checkbox boundaries meet the 3:1 non-text contrast threshold", () => {
+  const styles = readFileSync(new URL("../src/styles.css", import.meta.url), "utf8");
+  const boundary = styles.match(/--control-boundary:\s*(#[0-9a-f]{6})/iu)?.[1];
+  const paper = styles.match(/--paper:\s*(#[0-9a-f]{6})/iu)?.[1];
+  const luminance = (color) => {
+    const channels = color.slice(1).match(/../gu).map((value) => Number.parseInt(value, 16) / 255);
+    const [red, green, blue] = channels.map((value) => value <= 0.04045 ? value / 12.92 : ((value + 0.055) / 1.055) ** 2.4);
+    return 0.2126 * red + 0.7152 * green + 0.0722 * blue;
+  };
+  assert.ok(boundary);
+  assert.ok(paper);
+  const lighter = Math.max(luminance(boundary), luminance(paper));
+  const darker = Math.min(luminance(boundary), luminance(paper));
+  assert.ok((lighter + 0.05) / (darker + 0.05) >= 3);
+  assert.match(styles, /\.admin-information-request-form fieldset label > span \{[^\n]*var\(--control-boundary\)/u);
+  assert.match(styles, /\.admin-decision-dialog__acknowledgement > span \{[^\n]*var\(--control-boundary\)/u);
 });
 
 test("needs-information status is non-approvable and accepts only its declared actions", () => {

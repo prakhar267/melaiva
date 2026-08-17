@@ -12,6 +12,7 @@
   --ink: #281a29;
   --muted: #71666f;
   --line: #ddd2c6;
+  --control-boundary: #988898;
   --marigold: #f2a900;
   --marigold-soft: #fff0c7;
   --teal: #167d7f;
@@ -759,7 +760,7 @@ input:focus, select:focus, textarea:focus { outline: none; border-color: var(--t
 .award-offer-dialog__warning svg { flex: 0 0 auto; }
 .award-offer-dialog__acknowledgement { display: grid; grid-template-columns: auto 1fr; gap: 10px; align-items: center; margin-top: 17px; color: var(--ink); cursor: pointer; }
 .award-offer-dialog__acknowledgement > input { position: absolute; opacity: 0; pointer-events: none; }
-.award-offer-dialog__acknowledgement > span { width: 23px; height: 23px; display: grid; place-items: center; border: 1px solid #bcaebe; border-radius: 7px; background: var(--paper); color: transparent; }
+.award-offer-dialog__acknowledgement > span { width: 23px; height: 23px; display: grid; place-items: center; border: 1px solid var(--control-boundary); border-radius: 7px; background: var(--paper); color: transparent; }
 .award-offer-dialog__acknowledgement > input:checked + span { border-color: var(--teal); background: var(--teal); color: #fff; }
 .award-offer-dialog__acknowledgement > input:focus-visible + span { outline: 3px solid rgba(22, 125, 127, .34); outline-offset: 3px; }
 .award-offer-dialog__acknowledgement > strong { font-size: 10px; line-height: 1.5; }
@@ -1003,7 +1004,7 @@ input:focus, select:focus, textarea:focus { outline: none; border-color: var(--t
 .bid-form__section-heading p { color: var(--muted); font-size: 8px; line-height: 1.5; }
 .bid-inline-check { display: flex; align-items: center; gap: 7px; width: fit-content; color: var(--muted); cursor: pointer; }
 .bid-inline-check > input { position: absolute; opacity: 0; pointer-events: none; }
-.bid-inline-check > span { width: 19px; height: 19px; flex: 0 0 auto; display: grid; place-items: center; border: 1px solid #bcaebe; border-radius: 6px; background: var(--paper); color: transparent; }
+.bid-inline-check > span { width: 19px; height: 19px; flex: 0 0 auto; display: grid; place-items: center; border: 1px solid var(--control-boundary); border-radius: 6px; background: var(--paper); color: transparent; }
 .bid-inline-check > input:checked + span { border-color: var(--teal); background: var(--teal); color: #fff; }
 .bid-inline-check > input:focus-visible + span { outline: 3px solid rgba(22, 125, 127, .34); outline-offset: 2px; }
 .bid-inline-check > strong { font-size: 8px; font-weight: 700; line-height: 1.45; }
@@ -1124,7 +1125,7 @@ input:focus, select:focus, textarea:focus { outline: none; border-color: var(--t
 .onboarding-registration__guard svg { flex: 0 0 auto; }
 .onboarding-evidence-attestation { display: grid; grid-template-columns: auto minmax(0, 1fr); align-items: center; gap: 10px; cursor: pointer; }
 .onboarding-evidence-attestation > input { position: absolute; opacity: 0; }
-.onboarding-evidence-attestation > span { width: 25px; height: 25px; display: grid; place-items: center; border: 1px solid #bcaebe; border-radius: 7px; background: var(--paper); color: transparent; }
+.onboarding-evidence-attestation > span { width: 25px; height: 25px; display: grid; place-items: center; border: 1px solid var(--control-boundary); border-radius: 7px; background: var(--paper); color: transparent; }
 .onboarding-evidence-attestation > input:checked + span { border-color: var(--teal); background: var(--teal); color: #fff; }
 .onboarding-evidence-attestation > input:focus-visible + span { outline: 3px solid rgba(22, 125, 127, .34); outline-offset: 3px; }
 .onboarding-evidence-attestation > input[aria-invalid="true"] + span { border-color: var(--error); }
@@ -1363,7 +1364,7 @@ input:focus, select:focus, textarea:focus { outline: none; border-color: var(--t
 .admin-information-request-form fieldset > div { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 7px; }
 .admin-information-request-form fieldset label { min-height: 48px; display: grid; grid-template-columns: auto minmax(0, 1fr); align-items: center; gap: 7px; padding: 8px; border: 1px solid #dec88f; border-radius: 9px; background: rgba(255,255,255,.55); cursor: pointer; }
 .admin-information-request-form fieldset input { position: absolute; opacity: 0; }
-.admin-information-request-form fieldset label > span { width: 23px; height: 23px; display: grid; place-items: center; border: 1px solid #bcaebe; border-radius: 6px; background: var(--paper); color: transparent; }
+.admin-information-request-form fieldset label > span { width: 23px; height: 23px; display: grid; place-items: center; border: 1px solid var(--control-boundary); border-radius: 6px; background: var(--paper); color: transparent; }
 .admin-information-request-form fieldset input:checked + span { border-color: var(--teal); background: var(--teal); color: #fff; }
 .admin-information-request-form fieldset input:focus-visible + span { outline: 3px solid rgba(22,125,127,.34); outline-offset: 2px; }
 .admin-information-request-form fieldset strong { color: var(--ink); font-size: 9px; line-height: 1.35; }
@@ -1377,7 +1378,7 @@ input:focus, select:focus, textarea:focus { outline: none; border-color: var(--t
 .admin-decision-dialog__reason [aria-invalid="true"] + .admin-decision-dialog__reason-meta small:first-child { color: var(--error); font-weight: 700; }
 .admin-decision-dialog__acknowledgement { display: grid; grid-template-columns: auto minmax(0, 1fr); align-items: center; gap: 10px; margin-top: 17px; cursor: pointer; }
 .admin-decision-dialog__acknowledgement > input { position: absolute; opacity: 0; }
-.admin-decision-dialog__acknowledgement > span { width: 24px; height: 24px; display: grid; place-items: center; border: 1px solid #bcaebe; border-radius: 7px; background: var(--paper); color: transparent; }
+.admin-decision-dialog__acknowledgement > span { width: 24px; height: 24px; display: grid; place-items: center; border: 1px solid var(--control-boundary); border-radius: 7px; background: var(--paper); color: transparent; }
 .admin-decision-dialog__acknowledgement > input:checked + span { border-color: var(--teal); background: var(--teal); color: #fff; }
 .admin-decision-dialog__acknowledgement > input:focus-visible + span { outline: 3px solid rgba(22, 125, 127, .34); outline-offset: 3px; }
 .admin-decision-dialog__acknowledgement > strong { color: var(--ink); font-size: 11px; line-height: 1.55; }

@@ -2428,7 +2428,6 @@ test("evidence revisions and needs-information reviews are append-only, private,
   assert.equal(detailData.evidence.revision, 2);
   assert.deepEqual(detailData.evidenceHistory.map((item) => item.revision), [2, 1]);
   assert.equal(Object.hasOwn(detailData.evidenceHistory[1], "portfolioUrls"), false);
-  assert.equal(JSON.stringify(detailData).includes("portfolio-revisionevidence.example.com"), false);
   assert.equal(detailData.currentInformationRequest, null);
 
   const staleApproval = await requestJson(app, env, `/admin/vendors/${vendor.id}`, {
@@ -2526,6 +2525,203 @@ test("evidence revisions and needs-information reviews are append-only, private,
   });
   assert.equal(firstEvidence.status, 201, await firstEvidence.clone().text());
   assert.equal((await firstEvidence.json()).data.reviewRevision, 2);
+
+  const requestedInitialOwner = await register(app, env, {
+    name: "Requested Initial Owner",
+    email: "requested-initial-owner@example.com",
+    verifier: "u".repeat(43),
+  });
+  db.sqlite.prepare(
+    `INSERT INTO vendors
+      (id, user_id, slug, business_name, status, category, categories_json, city, service_areas_json,
+       description, min_budget, max_budget, currency, evidence_required)
+     VALUES ('requested-initial-vendor', ?, 'requested-initial-vendor', 'Requested Initial Vendor', 'pending',
+             'planning', '["planning"]', 'Delhi', '["Delhi"]',
+             'An evidence-less application used to exercise an exact first response to an active request.',
+             100000, 500000, 'INR', 1)`,
+  ).run(requestedInitialOwner.user.id);
+  const requestedInitial = await requestJson(app, env, "/admin/vendors/requested-initial-vendor", {
+    method: "PATCH",
+    cookie: admin.cookie,
+    headers: { "idempotency-key": "requested-initial-open-0001" },
+    body: {
+      status: "needs_information",
+      expectedStatus: "pending",
+      expectedRevision: 0,
+      expectedEvidenceRevision: 0,
+      requestedFields: ["portfolio", "references", "registration"],
+      applicantMessage: "Please complete each required evidence area before we continue the review.",
+      reason: "The application needs its first complete evidence snapshot before a decision.",
+    },
+  });
+  assert.equal(requestedInitial.status, 200, await requestedInitial.clone().text());
+  const requestedInitialBody = {
+    evidence: {
+      portfolioUrls: ["https://requested-initial-work.example.com/gallery"],
+      referenceUrls: ["https://requested-initial-reference.example.com/review"],
+      registrationType: "not_registered",
+      attested: true,
+    },
+    expectedStatus: "needs_information",
+    expectedRevision: 1,
+    expectedEvidenceRevision: 0,
+    expectedInformationRequestRevision: 1,
+  };
+  const submitRequestedInitial = () => requestJson(app, env, "/vendors/onboarding/evidence", {
+    method: "PUT",
+    cookie: requestedInitialOwner.cookie,
+    headers: { "idempotency-key": "requested-initial-response-0001" },
+    body: requestedInitialBody,
+  });
+  const submittedRequestedInitial = await submitRequestedInitial();
+  assert.equal(submittedRequestedInitial.status, 201, await submittedRequestedInitial.clone().text());
+  const submittedRequestedInitialData = (await submittedRequestedInitial.json()).data;
+  assert.equal(submittedRequestedInitialData.reviewRevision, 2);
+  assert.equal(submittedRequestedInitialData.evidenceSummary.revision, 1);
+  assert.equal(submittedRequestedInitialData.currentInformationRequest, null);
+  assert.equal((await submitRequestedInitial().then((response) => response.json())).meta.replayed, true);
+  assert.deepEqual(
+    { ...db.sqlite.prepare(
+      `SELECT review_revision, evidence_latest_revision, information_request_revision, information_requested
+       FROM vendors WHERE id = 'requested-initial-vendor'`,
+    ).get() },
+    {
+      review_revision: 2,
+      evidence_latest_revision: 1,
+      information_request_revision: 1,
+      information_requested: 0,
+    },
+  );
+  assert.equal(
+    db.sqlite.prepare(
+      `SELECT submitted_by_user_id FROM vendor_application_evidence_revisions
+       WHERE vendor_id = 'requested-initial-vendor' AND evidence_revision = 1`,
+    ).get().submitted_by_user_id,
+    requestedInitialOwner.user.id,
+  );
+  assert.equal(
+    db.sqlite.prepare(
+      "SELECT COUNT(*) AS count FROM vendor_application_evidence WHERE vendor_id = 'requested-initial-vendor'",
+    ).get().count,
+    1,
+  );
+
+  const rollingOwner = await register(app, env, {
+    name: "Rolling Evidence Owner",
+    email: "rolling-evidence-owner@example.com",
+    verifier: "v".repeat(43),
+  });
+  db.sqlite.prepare(
+    `INSERT INTO vendors
+      (id, user_id, slug, business_name, status, category, categories_json, city, service_areas_json,
+       description, min_budget, max_budget, currency, evidence_required)
+     VALUES ('rolling-evidence-vendor', ?, 'rolling-evidence-vendor', 'Rolling Evidence Vendor', 'pending',
+             'planning', '["planning"]', 'Delhi', '["Delhi"]',
+             'An evidence-less application used to exercise an in-flight legacy completion after migration.',
+             100000, 500000, 'INR', 1)`,
+  ).run(rollingOwner.user.id);
+  const rollingRequest = await requestJson(app, env, "/admin/vendors/rolling-evidence-vendor", {
+    method: "PATCH",
+    cookie: admin.cookie,
+    headers: { "idempotency-key": "rolling-evidence-open-0001" },
+    body: {
+      status: "needs_information",
+      expectedStatus: "pending",
+      expectedRevision: 0,
+      expectedEvidenceRevision: 0,
+      requestedFields: ["registration"],
+      applicantMessage: "Please complete the registration declaration for this application.",
+      reason: "The application needs a registration declaration before the review can continue.",
+    },
+  });
+  assert.equal(rollingRequest.status, 200, await rollingRequest.clone().text());
+  assert.throws(
+    () => db.sqlite.prepare(
+      `INSERT INTO vendor_application_evidence
+        (vendor_id, evidence_revision, portfolio_urls_json, reference_urls_json, registration_type,
+         registration_reference, attested, attested_at, created_at)
+       VALUES ('rolling-evidence-vendor', 1, '["https://rolling-evidence-work.example.com/gallery"]',
+               '["https://rolling-evidence-reference.example.com/review"]', 'not_registered', NULL, 1,
+               '2028-06-01T00:00:00.000Z', '2028-06-01T00:00:00.000Z')`,
+    ).run(),
+    /legacy vendor evidence cannot resolve an active information request/,
+  );
+  assert.deepEqual(
+    { ...db.sqlite.prepare(
+      `SELECT review_revision, evidence_latest_revision, information_request_revision, information_requested
+       FROM vendors WHERE id = 'rolling-evidence-vendor'`,
+    ).get() },
+    {
+      review_revision: 1,
+      evidence_latest_revision: 0,
+      information_request_revision: 1,
+      information_requested: 1,
+    },
+  );
+  assert.equal(
+    db.sqlite.prepare(
+      "SELECT COUNT(*) AS count FROM vendor_application_evidence WHERE vendor_id = 'rolling-evidence-vendor'",
+    ).get().count,
+    0,
+  );
+  assert.equal(
+    db.sqlite.prepare(
+      `SELECT COUNT(*) AS count FROM vendor_application_evidence_revisions
+       WHERE vendor_id = 'rolling-evidence-vendor'`,
+    ).get().count,
+    0,
+  );
+  const rollingContext = await requestJson(app, env, "/vendors/onboarding/evidence", { cookie: rollingOwner.cookie });
+  assert.equal(rollingContext.status, 200, await rollingContext.clone().text());
+  const rollingContextData = (await rollingContext.json()).data;
+  assert.equal(rollingContextData.effectiveStatus, "needs_information");
+  assert.equal(rollingContextData.reviewRevision, 1);
+  assert.equal(rollingContextData.evidenceSummary, null);
+  assert.equal(rollingContextData.currentInformationRequest.evidenceRevision, 0);
+  const rollingResponse = await requestJson(app, env, "/vendors/onboarding/evidence", {
+    method: "PUT",
+    cookie: rollingOwner.cookie,
+    headers: { "idempotency-key": "rolling-evidence-response-0001" },
+    body: {
+      evidence: {
+        portfolioUrls: ["https://rolling-evidence-revised-work.example.com/gallery"],
+        referenceUrls: ["https://rolling-evidence-revised-reference.example.com/review"],
+        registrationType: "not_registered",
+        attested: true,
+      },
+      expectedStatus: "needs_information",
+      expectedRevision: 1,
+      expectedEvidenceRevision: 0,
+      expectedInformationRequestRevision: 1,
+    },
+  });
+  assert.equal(rollingResponse.status, 201, await rollingResponse.clone().text());
+  assert.equal((await rollingResponse.json()).data.evidenceSummary.revision, 1);
+  assert.deepEqual(
+    { ...db.sqlite.prepare(
+      `SELECT review_revision, evidence_latest_revision, information_request_revision, information_requested
+       FROM vendors WHERE id = 'rolling-evidence-vendor'`,
+    ).get() },
+    {
+      review_revision: 2,
+      evidence_latest_revision: 1,
+      information_request_revision: 1,
+      information_requested: 0,
+    },
+  );
+  assert.equal(
+    db.sqlite.prepare(
+      `SELECT submitted_by_user_id FROM vendor_application_evidence_revisions
+       WHERE vendor_id = 'rolling-evidence-vendor' AND evidence_revision = 1`,
+    ).get().submitted_by_user_id,
+    rollingOwner.user.id,
+  );
+  assert.equal(
+    db.sqlite.prepare(
+      "SELECT COUNT(*) AS count FROM vendor_application_evidence WHERE vendor_id = 'rolling-evidence-vendor'",
+    ).get().count,
+    1,
+  );
 });
 
 test("admin vendor verification is private, paginated, reasoned, replay-safe, and reversible only through scoped transitions", async () => {

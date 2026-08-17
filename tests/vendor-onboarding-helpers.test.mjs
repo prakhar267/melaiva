@@ -14,6 +14,7 @@ import {
   validateVendorEvidence,
   vendorEvidenceCompletionEligibility,
   vendorEvidenceConflictState,
+  vendorEvidenceContextRefreshDecision,
   vendorEvidenceContextsMatch,
 } from "../src/components/vendorOnboarding.js";
 import {
@@ -333,6 +334,89 @@ test("evidence conflicts compare exact context versions and preserve safe catego
   assert.equal(vendorEvidenceConflictState({ status: 409, code: "vendor_information_request_conflict" }), "request_changed");
   assert.equal(vendorEvidenceConflictState({ status: 412, code: "unknown_conflict" }), "application_changed");
   assert.equal(vendorEvidenceConflictState({ status: 422 }), null);
+});
+
+test("dirty evidence drafts never inherit newer concurrency counters silently", () => {
+  const currentContext = {
+    vendorId: "vendor-1",
+    effectiveStatus: "needs_information",
+    reviewRevision: 6,
+    evidenceRevision: 1,
+    informationRequestRevision: 2,
+    currentInformationRequest: { revision: 2 },
+  };
+  const incomingContext = {
+    ...currentContext,
+    reviewRevision: 7,
+    informationRequestRevision: 3,
+    currentInformationRequest: { revision: 3 },
+  };
+
+  assert.deepEqual(vendorEvidenceContextRefreshDecision({
+    currentContext,
+    incomingContext,
+    dirty: true,
+    formInitialized: true,
+    loadedVendorId: currentContext.vendorId,
+  }), {
+    accountChanged: false,
+    shouldResetForm: false,
+    conflict: true,
+  });
+  assert.deepEqual(vendorEvidenceContextRefreshDecision({
+    currentContext,
+    incomingContext,
+    dirty: false,
+    formInitialized: true,
+    loadedVendorId: currentContext.vendorId,
+  }), {
+    accountChanged: false,
+    shouldResetForm: true,
+    conflict: false,
+  });
+  assert.deepEqual(vendorEvidenceContextRefreshDecision({
+    currentContext,
+    incomingContext: { ...incomingContext, vendorId: "vendor-2" },
+    dirty: true,
+    formInitialized: true,
+    loadedVendorId: currentContext.vendorId,
+  }), {
+    accountChanged: true,
+    shouldResetForm: true,
+    conflict: false,
+  });
+  assert.deepEqual(vendorEvidenceContextRefreshDecision({
+    currentContext,
+    incomingContext: { ...currentContext },
+    dirty: true,
+    formInitialized: true,
+    loadedVendorId: currentContext.vendorId,
+  }), {
+    accountChanged: false,
+    shouldResetForm: false,
+    conflict: false,
+  });
+  assert.deepEqual(vendorEvidenceContextRefreshDecision({
+    currentContext: null,
+    incomingContext,
+    dirty: true,
+    formInitialized: true,
+  }), {
+    accountChanged: false,
+    shouldResetForm: false,
+    conflict: true,
+  });
+  assert.deepEqual(vendorEvidenceContextRefreshDecision({
+    currentContext: null,
+    incomingContext: { ...incomingContext, vendorId: "vendor-2" },
+    dirty: true,
+    formInitialized: true,
+    loadedVendorId: currentContext.vendorId,
+  }), {
+    accountChanged: true,
+    shouldResetForm: true,
+    conflict: false,
+  });
 });
 
 test("ambiguous unchanged retries bypass only the stale preflight and preserve server CAS", () => {

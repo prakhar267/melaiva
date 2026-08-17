@@ -1154,7 +1154,9 @@ DROP TRIGGER IF EXISTS vendor_application_evidence_vendor_state_insert;
 DROP TRIGGER IF EXISTS vendors_evidence_approval_guard;
 DROP TRIGGER IF EXISTS audit_events_vendor_review_sensitive_insert;
 DROP TRIGGER IF EXISTS vendor_application_evidence_vendor_state_insert_v10;
+DROP TRIGGER IF EXISTS vendor_application_evidence_active_request_insert_v10;
 DROP TRIGGER IF EXISTS vendor_application_evidence_mirror_insert_v10;
+DROP TRIGGER IF EXISTS vendor_application_evidence_revisions_compatibility_insert_v10;
 DROP TRIGGER IF EXISTS vendor_application_evidence_revisions_validate_insert;
 DROP TRIGGER IF EXISTS vendor_application_evidence_revisions_state_insert;
 DROP TRIGGER IF EXISTS vendor_application_evidence_revisions_apply_insert;
@@ -1180,6 +1182,30 @@ WHEN NOT EXISTS (
 )
 BEGIN
   SELECT RAISE(ABORT, 'vendor application evidence requires a pending or rejected vendor');
+END;
+
+CREATE TRIGGER vendor_application_evidence_active_request_insert_v10
+BEFORE INSERT ON vendor_application_evidence
+WHEN EXISTS (
+  SELECT 1 FROM vendors vendor
+  WHERE vendor.id = NEW.vendor_id
+    AND vendor.information_requested = 1
+    AND NOT EXISTS (
+      SELECT 1 FROM vendor_application_evidence_revisions revision
+      WHERE revision.vendor_id = NEW.vendor_id
+        AND revision.evidence_revision = 1
+        AND revision.portfolio_urls_json = NEW.portfolio_urls_json
+        AND revision.reference_urls_json = NEW.reference_urls_json
+        AND revision.registration_type = NEW.registration_type
+        AND revision.registration_reference IS NEW.registration_reference
+        AND revision.attested = NEW.attested
+        AND revision.attested_at = NEW.attested_at
+        AND revision.created_at = NEW.created_at
+        AND revision.submitted_by_user_id = vendor.user_id
+    )
+)
+BEGIN
+  SELECT RAISE(ABORT, 'legacy vendor evidence cannot resolve an active information request');
 END;
 
 CREATE TRIGGER vendor_application_evidence_revisions_validate_insert
@@ -1237,16 +1263,35 @@ BEFORE INSERT ON vendor_application_evidence_revisions
 WHEN
   (
     NEW.evidence_revision = 1
-    AND NOT EXISTS (
-      SELECT 1 FROM vendor_application_evidence compatibility
-      WHERE compatibility.vendor_id = NEW.vendor_id
-        AND compatibility.evidence_revision = 1
-        AND compatibility.portfolio_urls_json = NEW.portfolio_urls_json
-        AND compatibility.reference_urls_json = NEW.reference_urls_json
-        AND compatibility.registration_type = NEW.registration_type
-        AND compatibility.registration_reference IS NEW.registration_reference
-        AND compatibility.attested = NEW.attested
-        AND compatibility.attested_at = NEW.attested_at
+    AND NOT (
+      EXISTS (
+        SELECT 1
+        FROM vendor_application_evidence compatibility
+        WHERE compatibility.vendor_id = NEW.vendor_id
+          AND compatibility.evidence_revision = 1
+          AND compatibility.portfolio_urls_json = NEW.portfolio_urls_json
+          AND compatibility.reference_urls_json = NEW.reference_urls_json
+          AND compatibility.registration_type = NEW.registration_type
+          AND compatibility.registration_reference IS NEW.registration_reference
+          AND compatibility.attested = NEW.attested
+          AND compatibility.attested_at = NEW.attested_at
+      )
+      OR (
+        NOT EXISTS (
+          SELECT 1 FROM vendor_application_evidence compatibility
+          WHERE compatibility.vendor_id = NEW.vendor_id
+        )
+        AND EXISTS (
+          SELECT 1 FROM vendors vendor
+          JOIN users owner ON owner.id = vendor.user_id
+          WHERE vendor.id = NEW.vendor_id
+            AND vendor.status IN ('pending', 'rejected')
+            AND vendor.information_requested = 1
+            AND vendor.evidence_latest_revision = 0
+            AND NEW.submitted_by_user_id = vendor.user_id
+            AND owner.status = 'active'
+        )
+      )
     )
   )
   OR (
@@ -1290,13 +1335,26 @@ END;
 CREATE TRIGGER vendor_application_evidence_mirror_insert_v10
 AFTER INSERT ON vendor_application_evidence
 BEGIN
-  INSERT INTO vendor_application_evidence_revisions
+  INSERT OR IGNORE INTO vendor_application_evidence_revisions
     (vendor_id, evidence_revision, portfolio_urls_json, reference_urls_json, registration_type,
      registration_reference, attested, attested_at, submitted_by_user_id, created_at)
   SELECT NEW.vendor_id, NEW.evidence_revision, NEW.portfolio_urls_json, NEW.reference_urls_json,
          NEW.registration_type, NEW.registration_reference, NEW.attested, NEW.attested_at,
          vendor.user_id, NEW.created_at
   FROM vendors vendor WHERE vendor.id = NEW.vendor_id;
+END;
+
+CREATE TRIGGER vendor_application_evidence_revisions_compatibility_insert_v10
+AFTER INSERT ON vendor_application_evidence_revisions
+WHEN NEW.evidence_revision = 1
+BEGIN
+  INSERT OR IGNORE INTO vendor_application_evidence
+    (vendor_id, evidence_revision, portfolio_urls_json, reference_urls_json, registration_type,
+     registration_reference, attested, attested_at, created_at)
+  VALUES (
+    NEW.vendor_id, 1, NEW.portfolio_urls_json, NEW.reference_urls_json, NEW.registration_type,
+    NEW.registration_reference, NEW.attested, NEW.attested_at, NEW.created_at
+  );
 END;
 
 CREATE TRIGGER vendor_application_evidence_revisions_identity_update
@@ -1701,9 +1759,11 @@ const VENDOR_EVIDENCE_TRIGGER_NAMES = Object.freeze([
 const VENDOR_EVIDENCE_V10_TRIGGER_NAMES = Object.freeze([
   "vendor_application_evidence_validate_insert",
   "vendor_application_evidence_vendor_state_insert_v10",
+  "vendor_application_evidence_active_request_insert_v10",
   "vendor_application_evidence_immutable_update",
   "vendor_application_evidence_immutable_delete",
   "vendor_application_evidence_mirror_insert_v10",
+  "vendor_application_evidence_revisions_compatibility_insert_v10",
   "vendor_application_evidence_revisions_validate_insert",
   "vendor_application_evidence_revisions_state_insert",
   "vendor_application_evidence_revisions_apply_insert",
@@ -2055,7 +2115,7 @@ export class MelaivaStore {
         ? "unique_constraint"
         : /vendor application evidence requires a pending or rejected vendor/i.test(message)
           ? "vendor_evidence_state_conflict"
-          : /vendor evidence revision requires the active owner and an information request/i.test(message)
+          : /vendor evidence revision requires the active owner and an information request|legacy vendor evidence cannot resolve an active information request/i.test(message)
             ? "vendor_evidence_revision_conflict"
             : /vendor information requests contain invalid or sensitive content/i.test(message)
               ? "vendor_information_request_conflict"

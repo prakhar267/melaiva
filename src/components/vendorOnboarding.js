@@ -255,6 +255,34 @@ export function vendorEvidenceContextsMatch(expected, current) {
     && (expected.currentInformationRequest?.revision || 0) === (current.currentInformationRequest?.revision || 0);
 }
 
+export function vendorEvidenceContextRefreshDecision({
+  currentContext,
+  incomingContext,
+  dirty = false,
+  formInitialized = false,
+  loadedVendorId = null,
+} = {}) {
+  const currentVendorId = loadedVendorId || currentContext?.vendorId || null;
+  const incomingVendorId = incomingContext?.vendorId || null;
+  const accountChanged = Boolean(
+    currentVendorId
+    && incomingVendorId
+    && currentVendorId !== incomingVendorId,
+  );
+  const contextChanged = Boolean(
+    incomingContext
+    && (!currentContext || !vendorEvidenceContextsMatch(currentContext, incomingContext)),
+  );
+  return {
+    accountChanged,
+    shouldResetForm: Boolean(
+      incomingContext
+      && (accountChanged || (!dirty && (!formInitialized || contextChanged))),
+    ),
+    conflict: Boolean(incomingContext && dirty && !accountChanged && contextChanged),
+  };
+}
+
 export function vendorEvidenceFieldRequested(field, request) {
   const normalized = normalizeInformationRequest(request);
   return Boolean(normalized?.requestedFields.includes(field));

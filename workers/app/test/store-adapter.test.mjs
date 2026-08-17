@@ -53,6 +53,10 @@ test("Durable Object storage errors preserve only safe conflict classifications"
   const classifications = [
     ["UNIQUE constraint failed: users.email", "unique_constraint"],
     ["vendor application evidence requires a pending or rejected vendor", "vendor_evidence_state_conflict"],
+    [
+      "legacy vendor evidence cannot resolve an active information request",
+      "vendor_evidence_revision_conflict",
+    ],
     ["vendor evidence must be completed and acknowledged before approval", "vendor_evidence_approval_conflict"],
     [
       "vendor review reasons must not contain evidence addresses or identity references",
@@ -1276,11 +1280,13 @@ test("schema v10 fresh install and interrupted v9-column restart converge withou
        ORDER BY name`,
     ).all().map((row) => row.name),
     [
+      "vendor_application_evidence_active_request_insert_v10",
       "vendor_application_evidence_immutable_delete",
       "vendor_application_evidence_immutable_update",
       "vendor_application_evidence_mirror_insert_v10",
       "vendor_application_evidence_revisions_actor_update",
       "vendor_application_evidence_revisions_apply_insert",
+      "vendor_application_evidence_revisions_compatibility_insert_v10",
       "vendor_application_evidence_revisions_delete",
       "vendor_application_evidence_revisions_identity_update",
       "vendor_application_evidence_revisions_state_insert",
@@ -1535,6 +1541,85 @@ test("schema v10 enforces contiguous immutable revisions, safe applicant text, a
       "UPDATE vendors SET evidence_latest_revision = 19 WHERE id = 'revision-cap-vendor'",
     ).run(),
     /latest revision must reference append-only history/,
+  );
+});
+
+test("schema v10 rejects a rolling v9 revision-one insert while an information request is active", () => {
+  const sqlite = new DatabaseSync(":memory:");
+  sqlite.exec(`CREATE TABLE _sql_schema_migrations (
+    id INTEGER PRIMARY KEY,
+    applied_at TEXT NOT NULL DEFAULT (datetime('now'))
+  )`);
+  sqlite.exec(STORE_SCHEMA_SQL);
+  const insertUser = sqlite.prepare(
+    `INSERT INTO users
+      (id, name, email, password_hash, password_salt, password_iterations, password_scheme, role)
+     VALUES (?, ?, ?, 'hash', 'salt', 100000, 'pbkdf2-server-v1', ?)`,
+  );
+  insertUser.run("rolling-owner", "Rolling Owner", "rolling-owner@example.com", "vendor");
+  insertUser.run("rolling-admin", "Rolling Admin", "rolling-admin@example.com", "admin");
+  sqlite.prepare(
+    `INSERT INTO vendors
+      (id, user_id, slug, business_name, status, category, categories_json, city, service_areas_json,
+       description, min_budget, max_budget, currency, evidence_required)
+     VALUES ('rolling-request-vendor', 'rolling-owner', 'rolling-request-vendor', 'Rolling Request Vendor',
+             'pending', 'photography', '["photography"]', 'Jaipur', '["Jaipur"]',
+             'An evidence-less application used to exercise an in-flight v9 completion after migration.',
+             100000, 500000, 'INR', 1)`,
+  ).run();
+  sqlite.prepare(
+    `INSERT INTO vendor_application_information_requests
+      (vendor_id, request_revision, evidence_revision, requested_fields_json, applicant_message,
+       requested_by_user_id, requested_at)
+     VALUES ('rolling-request-vendor', 1, 0, '["registration"]',
+             'Please complete the business registration declaration.', 'rolling-admin',
+             '2028-03-01T00:00:00.000Z')`,
+  ).run();
+
+  assert.throws(
+    () => sqlite.prepare(
+      `INSERT INTO vendor_application_evidence
+        (vendor_id, evidence_revision, portfolio_urls_json, reference_urls_json, registration_type,
+         registration_reference, attested, attested_at, created_at)
+       VALUES ('rolling-request-vendor', 1, '["https://rolling-work.example.com/gallery"]',
+               '["https://rolling-reference.example.com/review"]', 'not_registered', NULL, 1,
+               '2028-03-02T00:00:00.000Z', '2028-03-02T00:00:00.000Z')`,
+    ).run(),
+    /legacy vendor evidence cannot resolve an active information request/,
+  );
+
+  assert.deepEqual(
+    { ...sqlite.prepare(
+      `SELECT review_revision, evidence_latest_revision, information_request_revision, information_requested
+       FROM vendors WHERE id = 'rolling-request-vendor'`,
+    ).get() },
+    {
+      review_revision: 1,
+      evidence_latest_revision: 0,
+      information_request_revision: 1,
+      information_requested: 1,
+    },
+  );
+  assert.equal(
+    sqlite.prepare(
+      `SELECT COUNT(*) AS count FROM vendor_application_evidence
+       WHERE vendor_id = 'rolling-request-vendor'`,
+    ).get().count,
+    0,
+  );
+  assert.equal(
+    sqlite.prepare(
+      `SELECT COUNT(*) AS count FROM vendor_application_evidence_revisions
+       WHERE vendor_id = 'rolling-request-vendor'`,
+    ).get().count,
+    0,
+  );
+  assert.equal(
+    sqlite.prepare(
+      `SELECT COUNT(*) AS count FROM vendor_application_information_requests
+       WHERE vendor_id = 'rolling-request-vendor'`,
+    ).get().count,
+    1,
   );
 });
 

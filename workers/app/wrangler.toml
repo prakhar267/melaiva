@@ -4,7 +4,7 @@ compatibility_date = "2026-08-16"
 workers_dev = true
 
 [vars]
-APP_VERSION = "0.11.0"
+APP_VERSION = "0.12.0"
 ALLOWED_ORIGINS = ""
 GEMINI_MODEL = "gemini-3.5-flash"
 ENVIRONMENT = "production"
@@ -35,7 +35,7 @@ head_sampling_rate = 1
 name = "melaiva-staging"
 
 [env.staging.vars]
-APP_VERSION = "0.11.0-staging"
+APP_VERSION = "0.12.0-staging"
 ALLOWED_ORIGINS = ""
 GEMINI_MODEL = "gemini-3.5-flash"
 ENVIRONMENT = "production"

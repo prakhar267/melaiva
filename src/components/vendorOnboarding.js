@@ -32,6 +32,8 @@ const APPLICATION_LIMITS = Object.freeze({
 const EVIDENCE_URL_INPUT_MAX_LENGTH = 500;
 const EVIDENCE_URL_NORMALIZED_MAX_LENGTH = 300;
 const INSTAGRAM_HANDLE_PATTERN = /^@?[A-Za-z0-9._]{1,30}$/u;
+const VENDOR_EFFECTIVE_STATUSES = new Set(["pending", "approved", "rejected", "suspended", "needs_information"]);
+const INFORMATION_REQUEST_FIELDS = new Set(["portfolio", "references", "registration"]);
 
 function normalizedUniqueUrls(values) {
   return values.map((value) => normalizePublicWebsiteUrl(value)).filter(Boolean);
@@ -76,14 +78,233 @@ export function evidenceFocusIndexAfterRemoval(itemCount, removedIndex) {
 }
 
 export function canCompleteVendorEvidence(status, evidenceComplete) {
-  return evidenceComplete !== true && ["pending", "rejected"].includes(status);
+  return status === "needs_information"
+    || (evidenceComplete !== true && ["pending", "rejected"].includes(status));
 }
 
 export function vendorEvidenceCompletionEligibility(vendor) {
   if (!vendor) return "no_application";
-  if (vendor.evidenceComplete === true) return "complete";
-  if (!["pending", "rejected"].includes(vendor.status)) return "status_unavailable";
+  const effectiveStatus = normalizeVendorEffectiveStatus(vendor.effectiveStatus ?? vendor.status);
+  if (!effectiveStatus) return "status_unavailable";
+  if (effectiveStatus === "needs_information") {
+    const request = normalizeInformationRequest(vendor.currentInformationRequest);
+    const informationRequestRevision = Number(vendor.informationRequestRevision);
+    const evidenceRevision = Number(vendor.evidenceRevision ?? vendor.evidenceSummary?.revision ?? vendor.evidence?.revision ?? 0);
+    const fullEvidenceRevision = Number(vendor.evidence?.revision);
+    if (!request
+      || !Number.isInteger(informationRequestRevision)
+      || request.revision !== informationRequestRevision
+      || vendor.evidenceConsistent === false
+      || !Number.isInteger(evidenceRevision)
+      || request.evidenceRevision !== evidenceRevision) return "status_unavailable";
+    if (request.evidenceRevision === 0) return vendor.evidence ? "status_unavailable" : "revision";
+    return Number.isInteger(fullEvidenceRevision) && fullEvidenceRevision === request.evidenceRevision
+      ? "revision"
+      : "status_unavailable";
+  }
+  const evidenceRevision = Number(vendor.evidenceRevision ?? vendor.evidenceSummary?.revision ?? vendor.evidence?.revision);
+  if (vendor.evidenceComplete === true || (Number.isInteger(evidenceRevision) && evidenceRevision >= 1)) return "complete";
+  if (!["pending", "rejected"].includes(effectiveStatus)) return "status_unavailable";
   return "eligible";
+}
+
+export function normalizeVendorEffectiveStatus(value) {
+  return VENDOR_EFFECTIVE_STATUSES.has(value) ? value : null;
+}
+
+export function normalizeInformationRequest(request) {
+  if (!request) return null;
+  const revision = request.revision === null || request.revision === undefined ? Number.NaN : Number(request.revision);
+  const evidenceRevision = request.evidenceRevision === null || request.evidenceRevision === undefined
+    ? Number.NaN
+    : Number(request.evidenceRevision);
+  const requestedFieldsValid = Array.isArray(request.requestedFields)
+    && request.requestedFields.length >= 1
+    && request.requestedFields.length <= INFORMATION_REQUEST_FIELDS.size
+    && request.requestedFields.every((field) => INFORMATION_REQUEST_FIELDS.has(field))
+    && new Set(request.requestedFields).size === request.requestedFields.length;
+  const requestedFields = requestedFieldsValid ? [...request.requestedFields] : [];
+  const applicantMessage = typeof request.applicantMessage === "string" ? request.applicantMessage.trim() : "";
+  if (
+    !Number.isInteger(revision)
+    || revision < 1
+    || !Number.isInteger(evidenceRevision)
+    || evidenceRevision < 0
+    || !requestedFieldsValid
+    || !applicantMessage
+  ) return null;
+  return {
+    revision,
+    evidenceRevision,
+    requestedFields,
+    applicantMessage,
+    requestedAt: typeof request.requestedAt === "string" ? request.requestedAt : null,
+  };
+}
+
+function normalizeEvidenceSnapshot(evidence) {
+  if (!evidence) return null;
+  const revision = Number(evidence.revision);
+  if (!Number.isInteger(revision) || revision < 1) return null;
+  return {
+    revision,
+    portfolioUrls: Array.isArray(evidence.portfolioUrls)
+      ? evidence.portfolioUrls.filter((value) => typeof value === "string")
+      : [],
+    referenceUrls: Array.isArray(evidence.referenceUrls)
+      ? evidence.referenceUrls.filter((value) => typeof value === "string")
+      : [],
+    registrationType: typeof evidence.registrationType === "string" ? evidence.registrationType : "",
+    registrationReference: typeof evidence.registrationReference === "string" ? evidence.registrationReference : "",
+    attested: evidence.attested === true,
+    attestedAt: typeof evidence.attestedAt === "string" ? evidence.attestedAt : null,
+  };
+}
+
+export function normalizeVendorEvidenceContext(payload) {
+  const value = payload?.data || payload || {};
+  const effectiveStatus = normalizeVendorEffectiveStatus(value.effectiveStatus);
+  const reviewRevision = value.reviewRevision === null || value.reviewRevision === undefined
+    ? Number.NaN
+    : Number(value.reviewRevision);
+  const informationRequestRevision = value.informationRequestRevision === null || value.informationRequestRevision === undefined
+    ? Number.NaN
+    : Number(value.informationRequestRevision);
+  const evidence = normalizeEvidenceSnapshot(value.evidence);
+  const summaryRevision = Number(value.evidenceSummary?.revision);
+  const directEvidenceRevision = value.evidenceRevision === null || value.evidenceRevision === undefined
+    ? Number.NaN
+    : Number(value.evidenceRevision);
+  const evidenceRevision = Number.isInteger(directEvidenceRevision) && directEvidenceRevision >= 1
+    ? directEvidenceRevision
+    : Number.isInteger(summaryRevision) && summaryRevision >= 1
+      ? summaryRevision
+      : evidence?.revision ?? 0;
+  const evidenceConsistent = (!Number.isInteger(directEvidenceRevision) || directEvidenceRevision === evidenceRevision)
+    && (!Number.isInteger(summaryRevision) || summaryRevision === evidenceRevision)
+    && (!evidence || evidence.revision === evidenceRevision);
+  const currentInformationRequest = normalizeInformationRequest(value.currentInformationRequest);
+  return {
+    vendorId: typeof value.vendorId === "string" ? value.vendorId : typeof value.id === "string" ? value.id : "",
+    status: normalizeVendorEffectiveStatus(value.status),
+    effectiveStatus,
+    reviewRevision: Number.isInteger(reviewRevision) && reviewRevision >= 0 ? reviewRevision : null,
+    informationRequestRevision: Number.isInteger(informationRequestRevision) && informationRequestRevision >= 0
+      ? informationRequestRevision
+      : null,
+    evidenceRequired: value.evidenceRequired !== false,
+    evidenceRevision,
+    evidenceConsistent,
+    evidence,
+    currentInformationRequest,
+  };
+}
+
+export function prefillVendorEvidence(context) {
+  const evidence = context?.evidence;
+  return {
+    portfolioUrls: evidence?.portfolioUrls?.length ? [...evidence.portfolioUrls] : [""],
+    referenceUrls: evidence?.referenceUrls?.length ? [...evidence.referenceUrls] : [""],
+    registrationType: evidence?.registrationType || "",
+    registrationReference: evidence?.registrationReference || "",
+    // Every new immutable snapshot needs a fresh applicant attestation.
+    attested: false,
+  };
+}
+
+export function buildVendorEvidenceSubmissionPayload(evidence, context) {
+  if (
+    !context
+    || !context.vendorId
+    || !["pending", "rejected", "needs_information"].includes(context.effectiveStatus)
+    || !Number.isInteger(context.reviewRevision)
+    || !Number.isInteger(context.informationRequestRevision)
+  ) return null;
+  const informationRequestRevision = context.informationRequestRevision;
+  if (
+    context.effectiveStatus === "needs_information"
+    && (!context.currentInformationRequest || context.currentInformationRequest.revision !== informationRequestRevision)
+  ) return null;
+  if (context.effectiveStatus === "needs_information") {
+    const requestedEvidenceRevision = context.currentInformationRequest.evidenceRevision;
+    if (context.evidenceConsistent === false) return null;
+    if (requestedEvidenceRevision !== context.evidenceRevision) return null;
+    if (requestedEvidenceRevision > 0 && context.evidence?.revision !== requestedEvidenceRevision) return null;
+    if (requestedEvidenceRevision === 0 && context.evidence) return null;
+  }
+  return {
+    evidence: buildVendorEvidence(evidence),
+    expectedStatus: context.effectiveStatus,
+    expectedRevision: context.reviewRevision,
+    expectedEvidenceRevision: Number.isInteger(context.evidenceRevision) ? context.evidenceRevision : 0,
+    expectedInformationRequestRevision: informationRequestRevision,
+  };
+}
+
+export function shouldPreflightVendorEvidenceSubmission({ evidenceOnly, submissionUnconfirmed }) {
+  return Boolean(evidenceOnly && !submissionUnconfirmed);
+}
+
+export function vendorEvidenceContextsMatch(expected, current) {
+  if (!expected || !current) return false;
+  return expected.vendorId === current.vendorId
+    && expected.effectiveStatus === current.effectiveStatus
+    && expected.reviewRevision === current.reviewRevision
+    && expected.evidenceRevision === current.evidenceRevision
+    && expected.informationRequestRevision === current.informationRequestRevision
+    && (expected.currentInformationRequest?.revision || 0) === (current.currentInformationRequest?.revision || 0);
+}
+
+export function vendorEvidenceContextRefreshDecision({
+  currentContext,
+  incomingContext,
+  dirty = false,
+  formInitialized = false,
+  loadedVendorId = null,
+} = {}) {
+  const currentVendorId = loadedVendorId || currentContext?.vendorId || null;
+  const incomingVendorId = incomingContext?.vendorId || null;
+  const accountChanged = Boolean(
+    currentVendorId
+    && incomingVendorId
+    && currentVendorId !== incomingVendorId,
+  );
+  const contextChanged = Boolean(
+    incomingContext
+    && (!currentContext || !vendorEvidenceContextsMatch(currentContext, incomingContext)),
+  );
+  return {
+    accountChanged,
+    shouldResetForm: Boolean(
+      incomingContext
+      && (accountChanged || (!dirty && (!formInitialized || contextChanged))),
+    ),
+    conflict: Boolean(incomingContext && dirty && !accountChanged && contextChanged),
+  };
+}
+
+export function vendorEvidenceFieldRequested(field, request) {
+  const normalized = normalizeInformationRequest(request);
+  return Boolean(normalized?.requestedFields.includes(field));
+}
+
+export function vendorEvidenceConflictState(error) {
+  if (![409, 412].includes(Number(error?.status))) return null;
+  if (["vendor_evidence_exists", "vendor_evidence_conflict"].includes(error?.code)) return "evidence_changed";
+  if (["vendor_information_request_conflict", "vendor_information_request_resolved"].includes(error?.code)) return "request_changed";
+  return "application_changed";
+}
+
+export function vendorEvidenceServerFieldErrors(details) {
+  if (!Array.isArray(details)) return {};
+  const errors = {};
+  for (const detail of details) {
+    const rawField = Array.isArray(detail?.path) ? detail.path.join(".") : detail?.field;
+    const field = String(rawField || "").replace(/^evidence\./u, "");
+    if (!field || typeof detail?.message !== "string") continue;
+    errors[field] = detail.message;
+  }
+  return errors;
 }
 
 export function validateVendorApplication(application) {

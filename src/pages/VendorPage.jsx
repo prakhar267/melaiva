@@ -41,12 +41,23 @@ import { formatUnreadMessageCount, targetScrollLeftForControl } from "../compone
 import { useBookingInbox } from "../components/useBookingInbox.js";
 import {
   buildVendorEvidence,
+  buildVendorEvidenceSubmissionPayload,
   canCompleteVendorEvidence,
   evidenceFocusIndexAfterRemoval,
+  normalizeInformationRequest,
+  normalizeVendorEffectiveStatus,
+  normalizeVendorEvidenceContext,
+  prefillVendorEvidence,
+  shouldPreflightVendorEvidenceSubmission,
   VENDOR_REGISTRATION_OPTIONS,
   validateVendorApplication,
   validateVendorEvidence,
   vendorEvidenceCompletionEligibility,
+  vendorEvidenceConflictState,
+  vendorEvidenceContextRefreshDecision,
+  vendorEvidenceContextsMatch,
+  vendorEvidenceFieldRequested,
+  vendorEvidenceServerFieldErrors,
 } from "../components/vendorOnboarding.js";
 import { checkVendorApplicationEvidenceCompatibility } from "../components/vendorApplicationCompatibility.js";
 
@@ -388,8 +399,41 @@ function VendorEmpty({ type }) {
   return <div className="vendor-empty"><span><Icon size={28} /></span><h2>{type === "profile" ? "Your business profile" : "Live conversations are unavailable in preview"}</h2><p>{type === "profile" ? "Complete onboarding to manage portfolio details, service areas and starting budgets here." : "Sign in to read messages connected to awarded work. No example conversations are fabricated."}</p>{type === "profile" && <Link className="button button--primary" to="/vendor/onboarding">Complete profile</Link>}</div>;
 }
 
-function VendorAccessState({ icon: Icon, eyebrow, title, message, children }) {
-  return <div className="shell vendor-access-state"><div className="vendor-empty"><span><Icon size={29} /></span><div className="eyebrow">{eyebrow}</div><h1>{title}</h1><p>{message}</p><div className="vendor-access-state__actions">{children}</div></div></div>;
+function VendorAccessState({ icon: Icon, eyebrow, title, message, details, tone = "default", children }) {
+  return <div className={`shell vendor-access-state vendor-access-state--${tone}`}><div className="vendor-empty"><span><Icon size={29} /></span><div className="eyebrow">{eyebrow}</div><h1>{title}</h1><p>{message}</p>{details}<div className="vendor-access-state__actions">{children}</div></div></div>;
+}
+
+const OWNER_INFORMATION_FIELD_LABELS = Object.freeze({
+  portfolio: "Portfolio or work samples",
+  references: "Public reviews or references",
+  registration: "Business-registration disclosure",
+});
+
+function VendorApplicationStatus({ vendor }) {
+  const effectiveStatus = normalizeVendorEffectiveStatus(vendor?.effectiveStatus);
+  const evidenceComplete = Number(vendor?.evidenceRevision) >= 1 || vendor?.evidenceComplete === true;
+  if (effectiveStatus === "needs_information") {
+    const request = normalizeInformationRequest(vendor?.currentInformationRequest);
+    if (!request) {
+      return <VendorAccessState icon={ShieldAlert} eyebrow="Application status unavailable" title="We cannot safely open this evidence request" message="The service did not return a complete information-request record. No application data can be changed until the latest status is available."><button className="button button--primary" type="button" onClick={() => window.location.reload()}><RefreshCw size={16} /> Refresh status</button><Link className="button button--outline" to="/marketplace">View public marketplace</Link></VendorAccessState>;
+    }
+    const details = (
+      <section className="vendor-information-request" aria-labelledby="vendor-information-request-heading">
+        <div><FileCheck2 size={18} /><div><h2 id="vendor-information-request-heading">What the partner team needs updated</h2><p>Request {request.revision} · based on evidence revision {request.evidenceRevision || "none"}{request.requestedAt ? ` · ${formatDate(request.requestedAt)}` : ""}</p></div></div>
+        <ul>{request.requestedFields.map((field) => <li key={field}><Check size={14} />{OWNER_INFORMATION_FIELD_LABELS[field]}</li>)}</ul>
+        <blockquote>{request.applicantMessage}</blockquote>
+      </section>
+    );
+    return <VendorAccessState icon={CircleAlert} tone="information" eyebrow="Action needed" title="Update your review evidence" message="Marketplace access remains locked while this request is open. Review the instructions, update the relevant evidence, and submit one complete new snapshot." details={details}><Link className="button button--primary" to="/vendor/onboarding?mode=evidence">Revise review evidence <ArrowRight size={16} /></Link><Link className="button button--outline" to="/marketplace">View public marketplace</Link></VendorAccessState>;
+  }
+  if (effectiveStatus === "pending") {
+    const needsInitialEvidence = !evidenceComplete;
+    return <VendorAccessState icon={needsInitialEvidence ? FileCheck2 : ShieldCheck} eyebrow="Application status" title={needsInitialEvidence ? "Complete your review evidence" : "Your application is in review"} message={needsInitialEvidence ? (vendor?.evidenceRequired === false ? "This earlier application has no structured evidence snapshot. Add public work, reference and business evidence before an accountable review." : "Structured evidence is still required before this application can be approved.") : `Evidence revision ${vendor.evidenceRevision} is with the partner team. Submission does not guarantee approval.`}>{canCompleteVendorEvidence(effectiveStatus, evidenceComplete) && <Link className="button button--primary" to="/vendor/onboarding?mode=evidence">Complete review evidence</Link>}<Link className="button button--outline" to="/marketplace">View public marketplace</Link></VendorAccessState>;
+  }
+  if (effectiveStatus === "rejected") {
+    return <VendorAccessState icon={ShieldAlert} tone="rejected" eyebrow="Application decision" title="Your application was declined" message="This business is not eligible for private briefs or offers. If the partner team needs corrected evidence later, a new information request will appear here."><Link className="button button--primary" to="/marketplace">View public marketplace</Link><Link className="button button--outline" to="/">Return home</Link></VendorAccessState>;
+  }
+  return <VendorAccessState icon={ShieldAlert} eyebrow="Application status unavailable" title="We cannot safely show this application state" message="Refresh after the secure service upgrade. No application data can be changed while the state is unknown."><button className="button button--primary" type="button" onClick={() => window.location.reload()}><RefreshCw size={16} /> Refresh status</button><Link className="button button--outline" to="/marketplace">View public marketplace</Link></VendorAccessState>;
 }
 
 export function VendorPage({ notify, onOpenAuth, authRevision = 0 }) {
@@ -419,16 +463,25 @@ export function VendorPage({ notify, onOpenAuth, authRevision = 0 }) {
         const nextUser = mePayload.data?.user;
         const nextVendor = mePayload.data?.vendor;
         if (!nextVendor) { if (!controller.signal.aborted) { setProfile({ user: nextUser, vendor: nextVendor }); setMode("not-vendor"); } return; }
-        if (nextVendor.status !== "approved") {
+        const vendorContext = normalizeVendorEvidenceContext(nextVendor);
+        const normalizedVendor = {
+          ...nextVendor,
+          effectiveStatus: vendorContext.effectiveStatus,
+          reviewRevision: vendorContext.reviewRevision,
+          evidenceRevision: vendorContext.evidenceRevision,
+          evidenceComplete: vendorContext.evidenceRevision >= 1,
+          currentInformationRequest: vendorContext.currentInformationRequest,
+        };
+        if (vendorContext.effectiveStatus !== "approved") {
           if (!controller.signal.aborted) {
-            setProfile({ user: nextUser, vendor: nextVendor });
-            if (["suspended", "rejected"].includes(nextVendor.status)) {
+            setProfile({ user: nextUser, vendor: normalizedVendor });
+            if (vendorContext.effectiveStatus === "suspended") {
               setAwardsLoading(true);
               setAwardsError("");
               setActive("messages");
               setMode("restricted");
             } else {
-              setMode("pending");
+              setMode("application");
             }
           }
           return;
@@ -442,7 +495,7 @@ export function VendorPage({ notify, onOpenAuth, authRevision = 0 }) {
           readApiResponse(offerResponse, "Your submitted offers could not be loaded."),
         ]);
         if (controller.signal.aborted) return;
-        setProfile({ user: nextUser, vendor: nextVendor });
+        setProfile({ user: nextUser, vendor: normalizedVendor });
         setOpportunities((Array.isArray(auctionPayload.data) ? auctionPayload.data : []).map(toOpportunity));
         setOffers(Array.isArray(offerPayload.data) ? offerPayload.data : []);
         setAwardsLoading(true);
@@ -491,7 +544,7 @@ export function VendorPage({ notify, onOpenAuth, authRevision = 0 }) {
   if (mode === "loading") return <div className="vendor-page page-surface"><VendorAccessState icon={LoaderCircle} eyebrow="Loading partner workspace" title="Checking your business profile" message="Retrieving approval status, live opportunities and submitted offers." /></div>;
   if (mode === "guest") return <div className="vendor-page page-surface"><VendorAccessState icon={LockKeyhole} eyebrow="Private partner workspace" title="Sign in to see live opportunities" message="Only approved vendor accounts can read private briefs and submit offers."><button className="button button--primary" type="button" onClick={onOpenAuth}>Sign in</button><Link className="button button--outline" to="/vendor/onboarding">Apply to join</Link></VendorAccessState></div>;
   if (mode === "not-vendor") return <div className="vendor-page page-surface"><VendorAccessState icon={Store} eyebrow="Partner application" title="Introduce your business first" message="Complete the partner application before accessing private opportunities or sending proposals."><Link className="button button--primary" to="/vendor/onboarding">Start application</Link><Link className="button button--outline" to="/dashboard">Open couple workspace</Link></VendorAccessState></div>;
-  if (mode === "pending") return <div className="vendor-page page-surface"><VendorAccessState icon={ShieldCheck} eyebrow="Application status" title={`Your application is ${profile.vendor.status}.`} message={profile.vendor.evidenceComplete ? "Private briefs remain locked until the partner review is complete. Submission does not guarantee approval." : profile.vendor.evidenceRequired === false ? "This legacy application has no structured evidence snapshot. Add public work and business evidence before a future accountable review." : "Structured evidence is still required before this application can be approved. Add the public work and business evidence needed for an accountable review."}>{canCompleteVendorEvidence(profile.vendor.status, profile.vendor.evidenceComplete) && <Link className="button button--primary" to="/vendor/onboarding?mode=evidence">Complete review evidence</Link>}<Link className="button button--outline" to="/marketplace">View public marketplace</Link></VendorAccessState></div>;
+  if (mode === "application") return <div className="vendor-page page-surface"><VendorApplicationStatus vendor={profile.vendor} /></div>;
 
   const restricted = mode === "restricted";
   const businessName = ["live", "restricted"].includes(mode) ? profile.vendor.businessName : "Example partner studio";
@@ -517,12 +570,12 @@ export function VendorPage({ notify, onOpenAuth, authRevision = 0 }) {
   );
 }
 
-function OnboardingHero({ evidenceOnly = false }) {
+function OnboardingHero({ evidenceOnly = false, revisionMode = false }) {
   return (
     <section className="onboarding-hero">
       <div className="shell">
-        <div><Link className="back-link" to="/vendor"><ArrowLeft size={15} /> Vendor workspace</Link><div className="eyebrow eyebrow--light">Melaiva partner network</div><h1>{evidenceOnly ? <>Complete your record.<br /><em>Make review accountable.</em></> : <>Bring your best work.<br /><em>Meet better-fit briefs.</em></>}</h1></div>
-        <p>{evidenceOnly ? "Attach the structured public work and business evidence missing from your earlier application. Your existing profile remains unchanged." : "Apply with the public work and business evidence our partner team needs to make an accountable marketplace decision."}</p>
+        <div><Link className="back-link" to="/vendor"><ArrowLeft size={15} /> Vendor workspace</Link><div className="eyebrow eyebrow--light">Melaiva partner network</div><h1>{revisionMode ? <>Revise your evidence.<br /><em>Keep review moving.</em></> : evidenceOnly ? <>Complete your record.<br /><em>Make review accountable.</em></> : <>Bring your best work.<br /><em>Meet better-fit briefs.</em></>}</h1></div>
+        <p>{revisionMode ? "Start from your latest complete snapshot, follow the partner team’s request, and submit one new immutable revision. Your business profile remains unchanged." : evidenceOnly ? "Attach the structured public work and business evidence missing from your earlier application. Your existing profile remains unchanged." : "Apply with the public work and business evidence our partner team needs to make an accountable marketplace decision."}</p>
       </div>
     </section>
   );
@@ -545,30 +598,37 @@ function OnboardingGate({ icon: Icon, spinning = false, eyebrow, title, message,
   );
 }
 
-function OnboardingSuccess({ evidenceOnly = false }) {
-  return <div className="onboarding-success"><span><CheckCircle2 size={32} /></span><div className="eyebrow">{evidenceOnly ? "Evidence attached" : "Application received"}</div><h1>{evidenceOnly ? "Your review record is now complete." : "Thank you for introducing your work."}</h1><p>{evidenceOnly ? "The submitted evidence snapshot is now available to the partner team for the next accountable review." : "Our partner team will review the submitted profile and evidence before deciding marketplace eligibility."}</p><Link className="button button--primary" to="/vendor">Check application status <ArrowRight size={17} /></Link></div>;
+function OnboardingSuccess({ evidenceOnly = false, success }) {
+  const headingRef = useRef(null);
+  useEffect(() => { headingRef.current?.focus(); }, []);
+  const revision = Number(success?.evidenceRevision);
+  const revised = evidenceOnly && success?.revised === true;
+  return <div className="onboarding-success" role="status" aria-live="polite"><span><CheckCircle2 size={32} /></span><div className="eyebrow">{revised ? "Revision submitted" : evidenceOnly ? "Evidence attached" : "Application received"}</div><h1 ref={headingRef} tabIndex="-1">{revised ? `Evidence revision ${revision} is submitted.` : evidenceOnly && Number.isInteger(revision) ? `Evidence revision ${revision} is submitted.` : evidenceOnly ? "Your review record is now complete." : "Thank you for introducing your work."}</h1><p>{revised && success?.hadPreviousEvidence ? "The complete snapshot is now with the partner team. The previous immutable evidence revision remains in the review record." : revised ? "The complete snapshot has closed the information request and returned your application to review." : evidenceOnly ? "The complete snapshot is now available for an accountable review. Your existing application decision is unchanged until the partner team records a new one." : "Our partner team will review the submitted profile and evidence before deciding marketplace eligibility."}</p><Link className="button button--primary" to="/vendor">Check application status <ArrowRight size={17} /></Link></div>;
 }
 
-function OnboardingError({ children }) {
-  return children ? <small className="field-error" role="alert">{children}</small> : null;
+function OnboardingError({ id, children }) {
+  return children ? <small className="field-error" id={id} role="alert">{children}</small> : null;
 }
 
 async function readVendorEvidenceCompletionAccess({ signal } = {}) {
-  const response = await fetch("/api/v1/auth/me", { cache: "no-store", credentials: "include", signal });
-  if (response.status === 401) return { state: "guest", vendorStatus: null };
+  const response = await fetch("/api/v1/vendors/onboarding/evidence", { cache: "no-store", credentials: "include", signal });
+  if (response.status === 401) return { state: "guest", vendorStatus: null, context: null };
+  if (response.status === 404) return { state: "no_application", vendorStatus: null, context: null };
   const payload = await readApiResponse(response, "Application eligibility could not be checked.");
-  const vendor = payload.data?.vendor || null;
+  const context = normalizeVendorEvidenceContext(payload);
   return {
-    state: vendorEvidenceCompletionEligibility(vendor),
-    vendorStatus: vendor?.status || null,
+    state: vendorEvidenceCompletionEligibility(context),
+    vendorStatus: context.effectiveStatus,
+    context,
   };
 }
 
-function EvidenceUrlFields({ id, label, description, values, minimum, maximum, errors, onChange, onAdd, onRemove }) {
+function EvidenceUrlFields({ id, label, description, values, minimum, maximum, errors, requested = false, onChange, onAdd, onRemove }) {
+  const groupErrorId = `${id}-error`;
   return (
-    <div className="onboarding-evidence-links">
+    <div className={`onboarding-evidence-links ${requested ? "is-requested" : ""}`}>
       <div className="onboarding-evidence-links__heading">
-        <div><strong>{label}</strong><p>{description}</p></div>
+        <div><strong>{label}{requested && <span className="onboarding-requested-badge">Update requested</span>}</strong><p>{description}</p></div>
         <small>{minimum === 1 ? "At least 1" : `At least ${minimum}`} · Up to {maximum}</small>
       </div>
       <div className="onboarding-evidence-links__list">
@@ -576,15 +636,15 @@ function EvidenceUrlFields({ id, label, description, values, minimum, maximum, e
           <div className="onboarding-evidence-link" key={`${id}-${index}`}>
             <label className="field">
               <span>{label.replace(/s$/u, "")} {index + 1}{index >= minimum ? <small>Optional</small> : null}</span>
-              <div className="input-wrap"><Link2 size={16} /><input type="url" inputMode="url" value={value} onChange={(event) => onChange(index, event.target.value)} placeholder="https://" maxLength="500" data-evidence-field={id} data-evidence-index={index} aria-invalid={Boolean(errors[`${id}.${index}`])} required={index < minimum} /></div>
-              <OnboardingError>{errors[`${id}.${index}`]}</OnboardingError>
+              <div className="input-wrap"><Link2 size={16} /><input type="url" inputMode="url" value={value} onChange={(event) => onChange(index, event.target.value)} placeholder="https://" maxLength="500" data-evidence-field={id} data-evidence-index={index} aria-invalid={Boolean(errors[`${id}.${index}`] || errors[id])} aria-describedby={[errors[`${id}.${index}`] ? `${id}-${index}-error` : "", errors[id] ? groupErrorId : ""].filter(Boolean).join(" ") || undefined} required={index < minimum} /></div>
+              <OnboardingError id={`${id}-${index}-error`}>{errors[`${id}.${index}`]}</OnboardingError>
             </label>
             {values.length > minimum && <button className="icon-button icon-button--small" type="button" onClick={() => onRemove(index)} aria-label={`Remove ${label.toLowerCase().replace(/s$/u, "")} ${index + 1}`}><X size={16} /></button>}
           </div>
         ))}
       </div>
       {values.length < maximum && <button className="text-button onboarding-evidence-links__add" type="button" data-evidence-add={id} onClick={onAdd}><Plus size={14} /> Add another</button>}
-      <OnboardingError>{errors[id]}</OnboardingError>
+      <OnboardingError id={groupErrorId}>{errors[id]}</OnboardingError>
     </div>
   );
 }
@@ -613,14 +673,22 @@ export function VendorOnboardingPage({ notify, onOpenAuth, authRevision = 0 }) {
   const [errors, setErrors] = useState({});
   const [submitError, setSubmitError] = useState("");
   const [loading, setLoading] = useState(false);
-  const [success, setSuccess] = useState(false);
+  const [success, setSuccess] = useState(null);
   const [compatibility, setCompatibility] = useState("checking");
   const [compatibilityRetryKey, setCompatibilityRetryKey] = useState(0);
   const [evidenceAccess, setEvidenceAccess] = useState(evidenceOnly ? "checking" : "eligible");
   const [evidenceVendorStatus, setEvidenceVendorStatus] = useState(null);
+  const [evidenceContext, setEvidenceContext] = useState(null);
+  const [evidenceConflict, setEvidenceConflict] = useState(null);
+  const [submissionUnconfirmed, setSubmissionUnconfirmed] = useState(false);
   const [evidenceAccessRetryKey, setEvidenceAccessRetryKey] = useState(0);
   const submissionKeyRef = useRef(null);
   const formRef = useRef(null);
+  const formInitializedRef = useRef(false);
+  const dirtyRef = useRef(false);
+  const loadedVendorIdRef = useRef(null);
+  const evidenceReadSequenceRef = useRef(0);
+  const evidenceContextRef = useRef(null);
 
   useEffect(() => {
     const controller = new AbortController();
@@ -638,14 +706,21 @@ export function VendorOnboardingPage({ notify, onOpenAuth, authRevision = 0 }) {
   }, [compatibilityRetryKey]);
 
   useEffect(() => {
+    const readSequence = ++evidenceReadSequenceRef.current;
     if (!evidenceOnly) {
       setEvidenceAccess("eligible");
       setEvidenceVendorStatus(null);
+      evidenceContextRef.current = null;
+      setEvidenceContext(null);
       return undefined;
     }
     if (compatibility !== "ready") {
       setEvidenceAccess("checking");
       setEvidenceVendorStatus(null);
+      if (!dirtyRef.current) {
+        evidenceContextRef.current = null;
+        setEvidenceContext(null);
+      }
       return undefined;
     }
     const controller = new AbortController();
@@ -654,9 +729,44 @@ export function VendorOnboardingPage({ notify, onOpenAuth, authRevision = 0 }) {
     async function checkEvidenceAccess() {
       try {
         const result = await readVendorEvidenceCompletionAccess({ signal: controller.signal });
-        if (!controller.signal.aborted) {
+        if (!controller.signal.aborted && readSequence === evidenceReadSequenceRef.current) {
+          if (!result.context && dirtyRef.current) {
+            setEvidenceAccess(result.state);
+            setEvidenceVendorStatus(result.vendorStatus);
+            return;
+          }
+          const refreshDecision = vendorEvidenceContextRefreshDecision({
+            currentContext: evidenceContextRef.current,
+            incomingContext: result.context,
+            dirty: dirtyRef.current,
+            formInitialized: formInitializedRef.current,
+            loadedVendorId: loadedVendorIdRef.current,
+          });
+          if (refreshDecision.conflict) {
+            const preservedContext = evidenceContextRef.current;
+            setEvidenceAccess(preservedContext
+              ? vendorEvidenceCompletionEligibility(preservedContext)
+              : result.state);
+            setEvidenceVendorStatus(preservedContext?.effectiveStatus || result.vendorStatus);
+            setEvidenceConflict({ kind: "application_changed", latest: result });
+            setSubmitError("");
+            return;
+          }
           setEvidenceAccess(result.state);
           setEvidenceVendorStatus(result.vendorStatus);
+          evidenceContextRef.current = result.context;
+          setEvidenceContext(result.context);
+          if (refreshDecision.shouldResetForm) {
+            setForm((current) => ({ ...current, ...prefillVendorEvidence(result.context) }));
+            formInitializedRef.current = true;
+            dirtyRef.current = false;
+            submissionKeyRef.current = null;
+            setSubmissionUnconfirmed(false);
+            setEvidenceConflict(null);
+            setErrors({});
+            setSubmitError("");
+          }
+          if (result.context?.vendorId) loadedVendorIdRef.current = result.context.vendorId;
         }
       } catch (error) {
         if (error?.name !== "AbortError" && !controller.signal.aborted) setEvidenceAccess("error");
@@ -666,20 +776,26 @@ export function VendorOnboardingPage({ notify, onOpenAuth, authRevision = 0 }) {
     return () => controller.abort();
   }, [authRevision, compatibility, evidenceAccessRetryKey, evidenceOnly]);
 
-  function update(key, value) {
+  function markFormChanged() {
+    dirtyRef.current = true;
     submissionKeyRef.current = null;
+    setSubmissionUnconfirmed(false);
+  }
+
+  function update(key, value) {
+    markFormChanged();
     setForm((current) => ({ ...current, [key]: value }));
     setErrors((current) => ({ ...current, [key]: "" }));
     setSubmitError("");
   }
   function updateEvidenceUrl(key, index, value) {
-    submissionKeyRef.current = null;
+    markFormChanged();
     setForm((current) => ({ ...current, [key]: current[key].map((item, itemIndex) => itemIndex === index ? value : item) }));
     setErrors((current) => ({ ...current, [key]: "", [`${key}.${index}`]: "" }));
     setSubmitError("");
   }
   function addEvidenceUrl(key) {
-    submissionKeyRef.current = null;
+    markFormChanged();
     const nextIndex = form[key].length;
     setForm((current) => ({ ...current, [key]: [...current[key], ""] }));
     setErrors((current) => ({ ...current, [key]: "" }));
@@ -689,7 +805,7 @@ export function VendorOnboardingPage({ notify, onOpenAuth, authRevision = 0 }) {
       ?.focus());
   }
   function removeEvidenceUrl(key, index) {
-    submissionKeyRef.current = null;
+    markFormChanged();
     const nextIndex = evidenceFocusIndexAfterRemoval(form[key].length, index);
     setForm((current) => ({ ...current, [key]: current[key].filter((_, itemIndex) => itemIndex !== index) }));
     setErrors((current) => Object.fromEntries(Object.entries(current).filter(([errorKey]) => !errorKey.startsWith(`${key}.`))));
@@ -702,16 +818,53 @@ export function VendorOnboardingPage({ notify, onOpenAuth, authRevision = 0 }) {
     });
   }
 
+  async function reloadLatestEvidence() {
+    const readSequence = ++evidenceReadSequenceRef.current;
+    const expectedVendorId = loadedVendorIdRef.current;
+    setLoading(true);
+    setSubmitError("");
+    try {
+      const result = await readVendorEvidenceCompletionAccess();
+      if (readSequence !== evidenceReadSequenceRef.current
+        || (expectedVendorId && result.context?.vendorId && result.context.vendorId !== expectedVendorId)) return;
+      setEvidenceAccess(result.state);
+      setEvidenceVendorStatus(result.vendorStatus);
+      evidenceContextRef.current = result.context;
+      setEvidenceContext(result.context);
+      if (["eligible", "revision"].includes(result.state) && result.context) {
+        loadedVendorIdRef.current = result.context.vendorId;
+        setForm((current) => ({ ...current, ...prefillVendorEvidence(result.context) }));
+        formInitializedRef.current = true;
+        dirtyRef.current = false;
+        submissionKeyRef.current = null;
+        setSubmissionUnconfirmed(false);
+        setEvidenceConflict(null);
+        setErrors({});
+      }
+    } catch (error) {
+      if (readSequence === evidenceReadSequenceRef.current) {
+        setSubmitError(error.message || "The latest evidence request could not be loaded. Your edits remain in this form.");
+      }
+    } finally {
+      setLoading(false);
+    }
+  }
+
   async function submit(event) {
     event.preventDefault();
+    const retryingUnconfirmedSubmission = submissionUnconfirmed;
     if (compatibility !== "ready") {
       setSubmitError(compatibility === "upgrade"
         ? "Applications are temporarily paused during a service upgrade. Nothing was submitted."
         : "Secure submission compatibility has not been confirmed. Nothing was submitted.");
       return;
     }
-    if (evidenceOnly && evidenceAccess !== "eligible") {
-      setSubmitError("This account is not currently eligible to add evidence. Nothing was submitted.");
+    if (evidenceOnly && !["eligible", "revision"].includes(evidenceAccess)) {
+      setSubmitError("This account is not currently eligible to submit evidence. Nothing was submitted.");
+      return;
+    }
+    if (evidenceOnly && evidenceConflict) {
+      setSubmitError("Load the latest application version before submitting. Your current edits remain in this form until you choose to replace them.");
       return;
     }
     const serviceAreas = form.serviceAreas.split(",").map((item) => item.trim()).filter(Boolean);
@@ -722,7 +875,7 @@ export function VendorOnboardingPage({ notify, onOpenAuth, authRevision = 0 }) {
       window.requestAnimationFrame(() => formRef.current?.querySelector('[aria-invalid="true"]')?.focus());
       return;
     }
-    setLoading(true); setSubmitError("");
+    setLoading(true); setSubmitError(""); setErrors({});
     const evidence = buildVendorEvidence(form);
     const applicationPayload = {
       businessName: form.businessName.trim(),
@@ -740,24 +893,31 @@ export function VendorOnboardingPage({ notify, onOpenAuth, authRevision = 0 }) {
       instagramHandle: form.instagramHandle.trim() || undefined,
       evidence,
     };
-    const payload = evidenceOnly ? { evidence } : applicationPayload;
+    const expectedContext = evidenceContext;
+    const payload = evidenceOnly ? buildVendorEvidenceSubmissionPayload(form, expectedContext) : applicationPayload;
+    if (evidenceOnly && !payload) {
+      setLoading(false);
+      setSubmitError("The application version needed for a safe update is unavailable. Refresh the latest evidence request before submitting.");
+      return;
+    }
     let submissionStarted = false;
     let compatibilityConfirmed = false;
     try {
       const compatible = await checkVendorApplicationEvidenceCompatibility();
       if (!compatible) {
         setCompatibility("upgrade");
-        setSubmitError("Applications are temporarily paused during a service upgrade. Your entries remain in this form and nothing was submitted.");
+        setSubmitError(retryingUnconfirmedSubmission
+          ? "The secure service is still unavailable, so the earlier submission remains unconfirmed. Your unchanged form and secure submission key are preserved."
+          : "Applications are temporarily paused during a service upgrade. Your entries remain in this form and nothing was submitted.");
         return;
       }
       compatibilityConfirmed = true;
       setCompatibility("ready");
-      if (evidenceOnly) {
+      if (shouldPreflightVendorEvidenceSubmission({ evidenceOnly, submissionUnconfirmed: retryingUnconfirmedSubmission })) {
         const accessResult = await readVendorEvidenceCompletionAccess();
-        if (accessResult.state !== "eligible") {
-          setEvidenceAccess(accessResult.state);
-          setEvidenceVendorStatus(accessResult.vendorStatus);
-          setSubmitError("Application eligibility changed before submission. Your entries remain in this form and nothing was submitted.");
+        if (!["eligible", "revision"].includes(accessResult.state) || !vendorEvidenceContextsMatch(expectedContext, accessResult.context)) {
+          setEvidenceConflict({ kind: "application_changed", latest: accessResult });
+          setSubmitError("The application or information request changed before submission. Your edits are preserved and nothing was submitted.");
           return;
         }
       }
@@ -766,38 +926,81 @@ export function VendorOnboardingPage({ notify, onOpenAuth, authRevision = 0 }) {
       submissionStarted = true;
       const response = await fetch(evidenceOnly ? "/api/v1/vendors/onboarding/evidence" : "/api/v1/vendors/onboarding", { method: evidenceOnly ? "PUT" : "POST", headers: { "Content-Type": "application/json", "Idempotency-Key": submissionKey }, credentials: "include", body: JSON.stringify(payload) });
       if (response.status === 401) { onOpenAuth(); throw Object.assign(new Error("Sign in or create an account, then submit this form again."), { code: "SIGN_IN" }); }
-      await readApiResponse(response, "The application could not be submitted.");
-      setSuccess(true); notify({ title: evidenceOnly ? "Evidence attached" : "Application received", message: evidenceOnly ? "The partner team can now review the submitted evidence snapshot." : "The partner team will review your profile and evidence." });
+      const responsePayload = await readApiResponse(response, "The application could not be submitted.");
+      const responseData = responsePayload?.data || responsePayload || {};
+      if (evidenceOnly) {
+        const evidenceRevision = Number(responseData.evidenceSummary?.revision);
+        if (!Number.isInteger(evidenceRevision) || evidenceRevision < 1) {
+          throw Object.assign(new Error("The service accepted the request but did not return the saved evidence revision."), { code: "CONFIRMATION_MISSING" });
+        }
+        const revised = expectedContext?.effectiveStatus === "needs_information";
+        setSuccess({ evidenceRevision, revised, hadPreviousEvidence: Number(expectedContext?.evidenceRevision) >= 1 });
+        notify({ title: revised ? `Evidence revision ${evidenceRevision} submitted` : `Evidence revision ${evidenceRevision} attached`, message: "The complete snapshot is ready for the partner team to review." });
+      } else {
+        setSuccess({ application: true });
+        notify({ title: "Application received", message: "The partner team will review your profile and evidence." });
+      }
     } catch (requestError) {
       if (!submissionStarted) {
-        if (!compatibilityConfirmed) {
+        if (retryingUnconfirmedSubmission) {
+          setSubmissionUnconfirmed(true);
+          setSubmitError("We still could not confirm the earlier submission. Your unchanged form and secure submission key are preserved for another safe retry.");
+        } else if (!compatibilityConfirmed) {
           setCompatibility("error");
           setSubmitError("Secure submission compatibility could not be confirmed. Your entries remain in this form and nothing was submitted.");
         } else if (evidenceOnly) {
-          setEvidenceAccess("error");
           setSubmitError("Application eligibility could not be confirmed. Your entries remain in this form and nothing was submitted.");
         } else {
           setSubmitError("The application could not be prepared. Your entries remain in this form and nothing was submitted.");
         }
       } else if (requestError.code === "SIGN_IN") setSubmitError(requestError.message);
-      else if (isServiceUnavailable(requestError)) setSubmitError("The live service is unavailable. Your form is still open and nothing was stored or submitted.");
-      else setSubmitError(requestError.message || "The application could not be submitted. Please review the fields and try again.");
+      else if (evidenceOnly && vendorEvidenceConflictState(requestError)) {
+        let latest = null;
+        try {
+          latest = await readVendorEvidenceCompletionAccess();
+        } catch {
+          // Preserve the dirty form even when the read-only refresh is unavailable.
+        }
+        setEvidenceConflict({ kind: vendorEvidenceConflictState(requestError), latest });
+        setSubmissionUnconfirmed(false);
+        setSubmitError("The application changed while you were submitting. Your edits are preserved; load the latest application version before trying again.");
+      } else if (evidenceOnly && Object.keys(vendorEvidenceServerFieldErrors(requestError.details)).length) {
+        const serverErrors = vendorEvidenceServerFieldErrors(requestError.details);
+        setErrors(serverErrors);
+        setSubmissionUnconfirmed(false);
+        setSubmitError("Review the highlighted evidence fields. Your entries remain in this form.");
+        window.requestAnimationFrame(() => formRef.current?.querySelector('[aria-invalid="true"]')?.focus());
+      } else if (requestError.code === "CONFIRMATION_MISSING") {
+        setSubmissionUnconfirmed(true);
+        setSubmitError("The service accepted this request, but the saved revision could not be confirmed. Keep this form unchanged and check your application status before retrying.");
+      } else if (isServiceUnavailable(requestError)) {
+        setSubmissionUnconfirmed(true);
+        setSubmitError("We could not confirm whether the service saved this request. Keep the form unchanged; retrying will reuse the same secure submission key, or check your application status first.");
+      } else {
+        setSubmissionUnconfirmed(false);
+        setSubmitError(requestError.message || "The application could not be submitted. Please review the fields and try again.");
+      }
     } finally { setLoading(false); }
   }
 
-  if (success) return <div className="onboarding-page page-surface"><div className="shell"><OnboardingSuccess evidenceOnly={evidenceOnly} /></div></div>;
+  const revisionMode = evidenceOnly && evidenceAccess === "revision";
+  const informationRequest = evidenceContext?.currentInformationRequest;
+  const nextEvidenceRevision = evidenceOnly && Number.isInteger(evidenceContext?.evidenceRevision)
+    ? evidenceContext.evidenceRevision + 1
+    : null;
+  if (success) return <div className="onboarding-page page-surface"><div className="shell"><OnboardingSuccess evidenceOnly={evidenceOnly} success={success} /></div></div>;
   if (evidenceOnly && compatibility === "checking") return <OnboardingGate icon={LoaderCircle} spinning eyebrow="Secure evidence update" title="Checking secure submission support" message="Confirming the current service can safely accept this evidence form before loading any application details." />;
   if (evidenceOnly && compatibility === "upgrade") return <OnboardingGate icon={ShieldAlert} eyebrow="Evidence updates temporarily paused" title="Refresh after the secure service upgrade" message="This version cannot safely send the current evidence snapshot. Nothing has been submitted."><button className="button button--primary" type="button" onClick={() => setCompatibilityRetryKey((value) => value + 1)}><RefreshCw size={16} /> Check again</button><Link className="button button--outline" to="/vendor">Return to vendor workspace</Link></OnboardingGate>;
   if (evidenceOnly && compatibility === "error") return <OnboardingGate icon={CircleAlert} eyebrow="Secure check unavailable" title="Evidence updates cannot be opened right now" message="The current submission contract could not be confirmed. Nothing has been submitted."><button className="button button--primary" type="button" onClick={() => setCompatibilityRetryKey((value) => value + 1)}><RefreshCw size={16} /> Try again</button><Link className="button button--outline" to="/vendor">Return to vendor workspace</Link></OnboardingGate>;
   if (evidenceOnly && evidenceAccess === "checking") return <OnboardingGate icon={LoaderCircle} spinning eyebrow="Private application record" title="Checking evidence eligibility" message="Confirming this signed-in application can add a structured evidence snapshot." />;
   if (evidenceOnly && evidenceAccess === "guest") return <OnboardingGate icon={LockKeyhole} eyebrow="Private application record" title="Sign in to complete application evidence" message="Evidence can be attached only to your own pending or declined partner application. Any entries already made remain in this tab and nothing was submitted."><button className="button button--primary" type="button" onClick={onOpenAuth}>Sign in</button><Link className="button button--outline" to="/vendor">Return to vendor workspace</Link></OnboardingGate>;
   if (evidenceOnly && evidenceAccess === "no_application") return <OnboardingGate icon={Store} eyebrow="No partner application found" title="Start a partner application first" message="This account has no vendor application that can receive an evidence snapshot."><Link className="button button--primary" to="/vendor/onboarding">Start application</Link><Link className="button button--outline" to="/vendor">Return to vendor workspace</Link></OnboardingGate>;
-  if (evidenceOnly && evidenceAccess === "complete") return <OnboardingGate icon={FileCheck2} eyebrow="Evidence already complete" title="This application already has a structured snapshot" message="No additional evidence update is needed. Open the vendor workspace to check the current review status."><Link className="button button--primary" to="/vendor">Check application status</Link></OnboardingGate>;
-  if (evidenceOnly && evidenceAccess === "status_unavailable") return <OnboardingGate icon={ShieldAlert} eyebrow="Evidence update unavailable" title="This application cannot add evidence in its current state" message={`Evidence updates are available only for pending or declined applications. This application is ${evidenceVendorStatus || "in another review state"}; any entries already made remain in this tab and nothing was submitted.`}><Link className="button button--primary" to="/vendor">Open vendor workspace</Link></OnboardingGate>;
+  if (evidenceOnly && evidenceAccess === "complete") return <OnboardingGate icon={FileCheck2} eyebrow="Evidence already submitted" title="No evidence update is currently open" message="Your latest structured evidence is already with the partner team. Another revision can be submitted only when the partner team opens a specific information request."><Link className="button button--primary" to="/vendor">Check application status</Link></OnboardingGate>;
+  if (evidenceOnly && evidenceAccess === "status_unavailable") return <OnboardingGate icon={ShieldAlert} eyebrow="Evidence update unavailable" title="This application cannot add evidence in its current state" message={`Evidence updates are available for an incomplete application or an open information request. This application is ${evidenceVendorStatus || "in an unknown review state"}; any entries already made remain in this tab and nothing was submitted.`}><Link className="button button--primary" to="/vendor">Open vendor workspace</Link></OnboardingGate>;
   if (evidenceOnly && evidenceAccess === "error") return <OnboardingGate icon={CircleAlert} eyebrow="Eligibility check unavailable" title="This application could not be checked" message="Any entries already made remain in this tab and no evidence was submitted. Retry the read-only eligibility check when the service is available."><button className="button button--primary" type="button" onClick={() => setEvidenceAccessRetryKey((value) => value + 1)}><RefreshCw size={16} /> Try again</button><Link className="button button--outline" to="/vendor">Return to vendor workspace</Link></OnboardingGate>;
   return (
     <div className="onboarding-page page-surface">
-      <OnboardingHero evidenceOnly={evidenceOnly} />
+      <OnboardingHero evidenceOnly={evidenceOnly} revisionMode={revisionMode} />
       <section className="shell onboarding-layout">
         <form className="onboarding-form" onSubmit={submit} noValidate ref={formRef}>
           {compatibility !== "ready" && (
@@ -810,47 +1013,64 @@ export function VendorOnboardingPage({ notify, onOpenAuth, authRevision = 0 }) {
               {compatibility !== "checking" && <button className="text-button" type="button" onClick={() => setCompatibilityRetryKey((value) => value + 1)}><RefreshCw size={14} /> Check again</button>}
             </div>
           )}
+          {revisionMode && informationRequest && (
+            <section className="onboarding-information-request" aria-labelledby="onboarding-information-request-heading">
+              <div className="onboarding-information-request__top"><span><CircleAlert size={19} /></span><div><div className="eyebrow">Partner team request</div><h2 id="onboarding-information-request-heading">Revise the requested evidence areas</h2><p>Application version {evidenceContext.reviewRevision} · request {informationRequest.revision} · current evidence revision {evidenceContext.evidenceRevision}</p></div></div>
+              <ul>{informationRequest.requestedFields.map((field) => <li key={field}><Check size={14} />{OWNER_INFORMATION_FIELD_LABELS[field]}</li>)}</ul>
+              <blockquote>{informationRequest.applicantMessage}</blockquote>
+              <p className="onboarding-information-request__snapshot"><ShieldCheck size={15} /> {evidenceContext.evidenceRevision > 0 ? `The form is prefilled with evidence revision ${evidenceContext.evidenceRevision}. Submit every section to create revision ${nextEvidenceRevision}; earlier revisions stay immutable.` : `No earlier structured snapshot exists. Complete every section to create evidence revision ${nextEvidenceRevision} and close this request.`}</p>
+            </section>
+          )}
+          {evidenceConflict && (
+            <div className="onboarding-conflict" role="alert">
+              <CircleAlert size={19} />
+              <p><strong>Application version changed</strong><span>Your edits are still here and were not replaced. {Number.isInteger(evidenceConflict.latest?.context?.reviewRevision) && Number.isInteger(evidenceConflict.latest?.context?.informationRequestRevision) ? `The service now reports Application version ${evidenceConflict.latest.context.reviewRevision}, Evidence revision ${evidenceConflict.latest.context.evidenceRevision}, and information-request revision ${evidenceConflict.latest.context.informationRequestRevision}. ` : ""}Load the latest application and evidence snapshot before submitting again.</span></p>
+              <button className="button button--outline button--small" type="button" onClick={reloadLatestEvidence} disabled={loading}>Discard my edits and load latest</button>
+            </div>
+          )}
           {!evidenceOnly && <section className="onboarding-form__section" aria-labelledby="onboarding-business-heading">
             <div className="onboarding-form__heading"><span><Store size={20} /></span><div><h2 id="onboarding-business-heading">Introduce your business</h2><p>Every field without an “optional” label is required for partner review.</p></div></div>
             <div className="form-grid">
-              <label className="field"><span>Business name</span><input value={form.businessName} onChange={(event) => update("businessName", event.target.value)} placeholder="The Wedding Journal" maxLength="140" aria-invalid={Boolean(errors.businessName)} required /><OnboardingError>{errors.businessName}</OnboardingError></label>
-              <label className="field"><span>Registered or proprietor name</span><input value={form.legalName} onChange={(event) => update("legalName", event.target.value)} placeholder="Journal Studios Private Limited" maxLength="180" aria-invalid={Boolean(errors.legalName)} required /><OnboardingError>{errors.legalName}</OnboardingError></label>
-              <label className="field"><span>Primary service</span><div className="input-wrap input-wrap--select"><select value={form.category} onChange={(event) => update("category", event.target.value)} aria-invalid={Boolean(errors.category)} required><option value="">Choose a category</option>{categories.map((category) => <option value={category.id} key={category.id}>{category.name}</option>)}</select><ChevronDown size={15} /></div><OnboardingError>{errors.category}</OnboardingError></label>
-              <label className="field"><span>Home city</span><div className="input-wrap input-wrap--select"><select value={form.city} onChange={(event) => update("city", event.target.value)} aria-invalid={Boolean(errors.city)} required><option value="">Choose a city</option>{cities.map((city) => <option key={city}>{city}</option>)}</select><ChevronDown size={15} /></div><OnboardingError>{errors.city}</OnboardingError></label>
-              <label className="field field--span-2"><span>Service areas</span><input value={form.serviceAreas} onChange={(event) => update("serviceAreas", event.target.value)} placeholder="Delhi NCR, Jaipur, Chandigarh" aria-invalid={Boolean(errors.serviceAreas)} required /><small className="field-hint">Separate cities with commas.</small><OnboardingError>{errors.serviceAreas}</OnboardingError></label>
-              <label className="field"><span>Typical project from</span><div className="input-wrap"><IndianRupee size={16} /><input type="number" min="1000" step="1" value={form.minBudget} onChange={(event) => update("minBudget", event.target.value)} aria-invalid={Boolean(errors.minBudget)} required /></div><OnboardingError>{errors.minBudget}</OnboardingError></label>
-              <label className="field"><span>Typical project up to</span><div className="input-wrap"><IndianRupee size={16} /><input type="number" min="1000" step="1" value={form.maxBudget} onChange={(event) => update("maxBudget", event.target.value)} aria-invalid={Boolean(errors.maxBudget)} required /></div><OnboardingError>{errors.maxBudget}</OnboardingError></label>
-              <label className="field field--span-2"><span>About your approach</span><textarea rows="6" minLength="80" maxLength="3000" value={form.description} onChange={(event) => update("description", event.target.value)} placeholder="Describe your point of view, strongest services, team and the celebrations you do best…" aria-invalid={Boolean(errors.description)} required /><div className="field-counter"><OnboardingError>{errors.description}</OnboardingError><span>{form.description.length} / 3,000</span></div></label>
-              <label className="field"><span>Contact number</span><input type="tel" value={form.phone} onChange={(event) => update("phone", event.target.value)} placeholder="+91 98765 43210" maxLength="24" aria-invalid={Boolean(errors.phone)} required /><OnboardingError>{errors.phone}</OnboardingError></label>
-              <label className="field"><span>Website <small>Optional</small></span><input type="url" value={form.websiteUrl} onChange={(event) => update("websiteUrl", event.target.value)} placeholder="https://yourstudio.com" maxLength="300" aria-invalid={Boolean(errors.websiteUrl)} /><OnboardingError>{errors.websiteUrl}</OnboardingError></label>
-              <label className="field field--span-2"><span>Instagram handle <small>Optional</small></span><input value={form.instagramHandle} onChange={(event) => update("instagramHandle", event.target.value)} placeholder="@yourstudio" maxLength="31" aria-invalid={Boolean(errors.instagramHandle)} /><OnboardingError>{errors.instagramHandle}</OnboardingError></label>
+              <label className="field"><span>Business name</span><input value={form.businessName} onChange={(event) => update("businessName", event.target.value)} placeholder="The Wedding Journal" maxLength="140" aria-invalid={Boolean(errors.businessName)} aria-describedby={errors.businessName ? "businessName-error" : undefined} required /><OnboardingError id="businessName-error">{errors.businessName}</OnboardingError></label>
+              <label className="field"><span>Registered or proprietor name</span><input value={form.legalName} onChange={(event) => update("legalName", event.target.value)} placeholder="Journal Studios Private Limited" maxLength="180" aria-invalid={Boolean(errors.legalName)} aria-describedby={errors.legalName ? "legalName-error" : undefined} required /><OnboardingError id="legalName-error">{errors.legalName}</OnboardingError></label>
+              <label className="field"><span>Primary service</span><div className="input-wrap input-wrap--select"><select value={form.category} onChange={(event) => update("category", event.target.value)} aria-invalid={Boolean(errors.category)} aria-describedby={errors.category ? "category-error" : undefined} required><option value="">Choose a category</option>{categories.map((category) => <option value={category.id} key={category.id}>{category.name}</option>)}</select><ChevronDown size={15} /></div><OnboardingError id="category-error">{errors.category}</OnboardingError></label>
+              <label className="field"><span>Home city</span><div className="input-wrap input-wrap--select"><select value={form.city} onChange={(event) => update("city", event.target.value)} aria-invalid={Boolean(errors.city)} aria-describedby={errors.city ? "city-error" : undefined} required><option value="">Choose a city</option>{cities.map((city) => <option key={city}>{city}</option>)}</select><ChevronDown size={15} /></div><OnboardingError id="city-error">{errors.city}</OnboardingError></label>
+              <label className="field field--span-2"><span>Service areas</span><input value={form.serviceAreas} onChange={(event) => update("serviceAreas", event.target.value)} placeholder="Delhi NCR, Jaipur, Chandigarh" aria-invalid={Boolean(errors.serviceAreas)} aria-describedby={errors.serviceAreas ? "serviceAreas-hint serviceAreas-error" : "serviceAreas-hint"} required /><small className="field-hint" id="serviceAreas-hint">Separate cities with commas.</small><OnboardingError id="serviceAreas-error">{errors.serviceAreas}</OnboardingError></label>
+              <label className="field"><span>Typical project from</span><div className="input-wrap"><IndianRupee size={16} /><input type="number" min="1000" step="1" value={form.minBudget} onChange={(event) => update("minBudget", event.target.value)} aria-invalid={Boolean(errors.minBudget)} aria-describedby={errors.minBudget ? "minBudget-error" : undefined} required /></div><OnboardingError id="minBudget-error">{errors.minBudget}</OnboardingError></label>
+              <label className="field"><span>Typical project up to</span><div className="input-wrap"><IndianRupee size={16} /><input type="number" min="1000" step="1" value={form.maxBudget} onChange={(event) => update("maxBudget", event.target.value)} aria-invalid={Boolean(errors.maxBudget)} aria-describedby={errors.maxBudget ? "maxBudget-error" : undefined} required /></div><OnboardingError id="maxBudget-error">{errors.maxBudget}</OnboardingError></label>
+              <label className="field field--span-2"><span>About your approach</span><textarea rows="6" minLength="80" maxLength="3000" value={form.description} onChange={(event) => update("description", event.target.value)} placeholder="Describe your point of view, strongest services, team and the celebrations you do best…" aria-invalid={Boolean(errors.description)} aria-describedby={errors.description ? "description-error" : undefined} required /><div className="field-counter"><OnboardingError id="description-error">{errors.description}</OnboardingError><span>{form.description.length} / 3,000</span></div></label>
+              <label className="field"><span>Contact number</span><input type="tel" value={form.phone} onChange={(event) => update("phone", event.target.value)} placeholder="+91 98765 43210" maxLength="24" aria-invalid={Boolean(errors.phone)} aria-describedby={errors.phone ? "phone-error" : undefined} required /><OnboardingError id="phone-error">{errors.phone}</OnboardingError></label>
+              <label className="field"><span>Website <small>Optional</small></span><input type="url" value={form.websiteUrl} onChange={(event) => update("websiteUrl", event.target.value)} placeholder="https://yourstudio.com" maxLength="300" aria-invalid={Boolean(errors.websiteUrl)} aria-describedby={errors.websiteUrl ? "websiteUrl-error" : undefined} /><OnboardingError id="websiteUrl-error">{errors.websiteUrl}</OnboardingError></label>
+              <label className="field field--span-2"><span>Instagram handle <small>Optional</small></span><input value={form.instagramHandle} onChange={(event) => update("instagramHandle", event.target.value)} placeholder="@yourstudio" maxLength="31" aria-invalid={Boolean(errors.instagramHandle)} aria-describedby={errors.instagramHandle ? "instagramHandle-error" : undefined} /><OnboardingError id="instagramHandle-error">{errors.instagramHandle}</OnboardingError></label>
             </div>
           </section>}
 
           <section className="onboarding-form__section onboarding-form__section--evidence" aria-labelledby="onboarding-evidence-heading">
-            <div className="onboarding-form__heading"><span><FileCheck2 size={20} /></span><div><h2 id="onboarding-evidence-heading">{evidenceOnly ? "Complete review evidence" : "Evidence for partner review"}</h2><p>We store the submitted links as an application snapshot. Staff open them manually; Melaiva does not copy or embed their contents.</p></div></div>
-            <EvidenceUrlFields id="portfolioUrls" label="Portfolio links" description="Link directly to representative work that you are authorised to share." values={form.portfolioUrls} minimum={1} maximum={5} errors={errors} onChange={(index, value) => updateEvidenceUrl("portfolioUrls", index, value)} onAdd={() => addEvidenceUrl("portfolioUrls")} onRemove={(index) => removeEvidenceUrl("portfolioUrls", index)} />
-            <EvidenceUrlFields id="referenceUrls" label="Public review or reference links" description="Use a public client review, published testimonial or business listing—not private contact details." values={form.referenceUrls} minimum={1} maximum={3} errors={errors} onChange={(index, value) => updateEvidenceUrl("referenceUrls", index, value)} onAdd={() => addEvidenceUrl("referenceUrls")} onRemove={(index) => removeEvidenceUrl("referenceUrls", index)} />
-            <div className="form-grid onboarding-registration">
-              <label className="field"><span>Business registration</span><div className="input-wrap input-wrap--select"><Landmark size={16} /><select value={form.registrationType} onChange={(event) => { update("registrationType", event.target.value); update("registrationReference", ""); }} aria-invalid={Boolean(errors.registrationType)} required><option value="">Choose available evidence</option>{VENDOR_REGISTRATION_OPTIONS.map((option) => <option value={option.id} key={option.id}>{option.label}</option>)}</select><ChevronDown size={15} /></div><OnboardingError>{errors.registrationType}</OnboardingError></label>
+            <div className="onboarding-form__heading"><span><FileCheck2 size={20} /></span><div><h2 id="onboarding-evidence-heading">{revisionMode ? `Evidence revision ${nextEvidenceRevision}` : evidenceOnly ? "Complete review evidence" : "Evidence for partner review"}</h2><p>We store each complete submission as an immutable application snapshot. Staff open links manually; Melaiva does not copy or embed their contents.</p></div></div>
+            <EvidenceUrlFields id="portfolioUrls" label="Portfolio links" description="Link directly to representative work that you are authorised to share." values={form.portfolioUrls} minimum={1} maximum={5} errors={errors} requested={vendorEvidenceFieldRequested("portfolio", informationRequest)} onChange={(index, value) => updateEvidenceUrl("portfolioUrls", index, value)} onAdd={() => addEvidenceUrl("portfolioUrls")} onRemove={(index) => removeEvidenceUrl("portfolioUrls", index)} />
+            <EvidenceUrlFields id="referenceUrls" label="Public review or reference links" description="Use a public client review, published testimonial or business listing—not private contact details." values={form.referenceUrls} minimum={1} maximum={3} errors={errors} requested={vendorEvidenceFieldRequested("references", informationRequest)} onChange={(index, value) => updateEvidenceUrl("referenceUrls", index, value)} onAdd={() => addEvidenceUrl("referenceUrls")} onRemove={(index) => removeEvidenceUrl("referenceUrls", index)} />
+            <div className={`form-grid onboarding-registration ${vendorEvidenceFieldRequested("registration", informationRequest) ? "is-requested" : ""}`}>
+              {vendorEvidenceFieldRequested("registration", informationRequest) && <div className="onboarding-requested-heading field--span-2"><Landmark size={15} /><strong>Business-registration update requested</strong></div>}
+              <label className="field"><span>Business registration</span><div className="input-wrap input-wrap--select"><Landmark size={16} /><select value={form.registrationType} onChange={(event) => { update("registrationType", event.target.value); update("registrationReference", ""); }} aria-invalid={Boolean(errors.registrationType)} aria-describedby={errors.registrationType ? "registrationType-error" : undefined} required><option value="">Choose available evidence</option>{VENDOR_REGISTRATION_OPTIONS.map((option) => <option value={option.id} key={option.id}>{option.label}</option>)}</select><ChevronDown size={15} /></div><OnboardingError id="registrationType-error">{errors.registrationType}</OnboardingError></label>
               {form.registrationType && form.registrationType !== "not_registered" ? (
-                <label className="field"><span>Registration reference</span><input value={form.registrationReference} onChange={(event) => update("registrationReference", event.target.value.toUpperCase())} placeholder={form.registrationType === "udyam" ? "UDYAM-RJ-12-1234567" : form.registrationType === "cin" ? "L12345RJ2020PLC123456" : "27AAPFU0939F1ZV"} maxLength="24" autoCapitalize="characters" autoComplete="off" aria-invalid={Boolean(errors.registrationReference)} required /><OnboardingError>{errors.registrationReference}</OnboardingError></label>
+                <label className="field"><span>Registration reference</span><input value={form.registrationReference} onChange={(event) => update("registrationReference", event.target.value.toUpperCase())} placeholder={form.registrationType === "udyam" ? "UDYAM-RJ-12-1234567" : form.registrationType === "cin" ? "L12345RJ2020PLC123456" : "27AAPFU0939F1ZV"} maxLength="24" autoCapitalize="characters" autoComplete="off" aria-invalid={Boolean(errors.registrationReference)} aria-describedby={errors.registrationReference ? "registrationReference-error" : undefined} required /><OnboardingError id="registrationReference-error">{errors.registrationReference}</OnboardingError></label>
               ) : form.registrationType === "not_registered" ? (
                 <div className="onboarding-registration__declaration" role="note"><CircleAlert size={17} /><p><strong>Declaration only</strong><span>No government business-registration record will be supplied. The partner team must complete suitable alternative checks before approval.</span></p></div>
               ) : null}
               <p className="onboarding-registration__guard field--span-2"><ShieldAlert size={16} /><span>Do not enter Aadhaar, PAN, passport, voter ID, driving-licence, bank-account or payment-card details. This form accepts only the selected public business-registration reference.</span></p>
             </div>
             <label className="onboarding-evidence-attestation">
-              <input type="checkbox" checked={form.attested} onChange={(event) => update("attested", event.target.checked)} aria-invalid={Boolean(errors.attested)} required />
+              <input type="checkbox" checked={form.attested} onChange={(event) => update("attested", event.target.checked)} aria-invalid={Boolean(errors.attested)} aria-describedby={errors.attested ? "attested-error" : undefined} required />
               <span><Check size={14} /></span>
               <strong>I confirm these links are public, accurate, safe for authorised staff to open, and mine to submit for partner review.</strong>
             </label>
-            <OnboardingError>{errors.attested}</OnboardingError>
+            <OnboardingError id="attested-error">{errors.attested}</OnboardingError>
           </section>
 
           {submitError && <p className="form-error onboarding-submit-error" role="alert">{submitError}</p>}
-          <button className="button button--primary button--large button--wide" disabled={loading || compatibility !== "ready"} type="submit">{loading || compatibility === "checking" ? <span className="button-loader" aria-hidden="true" /> : compatibility === "ready" ? <Send size={17} /> : <ShieldAlert size={17} />}{loading ? "Submitting…" : compatibility === "checking" ? "Checking secure submission…" : compatibility === "upgrade" ? "Submission paused during upgrade" : compatibility === "error" ? "Secure submission unavailable" : evidenceOnly ? "Attach evidence to application" : "Submit evidence for review"}</button>
-          <p className="onboarding-form__privacy"><ShieldCheck size={14} /> {evidenceOnly ? "Your existing business profile stays unchanged; this adds one private evidence snapshot for authorised review." : "Business details and evidence stay private to authorised operations staff unless a later approval publishes the business profile."}</p>
+          {submissionUnconfirmed && <p className="onboarding-unconfirmed" role="note"><ShieldAlert size={15} /><span><strong>Keep the form unchanged to retry safely.</strong> The same idempotency key will be reused. You can also <Link to="/vendor">check application status</Link> first.</span></p>}
+          <button className="button button--primary button--large button--wide" disabled={loading || compatibility !== "ready" || Boolean(evidenceConflict)} type="submit">{loading || compatibility === "checking" ? <span className="button-loader" aria-hidden="true" /> : compatibility === "ready" ? <Send size={17} /> : <ShieldAlert size={17} />}{loading ? "Submitting…" : compatibility === "checking" ? "Checking secure submission…" : compatibility === "upgrade" ? "Submission paused during upgrade" : compatibility === "error" ? "Secure submission unavailable" : submissionUnconfirmed ? "Retry same secure submission" : revisionMode ? `Submit complete evidence revision ${nextEvidenceRevision}` : evidenceOnly ? "Attach evidence to application" : "Submit evidence for review"}</button>
+          <p className="onboarding-form__privacy"><ShieldCheck size={14} /> {revisionMode ? evidenceContext.evidenceRevision > 0 ? `This creates private evidence revision ${nextEvidenceRevision}; revision ${evidenceContext.evidenceRevision} remains immutable and your business profile stays unchanged.` : `This creates private evidence revision ${nextEvidenceRevision}; your existing business profile stays unchanged.` : evidenceOnly ? "Your existing business profile stays unchanged; this adds one private evidence snapshot for authorised review." : "Business details and evidence stay private to authorised operations staff unless a later approval publishes the business profile."}</p>
         </form>
         <aside className="onboarding-aside">
           <div className="onboarding-aside__card"><Sparkles size={22} /><h2>Built for serious opportunities</h2><ul><li><Check size={15} /><span><strong>Structured briefs</strong>See dates, scope and working range before investing time.</span></li><li><Check size={15} /><span><strong>Sealed offers</strong>Compete on fit and value without seeing another price.</span></li><li><Check size={15} /><span><strong>Accountable review</strong>Every marketplace decision carries an internal reason and immutable history.</span></li></ul></div>

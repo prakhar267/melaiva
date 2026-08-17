@@ -3,12 +3,19 @@ import test from "node:test";
 
 import {
   buildVendorEvidence,
+  buildVendorEvidenceSubmissionPayload,
   canCompleteVendorEvidence,
   evidenceFocusIndexAfterRemoval,
+  normalizeVendorEvidenceContext,
+  prefillVendorEvidence,
   registrationReferenceError,
+  shouldPreflightVendorEvidenceSubmission,
   validateVendorApplication,
   validateVendorEvidence,
   vendorEvidenceCompletionEligibility,
+  vendorEvidenceConflictState,
+  vendorEvidenceContextRefreshDecision,
+  vendorEvidenceContextsMatch,
 } from "../src/components/vendorOnboarding.js";
 import {
   supportsAdminVendorSummaryContract,
@@ -16,15 +23,15 @@ import {
 } from "../src/components/vendorApplicationCompatibility.js";
 
 test("vendor evidence compatibility fails closed across mixed Worker versions", () => {
-  assert.equal(supportsVendorApplicationEvidence({ data: { vendorApplicationEvidenceRevision: 1 } }), true);
+  assert.equal(supportsVendorApplicationEvidence({ data: { vendorApplicationEvidenceRevision: 2 } }), true);
   assert.equal(supportsVendorApplicationEvidence({ data: {} }), false);
-  assert.equal(supportsVendorApplicationEvidence({ data: { vendorApplicationEvidenceRevision: "1" } }), false);
-  assert.equal(supportsVendorApplicationEvidence({ data: { vendorApplicationEvidenceRevision: 2 } }), false);
+  assert.equal(supportsVendorApplicationEvidence({ data: { vendorApplicationEvidenceRevision: "2" } }), false);
+  assert.equal(supportsVendorApplicationEvidence({ data: { vendorApplicationEvidenceRevision: 1 } }), false);
 
-  const summaryPayload = { meta: { contract: "vendor-summary-v1" } };
-  assert.equal(supportsAdminVendorSummaryContract(summaryPayload, "1"), true);
+  const summaryPayload = { meta: { contract: "vendor-summary-v2" } };
+  assert.equal(supportsAdminVendorSummaryContract(summaryPayload, "2"), true);
   assert.equal(supportsAdminVendorSummaryContract(summaryPayload, null), false);
-  assert.equal(supportsAdminVendorSummaryContract({ meta: {} }, "1"), false);
+  assert.equal(supportsAdminVendorSummaryContract({ meta: {} }, "2"), false);
   const legacyFullDetailPayload = {
     data: [{ legalName: "Private legal name", phone: "+91 99999 99999", owner: { email: "private@example.com" } }],
     meta: { total: 1 },
@@ -173,10 +180,247 @@ test("evidence completion is offered only where the endpoint accepts it", () => 
   assert.equal(canCompleteVendorEvidence("suspended", false), false);
   assert.equal(canCompleteVendorEvidence("approved", false), false);
   assert.equal(canCompleteVendorEvidence("pending", true), false);
+  assert.equal(canCompleteVendorEvidence("needs_information", true), true);
   assert.equal(vendorEvidenceCompletionEligibility({ status: "pending", evidenceComplete: false }), "eligible");
   assert.equal(vendorEvidenceCompletionEligibility({ status: "rejected", evidenceComplete: false }), "eligible");
   assert.equal(vendorEvidenceCompletionEligibility({ status: "suspended", evidenceComplete: false }), "status_unavailable");
   assert.equal(vendorEvidenceCompletionEligibility({ status: "approved", evidenceComplete: false }), "status_unavailable");
   assert.equal(vendorEvidenceCompletionEligibility({ status: "pending", evidenceComplete: true }), "complete");
+  assert.equal(vendorEvidenceCompletionEligibility({
+    status: "pending",
+    effectiveStatus: "needs_information",
+    evidenceRevision: 2,
+    informationRequestRevision: 4,
+    evidence: {
+      revision: 2,
+      portfolioUrls: ["https://portfolio.example.com/current"],
+      referenceUrls: ["https://reviews.example.com/current"],
+      registrationType: "not_registered",
+      attested: true,
+    },
+    currentInformationRequest: {
+      revision: 4,
+      evidenceRevision: 2,
+      requestedFields: ["portfolio"],
+      applicantMessage: "Please replace the inaccessible portfolio example.",
+    },
+  }), "revision");
+  assert.equal(vendorEvidenceCompletionEligibility({
+    effectiveStatus: "needs_information",
+    evidenceRevision: 2,
+    informationRequestRevision: 4,
+    evidence: null,
+    currentInformationRequest: {
+      revision: 4,
+      evidenceRevision: 2,
+      requestedFields: ["portfolio"],
+      applicantMessage: "Please replace the inaccessible portfolio example.",
+    },
+  }), "status_unavailable");
+  assert.equal(vendorEvidenceCompletionEligibility({
+    effectiveStatus: "needs_information",
+    evidenceRevision: 2,
+    informationRequestRevision: 4,
+    evidence: { revision: 2 },
+    currentInformationRequest: {
+      revision: 4,
+      evidenceRevision: 2,
+      requestedFields: ["portfolio", "future_field"],
+      applicantMessage: "Please replace the inaccessible portfolio example.",
+    },
+  }), "status_unavailable");
+  assert.equal(vendorEvidenceCompletionEligibility({ status: "needs_information", evidenceComplete: true }), "status_unavailable");
+  assert.equal(vendorEvidenceCompletionEligibility({ status: "mystery", evidenceComplete: false }), "status_unavailable");
   assert.equal(vendorEvidenceCompletionEligibility(null), "no_application");
+});
+
+test("evidence revision payload includes every optimistic concurrency counter", () => {
+  const context = normalizeVendorEvidenceContext({
+    data: {
+      vendorId: "vendor-1",
+      status: "pending",
+      effectiveStatus: "needs_information",
+      reviewRevision: 8,
+      informationRequestRevision: 3,
+      evidenceSummary: { revision: 2 },
+      evidence: {
+        revision: 2,
+        portfolioUrls: ["https://portfolio.example.com/old"],
+        referenceUrls: ["https://reviews.example.com/studio"],
+        registrationType: "not_registered",
+        registrationReference: "",
+        attested: true,
+      },
+      currentInformationRequest: {
+        revision: 3,
+        evidenceRevision: 2,
+        requestedFields: ["portfolio"],
+        applicantMessage: "Please replace the inaccessible portfolio example.",
+      },
+    },
+  });
+  const prefilled = prefillVendorEvidence(context);
+  assert.deepEqual(prefilled, {
+    portfolioUrls: ["https://portfolio.example.com/old"],
+    referenceUrls: ["https://reviews.example.com/studio"],
+    registrationType: "not_registered",
+    registrationReference: "",
+    attested: false,
+  });
+  assert.deepEqual(buildVendorEvidenceSubmissionPayload({
+    ...prefilled,
+    portfolioUrls: ["https://portfolio.example.com/new"],
+    attested: true,
+  }, context), {
+    evidence: {
+      portfolioUrls: ["https://portfolio.example.com/new"],
+      referenceUrls: ["https://reviews.example.com/studio"],
+      registrationType: "not_registered",
+      attested: true,
+    },
+    expectedStatus: "needs_information",
+    expectedRevision: 8,
+    expectedEvidenceRevision: 2,
+    expectedInformationRequestRevision: 3,
+  });
+});
+
+test("inactive information requests retain their monotonic revision counter", () => {
+  const context = normalizeVendorEvidenceContext({
+    vendorId: "vendor-2",
+    status: "rejected",
+    effectiveStatus: "rejected",
+    reviewRevision: 5,
+    informationRequestRevision: 4,
+    evidence: null,
+    currentInformationRequest: null,
+  });
+  const payload = buildVendorEvidenceSubmissionPayload({
+    portfolioUrls: ["https://portfolio.example.com/work"],
+    referenceUrls: ["https://reviews.example.com/studio"],
+    registrationType: "not_registered",
+    attested: true,
+  }, context);
+  assert.equal(payload.expectedInformationRequestRevision, 4);
+  assert.equal(payload.expectedStatus, "rejected");
+  assert.equal(buildVendorEvidenceSubmissionPayload(payload.evidence, normalizeVendorEvidenceContext({
+    ...context,
+    informationRequestRevision: null,
+  })), null);
+  assert.equal(buildVendorEvidenceSubmissionPayload(payload.evidence, normalizeVendorEvidenceContext({
+    ...context,
+    effectiveStatus: undefined,
+  })), null);
+
+  assert.equal(buildVendorEvidenceSubmissionPayload(payload.evidence, {
+    ...context,
+    effectiveStatus: "needs_information",
+    currentInformationRequest: { revision: 3 },
+  }), null);
+});
+
+test("evidence conflicts compare exact context versions and preserve safe categories", () => {
+  const expected = {
+    vendorId: "vendor-1",
+    effectiveStatus: "needs_information",
+    reviewRevision: 6,
+    evidenceRevision: 1,
+    informationRequestRevision: 2,
+    currentInformationRequest: { revision: 2 },
+  };
+  assert.equal(vendorEvidenceContextsMatch(expected, { ...expected }), true);
+  assert.equal(vendorEvidenceContextsMatch(expected, { ...expected, evidenceRevision: 2 }), false);
+  assert.equal(vendorEvidenceContextsMatch(expected, { ...expected, informationRequestRevision: 3 }), false);
+  assert.equal(vendorEvidenceConflictState({ status: 409, code: "vendor_information_request_conflict" }), "request_changed");
+  assert.equal(vendorEvidenceConflictState({ status: 412, code: "unknown_conflict" }), "application_changed");
+  assert.equal(vendorEvidenceConflictState({ status: 422 }), null);
+});
+
+test("dirty evidence drafts never inherit newer concurrency counters silently", () => {
+  const currentContext = {
+    vendorId: "vendor-1",
+    effectiveStatus: "needs_information",
+    reviewRevision: 6,
+    evidenceRevision: 1,
+    informationRequestRevision: 2,
+    currentInformationRequest: { revision: 2 },
+  };
+  const incomingContext = {
+    ...currentContext,
+    reviewRevision: 7,
+    informationRequestRevision: 3,
+    currentInformationRequest: { revision: 3 },
+  };
+
+  assert.deepEqual(vendorEvidenceContextRefreshDecision({
+    currentContext,
+    incomingContext,
+    dirty: true,
+    formInitialized: true,
+    loadedVendorId: currentContext.vendorId,
+  }), {
+    accountChanged: false,
+    shouldResetForm: false,
+    conflict: true,
+  });
+  assert.deepEqual(vendorEvidenceContextRefreshDecision({
+    currentContext,
+    incomingContext,
+    dirty: false,
+    formInitialized: true,
+    loadedVendorId: currentContext.vendorId,
+  }), {
+    accountChanged: false,
+    shouldResetForm: true,
+    conflict: false,
+  });
+  assert.deepEqual(vendorEvidenceContextRefreshDecision({
+    currentContext,
+    incomingContext: { ...incomingContext, vendorId: "vendor-2" },
+    dirty: true,
+    formInitialized: true,
+    loadedVendorId: currentContext.vendorId,
+  }), {
+    accountChanged: true,
+    shouldResetForm: true,
+    conflict: false,
+  });
+  assert.deepEqual(vendorEvidenceContextRefreshDecision({
+    currentContext,
+    incomingContext: { ...currentContext },
+    dirty: true,
+    formInitialized: true,
+    loadedVendorId: currentContext.vendorId,
+  }), {
+    accountChanged: false,
+    shouldResetForm: false,
+    conflict: false,
+  });
+  assert.deepEqual(vendorEvidenceContextRefreshDecision({
+    currentContext: null,
+    incomingContext,
+    dirty: true,
+    formInitialized: true,
+  }), {
+    accountChanged: false,
+    shouldResetForm: false,
+    conflict: true,
+  });
+  assert.deepEqual(vendorEvidenceContextRefreshDecision({
+    currentContext: null,
+    incomingContext: { ...incomingContext, vendorId: "vendor-2" },
+    dirty: true,
+    formInitialized: true,
+    loadedVendorId: currentContext.vendorId,
+  }), {
+    accountChanged: true,
+    shouldResetForm: true,
+    conflict: false,
+  });
+});
+
+test("ambiguous unchanged retries bypass only the stale preflight and preserve server CAS", () => {
+  assert.equal(shouldPreflightVendorEvidenceSubmission({ evidenceOnly: true, submissionUnconfirmed: false }), true);
+  assert.equal(shouldPreflightVendorEvidenceSubmission({ evidenceOnly: true, submissionUnconfirmed: true }), false);
+  assert.equal(shouldPreflightVendorEvidenceSubmission({ evidenceOnly: false, submissionUnconfirmed: true }), false);
 });

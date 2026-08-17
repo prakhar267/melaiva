@@ -448,23 +448,58 @@ const auctionStatusSchema = z
   .strict();
 
 const VENDOR_STATUSES = Object.freeze(["pending", "approved", "rejected", "suspended"]);
-const ADMIN_VENDOR_SUMMARY_CONTRACT = "vendor-summary-v1";
+const ADMIN_VENDOR_STATUSES = Object.freeze([...VENDOR_STATUSES, "needs_information"]);
+const ADMIN_VENDOR_SUMMARY_CONTRACT = "vendor-summary-v2";
 const ADMIN_VENDOR_SUMMARY_HEADER = "X-Melaiva-Admin-Vendor-Summary";
 const VENDOR_EVIDENCE_REQUIRED_TRIGGERS = Object.freeze([
   "vendor_application_evidence_validate_insert",
-  "vendor_application_evidence_vendor_state_insert",
+  "vendor_application_evidence_vendor_state_insert_v10",
+  "vendor_application_evidence_active_request_insert_v10",
   "vendor_application_evidence_immutable_update",
   "vendor_application_evidence_immutable_delete",
-  "vendors_evidence_approval_guard",
-  "audit_events_vendor_review_sensitive_insert",
+  "vendor_application_evidence_mirror_insert_v10",
+  "vendor_application_evidence_revisions_compatibility_insert_v10",
+  "vendor_application_evidence_revisions_validate_insert",
+  "vendor_application_evidence_revisions_state_insert",
+  "vendor_application_evidence_revisions_apply_insert",
+  "vendor_application_evidence_revisions_identity_update",
+  "vendor_application_evidence_revisions_actor_update",
+  "vendor_application_evidence_revisions_delete",
+  "vendors_evidence_latest_revision_guard",
+  "vendor_application_information_requests_validate_insert",
+  "vendor_application_information_requests_apply_insert",
+  "vendor_application_information_requests_identity_update",
+  "vendor_application_information_requests_actor_update",
+  "vendor_application_information_requests_delete",
+  "vendors_information_request_status_guard",
+  "vendors_information_request_state_guard",
+  "vendors_evidence_approval_guard_v10",
+  "audit_events_vendor_review_sensitive_insert_v10",
 ]);
+const VENDOR_EVIDENCE_MAX_REVISION = 20;
+const VENDOR_INFORMATION_FIELDS = Object.freeze(["portfolio", "references", "registration"]);
 const VENDOR_REVIEW_TRANSITIONS = Object.freeze({
-  pending: Object.freeze(["approved", "rejected"]),
+  pending: Object.freeze(["approved", "rejected", "needs_information"]),
   approved: Object.freeze(["suspended"]),
-  rejected: Object.freeze(["pending"]),
+  rejected: Object.freeze(["pending", "needs_information"]),
   suspended: Object.freeze(["approved"]),
+  needs_information: Object.freeze(["pending", "rejected"]),
 });
 const vendorStatusSchema = z.enum(VENDOR_STATUSES);
+const adminVendorStatusSchema = z.enum(ADMIN_VENDOR_STATUSES);
+const applicantMessageSchema = z
+  .string()
+  .trim()
+  .min(10)
+  .max(1_000)
+  .refine(
+    (message) => !/[\u0000-\u0008\u000B\u000C\u000E-\u001F\u007F\u202A-\u202E\u2066-\u2069]/u.test(message),
+    "Applicant messages cannot contain control or bidirectional formatting characters",
+  )
+  .refine(
+    (message) => !reviewReasonContainsGenericSensitiveToken(message),
+    "Applicant messages must not include web addresses or personal identity references",
+  );
 const vendorReviewReasonSchema = z
   .string()
   .trim()
@@ -480,11 +515,13 @@ const vendorReviewReasonSchema = z
   );
 const vendorReviewSchema = z
   .object({
-    status: vendorStatusSchema,
-    expectedStatus: vendorStatusSchema,
+    status: adminVendorStatusSchema,
+    expectedStatus: adminVendorStatusSchema,
     expectedRevision: z.number().int().min(0).max(1_000_000_000),
     evidenceAcknowledged: z.literal(true).optional(),
-    expectedEvidenceRevision: z.number().int().min(1).max(1_000_000_000).optional(),
+    expectedEvidenceRevision: z.number().int().min(0).max(VENDOR_EVIDENCE_MAX_REVISION).optional(),
+    requestedFields: z.array(z.enum(VENDOR_INFORMATION_FIELDS)).min(1).max(3).optional(),
+    applicantMessage: applicantMessageSchema.optional(),
     reason: vendorReviewReasonSchema.optional(),
     note: vendorReviewReasonSchema.optional(),
   })
@@ -495,6 +532,25 @@ const vendorReviewSchema = z
         code: "custom",
         path: ["reason"],
         message: "Provide exactly one review reason",
+      });
+    }
+    if (value.status === "needs_information") {
+      if (!value.requestedFields?.length) {
+        context.addIssue({ code: "custom", path: ["requestedFields"], message: "Choose the information the applicant must update" });
+      } else if (new Set(value.requestedFields).size !== value.requestedFields.length) {
+        context.addIssue({ code: "custom", path: ["requestedFields"], message: "Choose each requested field once" });
+      }
+      if (!value.applicantMessage) {
+        context.addIssue({ code: "custom", path: ["applicantMessage"], message: "Add a message that can be shared with the applicant" });
+      }
+      if (value.expectedEvidenceRevision === undefined) {
+        context.addIssue({ code: "custom", path: ["expectedEvidenceRevision"], message: "Provide the exact evidence revision reviewed" });
+      }
+    } else if (value.requestedFields !== undefined || value.applicantMessage !== undefined) {
+      context.addIssue({
+        code: "custom",
+        path: ["requestedFields"],
+        message: "Information-request fields are accepted only when requesting information",
       });
     }
   });
@@ -522,7 +578,15 @@ const vendorOnboardingSchema = z
     message: "Must be greater than or equal to minBudget",
   });
 
-const vendorEvidenceCompletionSchema = z.object({ evidence: vendorEvidenceSchema }).strict();
+const vendorEvidenceCompletionSchema = z
+  .object({
+    evidence: vendorEvidenceSchema,
+    expectedStatus: adminVendorStatusSchema,
+    expectedRevision: z.number().int().min(0).max(1_000_000_000),
+    expectedEvidenceRevision: z.number().int().min(0).max(VENDOR_EVIDENCE_MAX_REVISION),
+    expectedInformationRequestRevision: z.number().int().min(0).max(1_000_000_000),
+  })
+  .strict();
 
 const leadSchema = z
   .object({
@@ -877,6 +941,23 @@ function isVendorEvidenceStateConflict(error) {
     || /vendor application evidence requires a pending or rejected vendor/i.test(String(error?.message || error));
 }
 
+function isVendorEvidenceRevisionConflict(error) {
+  return error?.code === "vendor_evidence_revision_conflict"
+    || /vendor evidence revision requires the active owner and an information request|legacy vendor evidence cannot resolve an active information request/i
+      .test(String(error?.message || error));
+}
+
+function isVendorInformationRequestConflict(error) {
+  return error?.code === "vendor_information_request_conflict"
+    || /vendor information requests contain invalid or sensitive content/i.test(String(error?.message || error));
+}
+
+function isVendorInformationStateConflict(error) {
+  return error?.code === "vendor_information_state_conflict"
+    || /vendor information request must be resolved before a status decision|vendor information request state is invalid/i
+      .test(String(error?.message || error));
+}
+
 function isVendorEvidenceApprovalConflict(error) {
   return error?.code === "vendor_evidence_approval_conflict"
     || /vendor evidence must be completed and acknowledged before approval/i.test(String(error?.message || error));
@@ -1202,12 +1283,40 @@ function mapEvidenceSummary(row) {
   };
 }
 
+function effectiveVendorStatus(row) {
+  return Boolean(row.information_requested) ? "needs_information" : row.status;
+}
+
+function mapInformationRequest(row, { includeMessage = false } = {}) {
+  if (!row.information_requested || row.current_information_request_revision === null
+    || row.current_information_request_revision === undefined) return null;
+  return {
+    revision: Math.max(1, Number(row.current_information_request_revision) || 1),
+    evidenceRevision: Math.max(0, Number(row.current_information_request_evidence_revision) || 0),
+    requestedFields: safeJsonArray(row.current_requested_fields_json),
+    ...(includeMessage ? { applicantMessage: row.current_applicant_message || "" } : {}),
+    requestedAt: row.current_information_requested_at || null,
+  };
+}
+
+function mapEvidenceHistoryRow(row) {
+  return {
+    revision: Math.max(1, Number(row.evidence_revision) || 1),
+    portfolioUrlCount: Math.max(0, Number(row.portfolio_url_count) || 0),
+    referenceUrlCount: Math.max(0, Number(row.reference_url_count) || 0),
+    registrationType: row.registration_type,
+    declarationOnly: row.registration_type === "not_registered",
+    attestedAt: row.evidence_attested_at || null,
+    createdAt: row.evidence_created_at || null,
+  };
+}
+
 function mapAdminVendorSummary(row) {
   return {
     id: row.id,
     slug: row.slug,
     businessName: row.business_name,
-    status: row.status,
+    status: effectiveVendorStatus(row),
     category: row.category,
     city: row.city,
     reviewRevision: row.review_revision === null || row.review_revision === undefined
@@ -1218,6 +1327,7 @@ function mapAdminVendorSummary(row) {
       : Math.max(0, Number(row.evidence_reviewed_revision) || 0),
     evidenceRequired: Boolean(row.evidence_required),
     evidenceSummary: mapEvidenceSummary(row),
+    informationRequestSummary: mapInformationRequest(row),
     reviewCount: Math.max(0, Number(row.review_count) || 0),
     lastReviewedAt: row.last_reviewed_at || null,
     createdAt: row.created_at,
@@ -1231,7 +1341,7 @@ function mapAdminVendorDetail(row) {
     slug: row.slug,
     businessName: row.business_name,
     legalName: row.legal_name,
-    status: row.status,
+    status: effectiveVendorStatus(row),
     category: row.category,
     categories: safeJsonArray(row.categories_json),
     city: row.city,
@@ -1252,6 +1362,7 @@ function mapAdminVendorDetail(row) {
       : Math.max(0, Number(row.evidence_reviewed_revision) || 0),
     evidenceRequired: Boolean(row.evidence_required),
     evidenceSummary: mapEvidenceSummary(row),
+    currentInformationRequest: mapInformationRequest(row, { includeMessage: true }),
     evidence: row.evidence_revision === null || row.evidence_revision === undefined
       ? null
       : {
@@ -1277,26 +1388,35 @@ async function hasVendorReviewRevision(db) {
 
 async function hasVendorEvidenceSchema(db) {
   try {
-    const migration = await db.prepare("SELECT id FROM _sql_schema_migrations WHERE id = 9 LIMIT 1").first();
+    const legacyTriggerName = "vendor_application_evidence_vendor_state_insert";
+    const inspectedTriggerNames = [...VENDOR_EVIDENCE_REQUIRED_TRIGGERS, legacyTriggerName];
+    const migration = await db.prepare("SELECT id FROM _sql_schema_migrations WHERE id = 10 LIMIT 1").first();
     if (!migration) return false;
     const vendorColumns = new Set(
       ((await db.prepare("PRAGMA table_info(vendors)").all()).results || []).map((column) => column.name),
     );
     const evidenceColumns = new Set(
-      ((await db.prepare("PRAGMA table_info(vendor_application_evidence)").all()).results || [])
+      ((await db.prepare("PRAGMA table_info(vendor_application_evidence_revisions)").all()).results || [])
+        .map((column) => column.name),
+    );
+    const informationRequestColumns = new Set(
+      ((await db.prepare("PRAGMA table_info(vendor_application_information_requests)").all()).results || [])
         .map((column) => column.name),
     );
     const triggerNames = new Set(
       ((await db
         .prepare(
           `SELECT name FROM sqlite_master
-           WHERE type = 'trigger' AND name IN (${VENDOR_EVIDENCE_REQUIRED_TRIGGERS.map(() => "?").join(", ")})`,
+           WHERE type = 'trigger' AND name IN (${inspectedTriggerNames.map(() => "?").join(", ")})`,
         )
-        .bind(...VENDOR_EVIDENCE_REQUIRED_TRIGGERS)
+        .bind(...inspectedTriggerNames)
         .all()).results || []).map((trigger) => trigger.name),
     );
     return vendorColumns.has("evidence_required")
       && vendorColumns.has("evidence_reviewed_revision")
+      && vendorColumns.has("evidence_latest_revision")
+      && vendorColumns.has("information_request_revision")
+      && vendorColumns.has("information_requested")
       && [
         "vendor_id",
         "evidence_revision",
@@ -1306,8 +1426,18 @@ async function hasVendorEvidenceSchema(db) {
         "registration_reference",
         "attested",
         "attested_at",
+        "submitted_by_user_id",
       ].every((column) => evidenceColumns.has(column))
-      && VENDOR_EVIDENCE_REQUIRED_TRIGGERS.every((name) => triggerNames.has(name));
+      && [
+        "vendor_id",
+        "request_revision",
+        "evidence_revision",
+        "requested_fields_json",
+        "applicant_message",
+        "requested_at",
+      ].every((column) => informationRequestColumns.has(column))
+      && VENDOR_EVIDENCE_REQUIRED_TRIGGERS.every((name) => triggerNames.has(name))
+      && !triggerNames.has(legacyTriggerName);
   } catch {
     return false;
   }
@@ -2049,7 +2179,7 @@ function buildApp() {
         iterations: CLIENT_PASSWORD_ITERATIONS,
         outputBits: 256,
         encoding: "base64url-no-padding",
-        vendorApplicationEvidenceRevision: 1,
+        vendorApplicationEvidenceRevision: 2,
       },
     }),
   );
@@ -2130,9 +2260,25 @@ function buildApp() {
     const row = await db
       .prepare(evidenceAvailable
         ? `SELECT vendor.id, vendor.slug, vendor.business_name, vendor.status,
-                  vendor.evidence_required, evidence.evidence_revision
+                  vendor.review_revision, vendor.evidence_required, vendor.evidence_latest_revision,
+                  vendor.information_request_revision,
+                  vendor.information_requested,
+                  evidence.evidence_revision,
+                  json_array_length(evidence.portfolio_urls_json) AS portfolio_url_count,
+                  json_array_length(evidence.reference_urls_json) AS reference_url_count,
+                  evidence.registration_type,
+                  information_request.request_revision AS current_information_request_revision,
+                  information_request.evidence_revision AS current_information_request_evidence_revision,
+                  information_request.requested_fields_json AS current_requested_fields_json,
+                  information_request.applicant_message AS current_applicant_message,
+                  information_request.requested_at AS current_information_requested_at
            FROM vendors vendor
-           LEFT JOIN vendor_application_evidence evidence ON evidence.vendor_id = vendor.id
+           LEFT JOIN vendor_application_evidence_revisions evidence
+             ON evidence.vendor_id = vendor.id
+            AND evidence.evidence_revision = vendor.evidence_latest_revision
+           LEFT JOIN vendor_application_information_requests information_request
+             ON information_request.vendor_id = vendor.id
+            AND information_request.request_revision = vendor.information_request_revision
            WHERE vendor.user_id = ? LIMIT 1`
         : "SELECT id, slug, business_name, status FROM vendors WHERE user_id = ? LIMIT 1")
       .bind(user.id)
@@ -2143,11 +2289,20 @@ function buildApp() {
         slug: row.slug,
         businessName: row.business_name,
         status: row.status,
+        effectiveStatus: evidenceAvailable ? effectiveVendorStatus(row) : row.status,
+        reviewRevision: evidenceAvailable ? Math.max(0, Number(row.review_revision) || 0) : null,
+        informationRequestRevision: evidenceAvailable
+          ? Math.max(0, Number(row.information_request_revision) || 0)
+          : null,
         evidenceRequired: Boolean(row.evidence_required),
         evidenceComplete: row.evidence_revision !== null && row.evidence_revision !== undefined,
         evidenceRevision: row.evidence_revision === null || row.evidence_revision === undefined
           ? null
           : Math.max(1, Number(row.evidence_revision) || 1),
+        evidenceSummary: evidenceAvailable ? mapEvidenceSummary(row) : null,
+        currentInformationRequest: evidenceAvailable
+          ? mapInformationRequest(row, { includeMessage: true })
+          : null,
       };
     }
     return c.json({ data: { user, vendor } });
@@ -3400,12 +3555,77 @@ function buildApp() {
     });
   });
 
+  app.get(`${API_PREFIX}/vendors/onboarding/evidence`, async (c) => {
+    const user = await currentUser(c);
+    if (user.role === "admin") {
+      throw new ApiError(403, "role_not_allowed", "Administrator accounts cannot submit vendor evidence");
+    }
+    const db = requireDatabase(c.env);
+    if (!(await hasVendorEvidenceSchema(db))) {
+      throw new ApiError(
+        503,
+        "vendor_evidence_migration_required",
+        "Vendor evidence is temporarily paused during a database upgrade",
+      );
+    }
+    const row = await db
+      .prepare(
+        `SELECT vendor.id, vendor.status, vendor.review_revision, vendor.evidence_required,
+                vendor.evidence_latest_revision, vendor.information_request_revision,
+                vendor.information_requested,
+                evidence.evidence_revision, evidence.portfolio_urls_json, evidence.reference_urls_json,
+                json_array_length(evidence.portfolio_urls_json) AS portfolio_url_count,
+                json_array_length(evidence.reference_urls_json) AS reference_url_count,
+                evidence.registration_type, evidence.registration_reference,
+                evidence.attested AS evidence_attested, evidence.attested_at AS evidence_attested_at,
+                information_request.request_revision AS current_information_request_revision,
+                information_request.evidence_revision AS current_information_request_evidence_revision,
+                information_request.requested_fields_json AS current_requested_fields_json,
+                information_request.applicant_message AS current_applicant_message,
+                information_request.requested_at AS current_information_requested_at
+         FROM vendors vendor
+         LEFT JOIN vendor_application_evidence_revisions evidence
+           ON evidence.vendor_id = vendor.id
+          AND evidence.evidence_revision = vendor.evidence_latest_revision
+         LEFT JOIN vendor_application_information_requests information_request
+           ON information_request.vendor_id = vendor.id
+          AND information_request.request_revision = vendor.information_request_revision
+         WHERE vendor.user_id = ? LIMIT 1`,
+      )
+      .bind(user.id)
+      .first();
+    if (!row) throw new ApiError(404, "vendor_not_found", "Create a vendor application before viewing evidence");
+    return c.json({
+      data: {
+        vendorId: row.id,
+        status: row.status,
+        effectiveStatus: effectiveVendorStatus(row),
+        reviewRevision: Math.max(0, Number(row.review_revision) || 0),
+        informationRequestRevision: Math.max(0, Number(row.information_request_revision) || 0),
+        evidenceRequired: Boolean(row.evidence_required),
+        evidenceSummary: mapEvidenceSummary(row),
+        evidence: row.evidence_revision === null || row.evidence_revision === undefined
+          ? null
+          : {
+              revision: Math.max(1, Number(row.evidence_revision) || 1),
+              portfolioUrls: safeJsonArray(row.portfolio_urls_json),
+              referenceUrls: safeJsonArray(row.reference_urls_json),
+              registrationType: row.registration_type,
+              registrationReference: row.registration_reference || null,
+              attested: Boolean(row.evidence_attested),
+              attestedAt: row.evidence_attested_at,
+            },
+        currentInformationRequest: mapInformationRequest(row, { includeMessage: true }),
+      },
+    });
+  });
+
   app.put(`${API_PREFIX}/vendors/onboarding/evidence`, async (c) => {
     const user = await currentUser(c);
     if (user.role === "admin") {
       throw new ApiError(403, "role_not_allowed", "Administrator accounts cannot submit vendor evidence");
     }
-    const requestKey = idempotencyKey(c);
+    const requestKey = idempotencyKey(c, { required: true });
     const input = await parseJson(c, vendorEvidenceCompletionSchema);
     const normalizedEvidence = {
       ...input.evidence,
@@ -3414,7 +3634,14 @@ function buildApp() {
     };
     const db = requireDatabase(c.env);
     const scope = "vendor-onboarding-evidence";
-    const requestHash = await canonicalRequestHash({ evidence: normalizedEvidence });
+    const normalizedRequest = {
+      evidence: normalizedEvidence,
+      expectedStatus: input.expectedStatus,
+      expectedRevision: input.expectedRevision,
+      expectedEvidenceRevision: input.expectedEvidenceRevision,
+      expectedInformationRequestRevision: input.expectedInformationRequestRevision,
+    };
+    const requestHash = await canonicalRequestHash(normalizedRequest);
     const replay = await findIdempotentResult(db, scope, requestKey, user.id, requestHash);
     if (replay) return c.json({ data: replay.value, meta: { replayed: true } }, replay.status);
     if (!(await hasVendorEvidenceSchema(db))) {
@@ -3427,82 +3654,171 @@ function buildApp() {
     await enforceRateLimit(c, `vendor-evidence-completion:${user.id}`, 5, 24 * 60 * 60);
     const vendor = await db
       .prepare(
-        `SELECT vendor.id, vendor.status, evidence.evidence_revision
+        `SELECT vendor.id, vendor.status, vendor.review_revision, vendor.evidence_required,
+                vendor.evidence_latest_revision, vendor.information_request_revision,
+                vendor.information_requested
          FROM vendors vendor
-         LEFT JOIN vendor_application_evidence evidence ON evidence.vendor_id = vendor.id
          WHERE vendor.user_id = ? LIMIT 1`,
       )
       .bind(user.id)
       .first();
     if (!vendor) throw new ApiError(404, "vendor_not_found", "Create a vendor application before submitting evidence");
-    if (vendor.evidence_revision !== null && vendor.evidence_revision !== undefined) {
-      throw new ApiError(409, "vendor_evidence_exists", "Application evidence has already been submitted");
+    const currentRevision = Math.max(0, Number(vendor.review_revision) || 0);
+    const currentEvidenceRevision = Math.max(0, Number(vendor.evidence_latest_revision) || 0);
+    const currentInformationRequestRevision = Math.max(0, Number(vendor.information_request_revision) || 0);
+    const currentEffectiveStatus = effectiveVendorStatus(vendor);
+    if (
+      input.expectedStatus !== currentEffectiveStatus
+      || input.expectedRevision !== currentRevision
+      || input.expectedEvidenceRevision !== currentEvidenceRevision
+      || input.expectedInformationRequestRevision !== currentInformationRequestRevision
+    ) {
+      throw new ApiError(409, "vendor_evidence_conflict", "This application changed; refresh before submitting evidence", {
+        currentStatus: currentEffectiveStatus,
+        currentRevision,
+        currentEvidenceRevision,
+        currentInformationRequestRevision,
+      });
     }
-    if (!["pending", "rejected"].includes(vendor.status)) {
+    if (!["pending", "rejected"].includes(vendor.status)
+      || (currentEvidenceRevision > 0 && !vendor.information_requested)) {
       throw new ApiError(
         409,
         "vendor_evidence_completion_unavailable",
-        "Evidence can only be completed while an application is pending or rejected",
+        "Evidence revisions require an active information request",
       );
     }
+    if (currentEvidenceRevision >= VENDOR_EVIDENCE_MAX_REVISION) {
+      throw new ApiError(409, "vendor_evidence_revision_limit", "Contact Melaiva support before submitting more revisions");
+    }
+    if (vendor.information_requested && input.expectedStatus !== "needs_information") {
+      throw new ApiError(409, "vendor_evidence_conflict", "This application changed; refresh before submitting evidence");
+    }
+    const nextEvidenceRevision = currentEvidenceRevision + 1;
     const attestedAt = new Date().toISOString();
+    const reviewChanged = nextEvidenceRevision > 1 || Boolean(vendor.information_requested);
+    const nextReviewRevision = currentRevision + (reviewChanged ? 1 : 0);
+    const nextStatus = vendor.information_requested ? "pending" : vendor.status;
     const responseValue = {
       vendorId: vendor.id,
+      status: nextStatus,
+      effectiveStatus: nextStatus,
+      reviewRevision: nextReviewRevision,
+      informationRequestRevision: currentInformationRequestRevision,
       evidenceSummary: {
-        revision: 1,
+        revision: nextEvidenceRevision,
         portfolioUrlCount: normalizedEvidence.portfolioUrls.length,
         referenceUrlCount: normalizedEvidence.referenceUrls.length,
         registrationType: normalizedEvidence.registrationType,
         declarationOnly: normalizedEvidence.registrationType === "not_registered",
       },
+      currentInformationRequest: null,
     };
-    const statements = [
-      db
+    const insertEvidence = nextEvidenceRevision === 1 && !vendor.information_requested
+      ? db
         .prepare(
           `INSERT INTO vendor_application_evidence
            (vendor_id, evidence_revision, portfolio_urls_json, reference_urls_json, registration_type,
             registration_reference, attested, attested_at, created_at)
-           VALUES (?, 1, ?, ?, ?, ?, 1, ?, ?)`,
+           SELECT vendor.id, 1, ?, ?, ?, ?, 1, ?, ?
+           FROM vendors vendor
+           JOIN users owner ON owner.id = vendor.user_id
+           WHERE vendor.id = ? AND vendor.user_id = ? AND owner.status = 'active'
+             AND vendor.status = ? AND vendor.review_revision = ?
+             AND vendor.evidence_latest_revision = 0
+             AND vendor.information_request_revision = ?
+             AND vendor.information_requested = ?`,
         )
         .bind(
-          vendor.id,
           JSON.stringify(normalizedEvidence.portfolioUrls),
           JSON.stringify(normalizedEvidence.referenceUrls),
           normalizedEvidence.registrationType,
           normalizedEvidence.registrationReference || null,
           attestedAt,
           attestedAt,
-        ),
+          vendor.id,
+          user.id,
+          vendor.status,
+          currentRevision,
+          currentInformationRequestRevision,
+          vendor.information_requested ? 1 : 0,
+        )
+      : db
+        .prepare(
+          `INSERT INTO vendor_application_evidence_revisions
+           (vendor_id, evidence_revision, portfolio_urls_json, reference_urls_json, registration_type,
+            registration_reference, attested, attested_at, submitted_by_user_id, created_at)
+           SELECT vendor.id, ?, ?, ?, ?, ?, 1, ?, ?, ?
+           FROM vendors vendor
+           JOIN users owner ON owner.id = vendor.user_id
+           WHERE vendor.id = ? AND vendor.user_id = ? AND owner.status = 'active'
+             AND vendor.status = ? AND vendor.review_revision = ?
+             AND vendor.evidence_latest_revision = ?
+             AND vendor.information_request_revision = ?
+             AND vendor.information_requested = 1`,
+        )
+        .bind(
+          nextEvidenceRevision,
+          JSON.stringify(normalizedEvidence.portfolioUrls),
+          JSON.stringify(normalizedEvidence.referenceUrls),
+          normalizedEvidence.registrationType,
+          normalizedEvidence.registrationReference || null,
+          attestedAt,
+          user.id,
+          attestedAt,
+          vendor.id,
+          user.id,
+          vendor.status,
+          currentRevision,
+          currentEvidenceRevision,
+          currentInformationRequestRevision,
+        );
+    const auditMetadata = JSON.stringify({
+      fromEvidenceRevision: currentEvidenceRevision,
+      toEvidenceRevision: nextEvidenceRevision,
+      informationRequestRevision: vendor.information_requested ? currentInformationRequestRevision : null,
+      evidenceSummary: responseValue.evidenceSummary,
+      reviewRevision: nextReviewRevision,
+    });
+    const statements = [
+      insertEvidence,
+      db
+        .prepare(
+          `INSERT INTO audit_events (actor_user_id, action, entity_type, entity_id, metadata_json, created_at)
+           SELECT ?, 'vendor.evidence_revised', 'vendor', ?, ?, ? WHERE changes() = 1`,
+        )
+        .bind(user.id, vendor.id, auditMetadata, attestedAt),
+      await conditionalIdempotencyStatement(db, scope, requestKey, user.id, requestHash, 201, responseValue),
     ];
-    if (requestKey) {
-      statements.push(
-        await conditionalIdempotencyStatement(db, scope, requestKey, user.id, requestHash, 201, responseValue),
-      );
-    }
+    let results;
     try {
-      await db.batch(statements);
+      results = await db.batch(statements);
     } catch (error) {
       if (isVendorEvidenceStateConflict(error)) {
         throw new ApiError(
           409,
           "vendor_evidence_completion_unavailable",
-          "Evidence can only be completed while an application is pending or rejected",
+          "Evidence revisions require an active information request",
         );
+      }
+      if (isVendorEvidenceRevisionConflict(error)) {
+        throw new ApiError(409, "vendor_evidence_conflict", "This application changed; refresh before submitting evidence");
       }
       if (isUniqueConstraint(error)) {
         const concurrentReplay = await findIdempotentResult(db, scope, requestKey, user.id, requestHash);
         if (concurrentReplay) {
           return c.json({ data: concurrentReplay.value, meta: { replayed: true } }, concurrentReplay.status);
         }
-        const completed = await db
-          .prepare("SELECT evidence_revision FROM vendor_application_evidence WHERE vendor_id = ? LIMIT 1")
-          .bind(vendor.id)
-          .first();
-        if (completed) {
-          throw new ApiError(409, "vendor_evidence_exists", "Application evidence has already been submitted");
-        }
+        throw new ApiError(409, "vendor_evidence_conflict", "This application changed; refresh before submitting evidence");
       }
       throw error;
+    }
+    if (Number(results?.[0]?.meta?.changes || 0) !== 1) {
+      const concurrentReplay = await findIdempotentResult(db, scope, requestKey, user.id, requestHash);
+      if (concurrentReplay) {
+        return c.json({ data: concurrentReplay.value, meta: { replayed: true } }, concurrentReplay.status);
+      }
+      throw new ApiError(409, "vendor_evidence_conflict", "This application changed; refresh before submitting evidence");
     }
     return c.json({ data: responseValue }, 201);
   });
@@ -3638,12 +3954,11 @@ function buildApp() {
   app.get(`${API_PREFIX}/admin/vendors`, async (c) => {
     const user = await currentUser(c);
     if (user.role !== "admin") throw new ApiError(403, "role_not_allowed", "Administrator access is required");
-    if (c.req.header("x-melaiva-admin-vendor-summary") !== "1") {
+    if (c.req.header("x-melaiva-admin-vendor-summary") !== "2") {
       throw new ApiError(409, "client_upgrade_required", "Refresh Melaiva before reviewing vendor applications");
     }
     const db = requireDatabase(c.env);
-    const evidenceAvailable = await hasVendorEvidenceSchema(db);
-    if (!evidenceAvailable) {
+    if (!(await hasVendorEvidenceSchema(db))) {
       throw new ApiError(
         503,
         "vendor_evidence_migration_required",
@@ -3651,14 +3966,13 @@ function buildApp() {
       );
     }
     const requestedStatus = c.req.query("status") || "pending";
-    const status = vendorStatusSchema.safeParse(requestedStatus);
+    const status = adminVendorStatusSchema.safeParse(requestedStatus);
     if (!status.success) throw new ApiError(422, "validation_failed", "Unknown vendor status");
     const limit = parsePositiveInt(c.req.query("limit"), 50, 100);
     const cursor = c.req.query("cursor") || null;
     if (cursor && !/^[A-Za-z0-9-]{1,100}$/.test(cursor)) {
       throw new ApiError(422, "invalid_cursor", "Vendor queue cursor is invalid");
     }
-    const revisionAvailable = await hasVendorReviewRevision(db);
     let cursorRow = null;
     if (cursor) {
       cursorRow = await db
@@ -3669,16 +3983,23 @@ function buildApp() {
     }
     const cursorCondition = cursorRow ? "AND (v.created_at > ? OR (v.created_at = ? AND v.id > ?))" : "";
     const cursorBinds = cursorRow ? [cursorRow.created_at, cursorRow.created_at, cursorRow.id] : [];
+    const statusCondition = status.data === "needs_information"
+      ? "v.information_requested = 1"
+      : "v.information_requested = 0 AND v.status = ?";
+    const statusBinds = status.data === "needs_information" ? [] : [status.data];
     const result = await db
       .prepare(
         `SELECT v.id, v.slug, v.business_name, v.status, v.category, v.city, v.created_at, v.updated_at,
-                ${revisionAvailable ? "v.review_revision" : "NULL"} AS review_revision,
-                ${evidenceAvailable ? "v.evidence_required" : "0"} AS evidence_required,
-                ${evidenceAvailable ? "v.evidence_reviewed_revision" : "NULL"} AS evidence_reviewed_revision,
-                ${evidenceAvailable ? "evidence.evidence_revision" : "NULL"} AS evidence_revision,
-                ${evidenceAvailable ? "json_array_length(evidence.portfolio_urls_json)" : "NULL"} AS portfolio_url_count,
-                ${evidenceAvailable ? "json_array_length(evidence.reference_urls_json)" : "NULL"} AS reference_url_count,
-                ${evidenceAvailable ? "evidence.registration_type" : "NULL"} AS registration_type,
+                v.review_revision, v.evidence_required, v.evidence_reviewed_revision,
+                v.evidence_latest_revision, v.information_requested, v.information_request_revision,
+                evidence.evidence_revision,
+                json_array_length(evidence.portfolio_urls_json) AS portfolio_url_count,
+                json_array_length(evidence.reference_urls_json) AS reference_url_count,
+                evidence.registration_type,
+                information_request.request_revision AS current_information_request_revision,
+                information_request.evidence_revision AS current_information_request_evidence_revision,
+                information_request.requested_fields_json AS current_requested_fields_json,
+                information_request.requested_at AS current_information_requested_at,
                 (
                   SELECT COUNT(*) FROM audit_events review_event
                   WHERE review_event.action = 'vendor.reviewed'
@@ -3693,23 +4014,32 @@ function buildApp() {
                   ORDER BY review_event.id DESC LIMIT 1
                 ) AS last_reviewed_at
          FROM vendors v
-         ${evidenceAvailable ? "LEFT JOIN vendor_application_evidence evidence ON evidence.vendor_id = v.id" : ""}
-         WHERE v.status = ? ${cursorCondition}
+         LEFT JOIN vendor_application_evidence_revisions evidence
+           ON evidence.vendor_id = v.id AND evidence.evidence_revision = v.evidence_latest_revision
+         LEFT JOIN vendor_application_information_requests information_request
+           ON information_request.vendor_id = v.id
+          AND information_request.request_revision = v.information_request_revision
+         WHERE ${statusCondition} ${cursorCondition}
          ORDER BY v.created_at ASC, v.id ASC LIMIT ?`,
       )
-      .bind(status.data, ...cursorBinds, limit + 1)
+      .bind(...statusBinds, ...cursorBinds, limit + 1)
       .all();
     const rows = result.results || [];
     const hasMore = rows.length > limit;
     const pageRows = rows.slice(0, limit);
     const countResult = await db
-      .prepare("SELECT status, COUNT(*) AS count FROM vendors GROUP BY status")
+      .prepare(
+        `SELECT CASE WHEN information_requested = 1 THEN 'needs_information' ELSE status END AS status,
+                COUNT(*) AS count
+         FROM vendors
+         GROUP BY CASE WHEN information_requested = 1 THEN 'needs_information' ELSE status END`,
+      )
       .all();
-    const statusCounts = Object.fromEntries(VENDOR_STATUSES.map((vendorStatus) => [vendorStatus, 0]));
+    const statusCounts = Object.fromEntries(ADMIN_VENDOR_STATUSES.map((vendorStatus) => [vendorStatus, 0]));
     for (const row of countResult.results || []) {
       if (Object.hasOwn(statusCounts, row.status)) statusCounts[row.status] = Number(row.count || 0);
     }
-    c.header(ADMIN_VENDOR_SUMMARY_HEADER, "1");
+    c.header(ADMIN_VENDOR_SUMMARY_HEADER, "2");
     return c.json({
       data: pageRows.map(mapAdminVendorSummary),
       meta: {
@@ -3726,33 +4056,31 @@ function buildApp() {
     const user = await currentUser(c);
     if (user.role !== "admin") throw new ApiError(403, "role_not_allowed", "Administrator access is required");
     const db = requireDatabase(c.env);
-    const evidenceAvailable = await hasVendorEvidenceSchema(db);
-    if (!evidenceAvailable) {
+    if (!(await hasVendorEvidenceSchema(db))) {
       throw new ApiError(
         503,
         "vendor_evidence_migration_required",
         "Vendor application reviews are temporarily paused during a database upgrade",
       );
     }
-    const revisionAvailable = await hasVendorReviewRevision(db);
     const row = await db
       .prepare(
         `SELECT v.id, v.slug, v.business_name, v.legal_name, v.status, v.category, v.categories_json,
                 v.city, v.service_areas_json, v.description, v.min_budget, v.max_budget, v.currency,
                 v.phone, v.website_url, v.instagram_handle, v.created_at, v.updated_at,
-                ${revisionAvailable ? "v.review_revision" : "NULL"} AS review_revision,
-                ${evidenceAvailable ? "v.evidence_required" : "0"} AS evidence_required,
-                ${evidenceAvailable ? "v.evidence_reviewed_revision" : "NULL"} AS evidence_reviewed_revision,
+                v.review_revision, v.evidence_required, v.evidence_reviewed_revision,
+                v.evidence_latest_revision, v.information_requested, v.information_request_revision,
                 u.id AS user_id, u.name AS owner_name, u.email AS owner_email,
-                ${evidenceAvailable ? "evidence.evidence_revision" : "NULL"} AS evidence_revision,
-                ${evidenceAvailable ? "evidence.portfolio_urls_json" : "NULL"} AS portfolio_urls_json,
-                ${evidenceAvailable ? "evidence.reference_urls_json" : "NULL"} AS reference_urls_json,
-                ${evidenceAvailable ? "json_array_length(evidence.portfolio_urls_json)" : "NULL"} AS portfolio_url_count,
-                ${evidenceAvailable ? "json_array_length(evidence.reference_urls_json)" : "NULL"} AS reference_url_count,
-                ${evidenceAvailable ? "evidence.registration_type" : "NULL"} AS registration_type,
-                ${evidenceAvailable ? "evidence.registration_reference" : "NULL"} AS registration_reference,
-                ${evidenceAvailable ? "evidence.attested" : "NULL"} AS evidence_attested,
-                ${evidenceAvailable ? "evidence.attested_at" : "NULL"} AS evidence_attested_at,
+                evidence.evidence_revision, evidence.portfolio_urls_json, evidence.reference_urls_json,
+                json_array_length(evidence.portfolio_urls_json) AS portfolio_url_count,
+                json_array_length(evidence.reference_urls_json) AS reference_url_count,
+                evidence.registration_type, evidence.registration_reference,
+                evidence.attested AS evidence_attested, evidence.attested_at AS evidence_attested_at,
+                information_request.request_revision AS current_information_request_revision,
+                information_request.evidence_revision AS current_information_request_evidence_revision,
+                information_request.requested_fields_json AS current_requested_fields_json,
+                information_request.applicant_message AS current_applicant_message,
+                information_request.requested_at AS current_information_requested_at,
                 (
                   SELECT COUNT(*) FROM audit_events review_event
                   WHERE review_event.action = 'vendor.reviewed'
@@ -3768,13 +4096,34 @@ function buildApp() {
                 ) AS last_reviewed_at
          FROM vendors v
          LEFT JOIN users u ON u.id = v.user_id
-         ${evidenceAvailable ? "LEFT JOIN vendor_application_evidence evidence ON evidence.vendor_id = v.id" : ""}
+         LEFT JOIN vendor_application_evidence_revisions evidence
+           ON evidence.vendor_id = v.id AND evidence.evidence_revision = v.evidence_latest_revision
+         LEFT JOIN vendor_application_information_requests information_request
+           ON information_request.vendor_id = v.id
+          AND information_request.request_revision = v.information_request_revision
          WHERE v.id = ? LIMIT 1`,
       )
       .bind(c.req.param("id"))
       .first();
     if (!row) throw new ApiError(404, "vendor_not_found", "Vendor not found");
-    return c.json({ data: mapAdminVendorDetail(row) });
+    const history = await db
+      .prepare(
+        `SELECT evidence_revision,
+                json_array_length(portfolio_urls_json) AS portfolio_url_count,
+                json_array_length(reference_urls_json) AS reference_url_count,
+                registration_type, attested_at AS evidence_attested_at, created_at AS evidence_created_at
+         FROM vendor_application_evidence_revisions
+         WHERE vendor_id = ?
+         ORDER BY evidence_revision DESC`,
+      )
+      .bind(row.id)
+      .all();
+    return c.json({
+      data: {
+        ...mapAdminVendorDetail(row),
+        evidenceHistory: (history.results || []).map(mapEvidenceHistoryRow),
+      },
+    });
   });
 
   app.get(`${API_PREFIX}/admin/vendors/:id/reviews`, async (c) => {
@@ -3828,8 +4177,7 @@ function buildApp() {
     const user = await currentUser(c);
     if (user.role !== "admin") throw new ApiError(403, "role_not_allowed", "Administrator access is required");
     const db = requireDatabase(c.env);
-    const evidenceAvailable = await hasVendorEvidenceSchema(db);
-    if (!evidenceAvailable) {
+    if (!(await hasVendorEvidenceSchema(db))) {
       throw new ApiError(
         503,
         "vendor_evidence_migration_required",
@@ -3839,12 +4187,12 @@ function buildApp() {
     const requestKey = idempotencyKey(c, { required: true });
     const input = await parseJson(c, vendorReviewSchema);
     const reason = input.reason || input.note;
-    const revisionAvailable = await hasVendorReviewRevision(db);
+    const requestedFields = input.requestedFields ? [...input.requestedFields].sort() : null;
     const scope = `vendor-review:${c.req.param("id")}`;
     const normalizedRequest = {
       status: input.status,
-      expectedStatus: input.expectedStatus ?? null,
-      expectedRevision: input.expectedRevision ?? null,
+      expectedStatus: input.expectedStatus,
+      expectedRevision: input.expectedRevision,
       reason,
       ...(input.evidenceAcknowledged !== undefined
         ? { evidenceAcknowledged: input.evidenceAcknowledged }
@@ -3852,47 +4200,56 @@ function buildApp() {
       ...(input.expectedEvidenceRevision !== undefined
         ? { expectedEvidenceRevision: input.expectedEvidenceRevision }
         : {}),
+      ...(requestedFields ? { requestedFields } : {}),
+      ...(input.applicantMessage ? { applicantMessage: input.applicantMessage } : {}),
     };
     const requestHash = await canonicalRequestHash(normalizedRequest);
     const replay = await findIdempotentResult(db, scope, requestKey, user.id, requestHash);
     if (replay) return c.json({ data: replay.value, meta: { replayed: true } }, replay.status);
-    if (!revisionAvailable) {
-      throw new ApiError(503, "vendor_review_migration_required", "Vendor reviews are temporarily paused during a database upgrade");
-    }
     await enforceRateLimit(c, `vendor-review:${user.id}`, 120, 60 * 60);
     const vendor = await db
       .prepare(
-        `SELECT v.id, v.status, ${revisionAvailable ? "v.review_revision" : "0"} AS review_revision,
-                ${evidenceAvailable ? "v.evidence_required" : "0"} AS evidence_required,
-                ${evidenceAvailable ? "v.evidence_reviewed_revision" : "0"} AS evidence_reviewed_revision,
-                ${evidenceAvailable ? "evidence.evidence_revision" : "NULL"} AS evidence_revision,
-                ${evidenceAvailable ? "evidence.portfolio_urls_json" : "NULL"} AS portfolio_urls_json,
-                ${evidenceAvailable ? "evidence.reference_urls_json" : "NULL"} AS reference_urls_json,
-                ${evidenceAvailable ? "json_array_length(evidence.portfolio_urls_json)" : "NULL"} AS portfolio_url_count,
-                ${evidenceAvailable ? "json_array_length(evidence.reference_urls_json)" : "NULL"} AS reference_url_count,
-                ${evidenceAvailable ? "evidence.registration_type" : "NULL"} AS registration_type,
-                ${evidenceAvailable ? "evidence.registration_reference" : "NULL"} AS registration_reference
+        `SELECT v.id, v.status, v.review_revision, v.evidence_required, v.evidence_reviewed_revision,
+                v.evidence_latest_revision, v.information_request_revision, v.information_requested,
+                evidence.evidence_revision, evidence.portfolio_urls_json, evidence.reference_urls_json,
+                json_array_length(evidence.portfolio_urls_json) AS portfolio_url_count,
+                json_array_length(evidence.reference_urls_json) AS reference_url_count,
+                evidence.registration_type, evidence.registration_reference,
+                information_request.request_revision AS current_information_request_revision,
+                information_request.evidence_revision AS current_information_request_evidence_revision,
+                information_request.requested_fields_json AS current_requested_fields_json,
+                information_request.applicant_message AS current_applicant_message,
+                information_request.requested_at AS current_information_requested_at
          FROM vendors v
-         ${evidenceAvailable ? "LEFT JOIN vendor_application_evidence evidence ON evidence.vendor_id = v.id" : ""}
+         LEFT JOIN vendor_application_evidence_revisions evidence
+           ON evidence.vendor_id = v.id AND evidence.evidence_revision = v.evidence_latest_revision
+         LEFT JOIN vendor_application_information_requests information_request
+           ON information_request.vendor_id = v.id
+          AND information_request.request_revision = v.information_request_revision
          WHERE v.id = ? LIMIT 1`,
       )
       .bind(c.req.param("id"))
       .first();
     if (!vendor) throw new ApiError(404, "vendor_not_found", "Vendor not found");
     const currentRevision = Math.max(0, Number(vendor.review_revision) || 0);
+    const currentEvidenceRevision = Math.max(0, Number(vendor.evidence_latest_revision) || 0);
+    const currentInformationRequestRevision = Math.max(0, Number(vendor.information_request_revision) || 0);
+    const currentStatus = effectiveVendorStatus(vendor);
     if (
-      input.expectedStatus !== vendor.status
+      input.expectedStatus !== currentStatus
       || input.expectedRevision !== currentRevision
     ) {
       throw new ApiError(409, "vendor_review_conflict", "This application changed; refresh before deciding", {
-        currentStatus: vendor.status,
+        currentStatus,
         currentRevision,
+        currentEvidenceRevision,
+        currentInformationRequestRevision,
       });
     }
-    if (!VENDOR_REVIEW_TRANSITIONS[vendor.status]?.includes(input.status)) {
+    if (!VENDOR_REVIEW_TRANSITIONS[currentStatus]?.includes(input.status)) {
       throw new ApiError(409, "invalid_status_transition", "This vendor status cannot make the requested transition", {
-        currentStatus: vendor.status,
-        allowedStatuses: VENDOR_REVIEW_TRANSITIONS[vendor.status] || [],
+        currentStatus,
+        allowedStatuses: VENDOR_REVIEW_TRANSITIONS[currentStatus] || [],
       });
     }
     if (reviewReasonContainsStoredEvidence(reason, vendor)) {
@@ -3904,57 +4261,75 @@ function buildApp() {
       ]);
     }
     const evidenceRequired = Boolean(vendor.evidence_required);
-    const evidenceRevision = vendor.evidence_revision === null || vendor.evidence_revision === undefined
-      ? null
-      : Math.max(1, Number(vendor.evidence_revision) || 1);
-    const evidenceSummary = evidenceRevision === null
-      ? null
-      : {
-          revision: evidenceRevision,
-          portfolioUrlCount: Math.max(0, Number(vendor.portfolio_url_count) || 0),
-          referenceUrlCount: Math.max(0, Number(vendor.reference_url_count) || 0),
-          registrationType: vendor.registration_type,
-          declarationOnly: vendor.registration_type === "not_registered",
-        };
-    if (input.status === "approved" && evidenceRequired && evidenceRevision === null) {
+    const evidenceSummary = mapEvidenceSummary(vendor);
+    if (input.status === "needs_information") {
+      if (currentEvidenceRevision >= VENDOR_EVIDENCE_MAX_REVISION) {
+        throw new ApiError(
+          409,
+          "vendor_evidence_revision_limit",
+          "Resolve this application without requesting another evidence revision",
+        );
+      }
+      if (input.expectedEvidenceRevision !== currentEvidenceRevision) {
+        throw new ApiError(409, "vendor_evidence_conflict", "Application evidence changed; refresh before deciding", {
+          currentEvidenceRevision,
+        });
+      }
+    }
+    if (input.status === "approved" && evidenceRequired && currentEvidenceRevision === 0) {
       throw new ApiError(
         409,
         "vendor_evidence_required",
         "The vendor must complete application evidence before approval",
       );
     }
-    if (input.status === "approved" && evidenceRevision !== null) {
+    if (input.status === "approved" && currentEvidenceRevision > 0) {
       if (input.evidenceAcknowledged !== true || input.expectedEvidenceRevision === undefined) {
         throw new ApiError(
           422,
           "vendor_evidence_acknowledgement_required",
           "Acknowledge the exact application evidence revision before approval",
-          { currentEvidenceRevision: evidenceRevision },
+          { currentEvidenceRevision },
         );
       }
-      if (input.expectedEvidenceRevision !== evidenceRevision) {
+      if (input.expectedEvidenceRevision !== currentEvidenceRevision) {
         throw new ApiError(409, "vendor_evidence_conflict", "Application evidence changed; refresh before deciding", {
-          currentEvidenceRevision: evidenceRevision,
+          currentEvidenceRevision,
         });
       }
     }
     const reviewId = crypto.randomUUID();
     const reviewedAt = new Date().toISOString();
-    const nextRevision = revisionAvailable ? currentRevision + 1 : currentRevision;
+    const nextRevision = currentRevision + 1;
+    const nextInformationRequestRevision = input.status === "needs_information"
+      ? currentInformationRequestRevision + 1
+      : currentInformationRequestRevision;
+    const currentInformationRequest = input.status === "needs_information"
+      ? {
+          revision: nextInformationRequestRevision,
+          evidenceRevision: currentEvidenceRevision,
+          requestedFields,
+          applicantMessage: input.applicantMessage,
+          requestedAt: reviewedAt,
+        }
+      : null;
+    const evidenceReviewedRevision = input.status === "approved" || input.status === "needs_information"
+      ? currentEvidenceRevision
+      : Math.max(0, Number(vendor.evidence_reviewed_revision) || 0);
     const responseValue = {
       id: vendor.id,
       status: input.status,
       verified: input.status === "approved",
       reviewRevision: nextRevision,
+      informationRequestRevision: nextInformationRequestRevision,
       evidenceRequired,
-      evidenceReviewedRevision: input.status === "approved" && evidenceRevision !== null
-        ? evidenceRevision
-        : Math.max(0, Number(vendor.evidence_reviewed_revision) || 0),
+      evidenceReviewedRevision,
       evidenceSummary,
+      currentInformationRequest,
       reviewedAt,
       review: {
         id: reviewId,
-        fromStatus: vendor.status,
+        fromStatus: currentStatus,
         toStatus: input.status,
         reason,
         statusRevision: nextRevision,
@@ -3963,56 +4338,131 @@ function buildApp() {
         legacy: false,
       },
     };
-    const update = revisionAvailable && input.status === "approved" && evidenceRevision !== null
-      ? db
-          .prepare(
-            `UPDATE vendors
-             SET status = ?, verified = 1, evidence_reviewed_revision = ?, updated_at = ?
-             WHERE id = ? AND status = ? AND review_revision = ?
-               AND EXISTS (
-                 SELECT 1 FROM vendor_application_evidence current_evidence
-                 WHERE current_evidence.vendor_id = vendors.id
-                   AND current_evidence.evidence_revision = ?
-               )
-               AND EXISTS (
-                 SELECT 1 FROM users active_admin
-                 WHERE active_admin.id = ? AND active_admin.role = 'admin' AND active_admin.status = 'active'
-               )`,
-          )
-          .bind(input.status, evidenceRevision, reviewedAt, vendor.id, vendor.status, currentRevision, evidenceRevision, user.id)
-      : revisionAvailable
-      ? db
-          .prepare(
-            `UPDATE vendors
-             SET status = ?, verified = ?, updated_at = ?
-             WHERE id = ? AND status = ? AND review_revision = ?
-               AND EXISTS (
-                 SELECT 1 FROM users active_admin
-                 WHERE active_admin.id = ? AND active_admin.role = 'admin' AND active_admin.status = 'active'
-               )`,
-          )
-          .bind(input.status, input.status === "approved" ? 1 : 0, reviewedAt, vendor.id, vendor.status, currentRevision, user.id)
-      : db
-          .prepare(
-            `UPDATE vendors
-             SET status = ?, verified = ?, updated_at = ?
-             WHERE id = ? AND status = ?
-               AND EXISTS (
-                 SELECT 1 FROM users active_admin
-                 WHERE active_admin.id = ? AND active_admin.role = 'admin' AND active_admin.status = 'active'
-               )`,
-          )
-          .bind(input.status, input.status === "approved" ? 1 : 0, reviewedAt, vendor.id, vendor.status, user.id);
+    let mutation;
+    if (input.status === "needs_information") {
+      mutation = db
+        .prepare(
+          `INSERT INTO vendor_application_information_requests
+           (vendor_id, request_revision, evidence_revision, requested_fields_json, applicant_message,
+            requested_by_user_id, requested_at)
+           SELECT candidate.id, ?, ?, ?, ?, ?, ?
+           FROM vendors candidate
+           JOIN users active_admin ON active_admin.id = ?
+           WHERE candidate.id = ? AND candidate.status = ? AND candidate.review_revision = ?
+             AND candidate.evidence_latest_revision = ? AND candidate.evidence_latest_revision < ?
+             AND candidate.information_request_revision = ? AND candidate.information_requested = 0
+             AND active_admin.role = 'admin' AND active_admin.status = 'active'`,
+        )
+        .bind(
+          nextInformationRequestRevision,
+          currentEvidenceRevision,
+          JSON.stringify(requestedFields),
+          input.applicantMessage,
+          user.id,
+          reviewedAt,
+          user.id,
+          vendor.id,
+          vendor.status,
+          currentRevision,
+          currentEvidenceRevision,
+          VENDOR_EVIDENCE_MAX_REVISION,
+          currentInformationRequestRevision,
+        );
+    } else if (currentStatus === "needs_information") {
+      mutation = db
+        .prepare(
+          `UPDATE vendors
+           SET status = ?, verified = 0, information_requested = 0,
+               review_revision = review_revision + 1, updated_at = ?
+           WHERE id = ? AND status = ? AND review_revision = ?
+             AND evidence_latest_revision = ? AND information_request_revision = ?
+             AND information_requested = 1
+             AND EXISTS (
+               SELECT 1 FROM users active_admin
+               WHERE active_admin.id = ? AND active_admin.role = 'admin' AND active_admin.status = 'active'
+             )`,
+        )
+        .bind(
+          input.status,
+          reviewedAt,
+          vendor.id,
+          vendor.status,
+          currentRevision,
+          currentEvidenceRevision,
+          currentInformationRequestRevision,
+          user.id,
+        );
+    } else if (input.status === "approved") {
+      mutation = db
+        .prepare(
+          `UPDATE vendors
+           SET status = 'approved', verified = 1, evidence_reviewed_revision = ?, updated_at = ?
+           WHERE id = ? AND status = ? AND review_revision = ?
+             AND evidence_latest_revision = ? AND information_request_revision = ?
+             AND information_requested = 0
+             AND (? = 0 OR EXISTS (
+               SELECT 1 FROM vendor_application_evidence_revisions current_evidence
+               WHERE current_evidence.vendor_id = vendors.id
+                 AND current_evidence.evidence_revision = ?
+             ))
+             AND EXISTS (
+               SELECT 1 FROM users active_admin
+               WHERE active_admin.id = ? AND active_admin.role = 'admin' AND active_admin.status = 'active'
+             )`,
+        )
+        .bind(
+          currentEvidenceRevision,
+          reviewedAt,
+          vendor.id,
+          vendor.status,
+          currentRevision,
+          currentEvidenceRevision,
+          currentInformationRequestRevision,
+          currentEvidenceRevision,
+          currentEvidenceRevision,
+          user.id,
+        );
+    } else {
+      mutation = db
+        .prepare(
+          `UPDATE vendors
+           SET status = ?, verified = 0, updated_at = ?
+           WHERE id = ? AND status = ? AND review_revision = ?
+             AND evidence_latest_revision = ? AND information_request_revision = ?
+             AND information_requested = 0
+             AND EXISTS (
+               SELECT 1 FROM users active_admin
+               WHERE active_admin.id = ? AND active_admin.role = 'admin' AND active_admin.status = 'active'
+             )`,
+        )
+        .bind(
+          input.status,
+          reviewedAt,
+          vendor.id,
+          vendor.status,
+          currentRevision,
+          currentEvidenceRevision,
+          currentInformationRequestRevision,
+          user.id,
+        );
+    }
     const metadata = JSON.stringify({
       reviewId,
-      from: vendor.status,
+      from: currentStatus,
       to: input.status,
       reason,
       statusRevision: nextRevision,
       evidenceSummary,
+      ...(input.status === "needs_information"
+        ? {
+            informationRequestRevision: nextInformationRequestRevision,
+            requestedFields,
+            requestedEvidenceRevision: currentEvidenceRevision,
+          }
+        : {}),
     });
     const statements = [
-      update,
+      mutation,
       db
         .prepare(
           `INSERT INTO audit_events (actor_user_id, action, entity_type, entity_id, metadata_json, created_at)
@@ -4062,6 +4512,17 @@ function buildApp() {
           },
         ]);
       }
+      if (isVendorInformationRequestConflict(error)) {
+        throw new ApiError(422, "validation_failed", "Please correct the highlighted fields", [
+          {
+            field: "applicantMessage",
+            message: "Applicant messages must not include evidence addresses, identity references, or unsafe characters",
+          },
+        ]);
+      }
+      if (isVendorInformationStateConflict(error)) {
+        throw new ApiError(409, "vendor_review_conflict", "This application changed; refresh before deciding");
+      }
       if (isUniqueConstraint(error)) {
         const concurrentReplay = await findIdempotentResult(db, scope, requestKey, user.id, requestHash);
         if (concurrentReplay) {
@@ -4077,14 +4538,17 @@ function buildApp() {
       }
       const current = await db
         .prepare(
-          `SELECT status, ${revisionAvailable ? "review_revision" : "0"} AS review_revision
+          `SELECT status, review_revision, evidence_latest_revision, information_request_revision,
+                  information_requested
            FROM vendors WHERE id = ? LIMIT 1`,
         )
         .bind(vendor.id)
         .first();
       throw new ApiError(409, "vendor_review_conflict", "This application changed; refresh before deciding", {
-        currentStatus: current?.status || null,
+        currentStatus: current ? effectiveVendorStatus(current) : null,
         currentRevision: Math.max(0, Number(current?.review_revision) || 0),
+        currentEvidenceRevision: Math.max(0, Number(current?.evidence_latest_revision) || 0),
+        currentInformationRequestRevision: Math.max(0, Number(current?.information_request_revision) || 0),
       });
     }
     return c.json({ data: responseValue });

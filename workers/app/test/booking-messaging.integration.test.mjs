@@ -121,6 +121,9 @@ function seedBooking(db, { suffix, auctionId, ownerId, vendorUserId, vendorStatu
                'A booking messaging integration-test vendor profile.', 100000, 500000, 'INR', 1)`,
     )
     .run(vendorId, vendorUserId, `studio-${suffix}`, `Studio ${suffix[0].toUpperCase()}${suffix.slice(1)}`, vendorStatus);
+  if (db.sqlite.prepare("PRAGMA table_info(vendors)").all().some((column) => column.name === "evidence_required")) {
+    db.sqlite.prepare("UPDATE vendors SET evidence_required = 0 WHERE id = ?").run(vendorId);
+  }
   db.sqlite
     .prepare(
       `INSERT INTO auctions

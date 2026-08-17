@@ -75,7 +75,7 @@ function MelaivaApp() {
         <Route path="/request" element={<RequestPage notify={notify} onOpenAuth={() => setOpenAuth(true)} />} />
         <Route path="/dashboard" element={<DashboardPage notify={notify} onOpenAuth={() => setOpenAuth(true)} authRevision={authRevision} />} />
         <Route path="/vendor" element={<VendorPage notify={notify} onOpenAuth={() => setOpenAuth(true)} authRevision={authRevision} />} />
-        <Route path="/vendor/onboarding" element={<VendorOnboardingPage notify={notify} onOpenAuth={() => setOpenAuth(true)} />} />
+        <Route path="/vendor/onboarding" element={<VendorOnboardingPage notify={notify} onOpenAuth={() => setOpenAuth(true)} authRevision={authRevision} />} />
         <Route path="/admin/vendors" element={<AdminRouteErrorBoundary key={authRevision}><Suspense fallback={<AdminRouteFallback />}><AdminVendorsPage notify={notify} onOpenAuth={() => setOpenAuth(true)} authRevision={authRevision} /></Suspense></AdminRouteErrorBoundary>} />
         <Route path="/auth" element={<AuthPage notify={notify} onAuthenticated={() => setAuthRevision((value) => value + 1)} />} />
         <Route path="/privacy" element={<LegalPage type="privacy" />} />

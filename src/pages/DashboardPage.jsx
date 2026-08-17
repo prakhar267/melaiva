@@ -106,7 +106,7 @@ function PreferredVendorSummary({ vendor }) {
     <div className="dashboard-preferred-vendor">
       <span className="dashboard-preferred-vendor__monogram">{initials}</span>
       <div><small>Preferred partner</small><strong>{businessName}</strong><span>{[categoryName(vendor.category), vendor.city].filter(Boolean).join(" · ")}</span></div>
-      {vendor.verified && <span className="dashboard-preferred-vendor__verified"><ShieldCheck size={14} /> Melaiva verified</span>}
+      {vendor.verified && <span className="dashboard-preferred-vendor__verified"><ShieldCheck size={14} /> Marketplace reviewed</span>}
       <span className={`status-pill ${vendor.inviteStatus === "responded" ? "status-pill--teal" : vendor.inviteStatus === "unavailable" ? "status-pill--neutral" : "status-pill--direct"}`}><span /> {status}</span>
     </div>
   );
@@ -546,7 +546,7 @@ function LiveOffers({ auction, bids, loading, error, decidingId, closing, award,
               const addOns = structured && Array.isArray(bid.addOns) ? bid.addOns : null;
               return (
                 <article className="live-offer" key={bid.id}>
-                  <div className="live-offer__top"><span className="offer-logo">{businessName.split(" ").map((word) => word[0]).join("").slice(0, 2)}</span><div><strong>{businessName}</strong><small>{bid.vendor?.verified ? "Melaiva verified" : "Partner proposal"}</small></div><div><small>Quoted amount</small><strong>{formatCurrency(bid.amount)}</strong></div><span className={`status-pill status-pill--${bid.status === "accepted" ? "teal" : "neutral"}`}><span /> {bid.status}</span></div>
+                  <div className="live-offer__top"><span className="offer-logo">{businessName.split(" ").map((word) => word[0]).join("").slice(0, 2)}</span><div><strong>{businessName}</strong><small>{bid.vendor?.verified ? "Marketplace reviewed" : "Partner proposal"}</small></div><div><small>Quoted amount</small><strong>{formatCurrency(bid.amount)}</strong></div><span className={`status-pill status-pill--${bid.status === "accepted" ? "teal" : "neutral"}`}><span /> {bid.status}</span></div>
                   <p className="live-offer__proposal">{bid.proposal}</p>
                   {!structured && <div className="offer-legacy-note"><CircleAlert size={16} /><span>Legacy offer · normalized commercial terms were not collected. Missing details are marked “Not provided.”</span></div>}
                   <div className="live-offer__scope-grid">

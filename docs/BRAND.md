@@ -8,7 +8,7 @@ Initial screening on 16 August 2026 found no obvious exact-name event or technol
 
 ## Positioning
 
-Melaiva turns one clear celebration brief into a small set of verified, comparable vendor offers, then helps the customer carry the chosen scope through booking and delivery.
+Melaiva turns one clear celebration brief into a small set of marketplace-reviewed, comparable vendor offers, then helps the customer carry the chosen scope through booking and delivery.
 
 Primary promise: **Your celebration, beautifully matched.**
 
@@ -26,7 +26,7 @@ Product line: **Plan once. Vendors compete. You celebrate.**
 
 - Aubergine `#3A193B`: trust, ceremony, primary surfaces.
 - Marigold `#F2A900`: optimism, important actions, highlights.
-- Peacock teal `#167D7F`: verified states, planning intelligence.
+- Peacock teal `#167D7F`: marketplace-reviewed states, planning intelligence.
 - Rose `#E86A76`: warmth and secondary emphasis.
 - Warm ivory `#FFF8EE`: the main canvas.
 - Ink `#221B20`: readable body text.
@@ -36,6 +36,7 @@ Fraunces is the editorial display face; Manrope is the product and body face. Ph
 ## Trust rules
 
 - Never publish invented customer, vendor, savings, or GMV figures.
+- Use “Marketplace reviewed” for the operating approval state. Never imply KYC, government identity verification, business-registration verification, or a performance guarantee.
 - Never imply that Melaiva independently provides regulated escrow.
 - Use “protected milestone payments” only after integrating an appropriate licensed provider and obtaining legal review.
 - Sponsored placement must be labelled and must not silently alter recommendation rankings.

@@ -5,6 +5,7 @@ import test from "node:test";
 import {
   MAINTENANCE_INTERVAL_MS,
   MelaivaStore,
+  STORE_SCHEMA_SQL,
   STORE_SCHEMA_V1_SQL,
   STORE_SCHEMA_V2_MIGRATION_SQL,
   STORE_SCHEMA_V3_MIGRATION_SQL,
@@ -15,6 +16,8 @@ import {
   STORE_SCHEMA_V7_MIGRATION_SQL,
   STORE_SCHEMA_V8_FINALIZE_SQL,
   STORE_SCHEMA_V8_MIGRATION_SQL,
+  STORE_SCHEMA_V9_FINALIZE_SQL,
+  STORE_SCHEMA_V9_MIGRATION_SQL,
   STORE_SCHEMA_VERSION,
   createDurableDatabase,
   executeSql,
@@ -43,28 +46,35 @@ test("Durable Object adapter reports logical changes rather than indexed billing
   assert.deepEqual(calls, ["UPDATE bids SET status = 'accepted' WHERE id = ?", "SELECT changes() AS changes"]);
 });
 
-test("Durable Object storage errors preserve only safe unique-constraint classification", async () => {
+test("Durable Object storage errors preserve only safe conflict classifications", async () => {
   const store = Object.create(MelaivaStore.prototype);
-  store.sql = {
-    exec() {
-      throw new Error("UNIQUE constraint failed: users.email");
-    },
-  };
-  const response = await store.fetch(new Request("https://melaiva-store.internal/sql", {
-    method: "POST",
-    body: JSON.stringify({ operation: "statement", statement: { mode: "run", sql: "INSERT", args: [] } }),
-  }));
-  const body = await response.json();
-
-  assert.equal(response.status, 409);
-  assert.deepEqual(body, { error: "storage_error", code: "unique_constraint" });
-  assert.doesNotMatch(JSON.stringify(body), /users\.email|UNIQUE constraint/i);
+  const classifications = [
+    ["UNIQUE constraint failed: users.email", "unique_constraint"],
+    ["vendor application evidence requires a pending or rejected vendor", "vendor_evidence_state_conflict"],
+    ["vendor evidence must be completed and acknowledged before approval", "vendor_evidence_approval_conflict"],
+    [
+      "vendor review reasons must not contain evidence addresses or identity references",
+      "vendor_review_sensitive_content",
+    ],
+  ];
+  let body;
+  for (const [message, code] of classifications) {
+    store.sql = { exec() { throw new Error(message); } };
+    const response = await store.fetch(new Request("https://melaiva-store.internal/sql", {
+      method: "POST",
+      body: JSON.stringify({ operation: "statement", statement: { mode: "run", sql: "INSERT", args: [] } }),
+    }));
+    body = await response.json();
+    assert.equal(response.status, 409);
+    assert.deepEqual(body, { error: "storage_error", code });
+    assert.doesNotMatch(JSON.stringify(body), /users\.email|UNIQUE constraint|pending or rejected|acknowledged|identity references/i);
+  }
 
   const database = createDurableDatabase({
     getByName() {
       return {
         async fetch() {
-          return new Response(JSON.stringify(body), {
+          return new Response(JSON.stringify({ error: "storage_error", code: "unique_constraint" }), {
             status: 409,
             headers: { "content-type": "application/json" },
           });
@@ -986,6 +996,486 @@ test("schema v8 preserves reviewed vendors, resumes safely, and makes audit fact
   sqlite.exec(STORE_SCHEMA_V8_FINALIZE_SQL);
   assert.equal(sqlite.prepare("SELECT review_revision FROM vendors WHERE id = 'review-vendor'").get().review_revision, 3);
   assert.equal(sqlite.prepare("SELECT COUNT(*) AS count FROM audit_events").get().count, 3);
+});
+
+test("schema v9 is additive, keeps evidence immutable, and blocks unacknowledged old-worker approvals", () => {
+  const sqlite = new DatabaseSync(":memory:");
+  sqlite.exec(`CREATE TABLE _sql_schema_migrations (
+    id INTEGER PRIMARY KEY,
+    applied_at TEXT NOT NULL DEFAULT (datetime('now'))
+  )`);
+  sqlite.exec(STORE_SCHEMA_V1_SQL);
+  sqlite.exec(STORE_SCHEMA_V2_MIGRATION_SQL);
+  sqlite.exec(STORE_SCHEMA_V3_MIGRATION_SQL);
+  sqlite.exec(STORE_SCHEMA_V4_MIGRATION_SQL);
+  sqlite.exec(STORE_SCHEMA_V5_MIGRATION_SQL);
+  sqlite.exec(STORE_SCHEMA_V6_MIGRATION_SQL);
+  sqlite.exec(STORE_SCHEMA_V7_MIGRATION_SQL);
+  sqlite.exec(STORE_SCHEMA_V8_MIGRATION_SQL);
+  sqlite.exec(`
+    INSERT INTO users
+      (id, name, email, password_hash, password_salt, password_iterations, role, status)
+    VALUES ('evidence-owner', 'Evidence Owner', 'evidence-owner@example.com', 'hash', 'salt', 100000, 'couple', 'active');
+    INSERT INTO vendors
+      (id, user_id, slug, business_name, legal_name, status, category, categories_json, city,
+       service_areas_json, description, min_budget, max_budget, currency)
+    VALUES
+      ('evidence-vendor', 'evidence-owner', 'evidence-vendor', 'Evidence Vendor', 'Evidence Vendor Private Limited',
+       'pending', 'photography', '["photography"]', 'Jaipur', '["Jaipur"]',
+       'A populated vendor retained while schema v9 adds immutable application evidence.', 100000, 500000, 'INR'),
+      ('legacy-audit-guard-vendor', NULL, 'legacy-audit-guard-vendor', 'Legacy Audit Guard Vendor', NULL,
+       'pending', 'photography', '["photography"]', 'Jaipur', '["Jaipur"]',
+       'A legacy vendor retained to test old-worker audit minimization at the database boundary.', 100000, 500000, 'INR');
+  `);
+
+  sqlite.exec(STORE_SCHEMA_V9_MIGRATION_SQL);
+
+  assert.equal(sqlite.prepare("SELECT MAX(id) AS version FROM _sql_schema_migrations").get().version, 9);
+  assert.deepEqual(
+    { ...sqlite.prepare(
+      "SELECT evidence_required, evidence_reviewed_revision FROM vendors WHERE id = 'evidence-vendor'",
+    ).get() },
+    { evidence_required: 0, evidence_reviewed_revision: 0 },
+  );
+  assert.equal(
+    sqlite.prepare("SELECT evidence_required FROM vendors WHERE id = 'legacy-audit-guard-vendor'").get().evidence_required,
+    0,
+  );
+  const insertLegacyReviewAudit = sqlite.prepare(
+    `INSERT INTO audit_events (action, entity_type, entity_id, metadata_json)
+     VALUES ('vendor.reviewed', 'vendor', 'legacy-audit-guard-vendor', ?)`,
+  );
+  for (const sensitiveReason of [
+    "Reviewed https://proof.example.com during approval.",
+    "Reviewed proof.example.com during approval.",
+    "Reviewed address 10.0.0.1 during approval.",
+    "Reviewed GSTIN 08ABCDE1234F1Z5 during approval.",
+    "Reviewed GSTIN 08 ABCDE 1234 F1Z5 during approval.",
+    "Reviewed CIN L12345RJ2020PLC123456 during approval.",
+    "Reviewed UDYAM-RJ-12-1234567 during approval.",
+    "Reviewed PAN A B C D E 1 2 3 4 F during approval.",
+    "Reviewed Aadhaar 1234 5678 9012 during approval.",
+    "Reviewed Aadhaar 1234  5678  9012 during approval.",
+    "Reviewed passport A 1 2 3 4 5 6 7 during approval.",
+  ]) {
+    assert.throws(
+      () => insertLegacyReviewAudit.run(JSON.stringify({ reason: sensitiveReason })),
+      /vendor review reasons must not contain evidence addresses or identity references/,
+    );
+  }
+  insertLegacyReviewAudit.run(JSON.stringify({
+    reviewId: "legacy-safe-summary",
+    from: "pending",
+    to: "rejected",
+    evidenceSummary: {
+      revision: 1,
+      portfolioUrlCount: 2,
+      referenceUrlCount: 1,
+      registrationType: "gstin",
+    },
+  }));
+  for (const benignReason of [
+    "Alpha 2026 approval completed after an ordinary service-quality review.",
+    "Phase A 1234567 was accepted after an ordinary service-quality review.",
+    "The 2026 plan and 2027 launch dates were reviewed successfully.",
+    "Evidence reviewed on 2026-08-17",
+  ]) {
+    insertLegacyReviewAudit.run(JSON.stringify({ reason: benignReason }));
+  }
+  assert.throws(
+    () => {
+      sqlite.exec("BEGIN IMMEDIATE");
+      try {
+        sqlite.prepare(
+          "UPDATE vendors SET status = 'approved', verified = 1 WHERE id = 'legacy-audit-guard-vendor'",
+        ).run();
+        insertLegacyReviewAudit.run(JSON.stringify({
+          from: "pending",
+          to: "approved",
+          note: "Old Worker reviewed proof.example.com and should roll back atomically.",
+        }));
+        sqlite.exec("COMMIT");
+      } catch (error) {
+        sqlite.exec("ROLLBACK");
+        throw error;
+      }
+    },
+    /vendor review reasons must not contain evidence addresses or identity references/,
+  );
+  assert.deepEqual(
+    { ...sqlite.prepare(
+      "SELECT status, verified, review_revision FROM vendors WHERE id = 'legacy-audit-guard-vendor'",
+    ).get() },
+    { status: "pending", verified: 0, review_revision: 0 },
+  );
+  assert.equal(
+    sqlite.prepare("SELECT COUNT(*) AS count FROM audit_events WHERE entity_id = 'legacy-audit-guard-vendor'").get().count,
+    5,
+  );
+  sqlite.prepare(
+    `INSERT INTO vendor_application_evidence
+      (vendor_id, portfolio_urls_json, reference_urls_json, registration_type, registration_reference, attested, attested_at)
+     VALUES ('evidence-vendor', '["https://portfolio.example.com/work"]',
+             '["https://reviews.example.com/vendor"]', 'gstin', '08ABCDE1234F1Z5', 1,
+             '2028-01-01T00:00:00.000Z')`,
+  ).run();
+  const insertEvidenceReviewAudit = sqlite.prepare(
+    `INSERT INTO audit_events (action, entity_type, entity_id, metadata_json)
+     VALUES ('vendor.reviewed', 'vendor', 'evidence-vendor', ?)`,
+  );
+  for (const obfuscatedStoredEvidence of [
+    "Reviewed portfolio . example . com during approval.",
+    "Reviewed GSTIN 08 ABCDE 1234 F1Z5 during approval.",
+  ]) {
+    assert.throws(
+      () => insertEvidenceReviewAudit.run(JSON.stringify({ reason: obfuscatedStoredEvidence })),
+      /vendor review reasons must not contain evidence addresses or identity references/,
+    );
+  }
+  sqlite.prepare(
+    `INSERT INTO vendors
+      (id, slug, business_name, status, category, categories_json, city, service_areas_json,
+       description, min_budget, max_budget, currency)
+     VALUES ('invalid-evidence-vendor', 'invalid-evidence-vendor', 'Invalid Evidence Vendor', 'pending',
+             'photography', '["photography"]', 'Jaipur', '["Jaipur"]',
+             'A schema-only vendor used to reject malformed evidence rows.', 100000, 500000, 'INR')`,
+  ).run();
+  assert.equal(
+    sqlite.prepare("SELECT evidence_required FROM vendors WHERE id = 'invalid-evidence-vendor'").get().evidence_required,
+    1,
+  );
+  assert.throws(
+    () => sqlite.prepare(
+      `INSERT INTO vendor_application_evidence
+        (vendor_id, portfolio_urls_json, reference_urls_json, registration_type, registration_reference, attested, attested_at)
+       VALUES ('invalid-evidence-vendor', '["https://portfolio.example.com/work"]',
+               '["https://reviews.example.com/vendor"]', 'gstin', NULL, 1,
+               '2028-01-01T00:00:00.000Z')`,
+    ).run(),
+    /CHECK constraint failed/,
+  );
+  assert.throws(
+    () => sqlite.prepare(
+      `INSERT INTO vendor_application_evidence
+        (vendor_id, portfolio_urls_json, reference_urls_json, registration_type, registration_reference, attested, attested_at)
+       VALUES ('invalid-evidence-vendor', '["https://portfolio.example.com/work"]',
+               '["https://reviews.example.com/vendor"]', 'udyam', 'UDYAM-RJ-1-1234567', 1,
+               '2028-01-01T00:00:00.000Z')`,
+    ).run(),
+    /CHECK constraint failed/,
+  );
+  assert.throws(
+    () => sqlite.prepare(
+      `INSERT INTO vendor_application_evidence
+        (vendor_id, portfolio_urls_json, reference_urls_json, registration_type, registration_reference, attested, attested_at)
+       VALUES ('invalid-evidence-vendor', '["https://same.example.com/work"]',
+               '["https://same.example.com/work"]', 'not_registered', NULL, 1,
+               '2028-01-01T00:00:00.000Z')`,
+    ).run(),
+    /normalized unique public HTTPS URLs/,
+  );
+  assert.throws(
+    () => sqlite.prepare(
+      `INSERT INTO vendor_application_evidence
+        (vendor_id, portfolio_urls_json, reference_urls_json, registration_type, registration_reference, attested, attested_at)
+       VALUES ('invalid-evidence-vendor', '["https://xn--fsqu00a.xn--55qx5d/work"]',
+               '["https://reviews.example.com/vendor"]', 'not_registered', NULL, 1,
+               '2028-01-01T00:00:00.000Z')`,
+    ).run(),
+    /normalized unique public HTTPS URLs/,
+  );
+  assert.throws(
+    () => sqlite.prepare(
+      `INSERT INTO vendor_application_evidence
+        (vendor_id, portfolio_urls_json, reference_urls_json, registration_type, registration_reference, attested, attested_at)
+       VALUES ('invalid-evidence-vendor', '["https://portfolio.example.com./work"]',
+               '["https://reviews.example.com/vendor"]', 'not_registered', NULL, 1,
+               '2028-01-01T00:00:00.000Z')`,
+    ).run(),
+    /normalized unique public HTTPS URLs/,
+  );
+  assert.throws(
+    () => sqlite.prepare(
+      "UPDATE vendors SET status = 'approved', verified = 1 WHERE id = 'invalid-evidence-vendor'",
+    ).run(),
+    /evidence must be completed and acknowledged/,
+  );
+  sqlite.prepare(
+    `INSERT INTO vendors
+      (id, slug, business_name, status, category, categories_json, city, service_areas_json,
+       description, min_budget, max_budget, currency, evidence_required)
+     VALUES ('legacy-approved-vendor', 'legacy-approved-vendor', 'Legacy Approved Vendor', 'pending',
+             'photography', '["photography"]', 'Jaipur', '["Jaipur"]',
+             'A genuine pre-evidence application used to enforce write-time completion state.',
+             100000, 500000, 'INR', 0)`,
+  ).run();
+  sqlite.prepare("UPDATE vendors SET status = 'approved', verified = 1 WHERE id = 'legacy-approved-vendor'").run();
+  assert.throws(
+    () => sqlite.prepare(
+      `INSERT INTO vendor_application_evidence
+        (vendor_id, portfolio_urls_json, reference_urls_json, registration_type, registration_reference, attested, attested_at)
+       VALUES ('legacy-approved-vendor', '["https://legacy-portfolio.example.com/work"]',
+               '["https://legacy-reviews.example.com/vendor"]', 'not_registered', NULL, 1,
+               '2028-01-01T00:00:00.000Z')`,
+    ).run(),
+    /evidence requires a pending or rejected vendor/,
+  );
+
+  assert.throws(
+    () => sqlite.prepare("UPDATE vendors SET status = 'approved', verified = 1 WHERE id = 'evidence-vendor'").run(),
+    /evidence must be completed and acknowledged/,
+  );
+  assert.deepEqual(
+    { ...sqlite.prepare("SELECT status, verified, review_revision FROM vendors WHERE id = 'evidence-vendor'").get() },
+    { status: "pending", verified: 0, review_revision: 0 },
+  );
+  sqlite.prepare("UPDATE vendors SET evidence_reviewed_revision = 2 WHERE id = 'evidence-vendor'").run();
+  assert.throws(
+    () => sqlite.prepare("UPDATE vendors SET status = 'approved', verified = 1 WHERE id = 'evidence-vendor'").run(),
+    /evidence must be completed and acknowledged/,
+  );
+  sqlite.prepare("UPDATE vendors SET evidence_reviewed_revision = 0 WHERE id = 'evidence-vendor'").run();
+  sqlite.prepare(
+    `UPDATE vendors
+     SET status = 'approved', verified = 1, evidence_reviewed_revision = 1
+     WHERE id = 'evidence-vendor'`,
+  ).run();
+  assert.deepEqual(
+    { ...sqlite.prepare(
+      "SELECT status, verified, review_revision, evidence_reviewed_revision FROM vendors WHERE id = 'evidence-vendor'",
+    ).get() },
+    { status: "approved", verified: 1, review_revision: 1, evidence_reviewed_revision: 1 },
+  );
+  assert.throws(
+    () => sqlite.prepare(
+      "UPDATE vendor_application_evidence SET registration_reference = '08ABCDE1234F1Z6' WHERE vendor_id = 'evidence-vendor'",
+    ).run(),
+    /evidence is immutable/,
+  );
+  assert.throws(
+    () => sqlite.prepare("DELETE FROM vendor_application_evidence WHERE vendor_id = 'evidence-vendor'").run(),
+    /evidence is immutable/,
+  );
+});
+
+test("schema v9 fresh install and interrupted-column restart converge without duplicate evidence structures", async () => {
+  assert.doesNotMatch(STORE_SCHEMA_V9_FINALIZE_SQL, /DROP\s+TRIGGER/iu);
+  const fresh = new DatabaseSync(":memory:");
+  fresh.exec(`CREATE TABLE _sql_schema_migrations (
+    id INTEGER PRIMARY KEY,
+    applied_at TEXT NOT NULL DEFAULT (datetime('now'))
+  )`);
+  fresh.exec(STORE_SCHEMA_SQL);
+  assert.equal(fresh.prepare("SELECT MAX(id) AS version FROM _sql_schema_migrations").get().version, 9);
+  assert.deepEqual(
+    fresh.prepare(
+      `SELECT name FROM sqlite_master
+       WHERE type = 'trigger' AND name LIKE '%evidence%'
+       ORDER BY name`,
+    ).all().map((row) => row.name),
+    [
+      "vendor_application_evidence_immutable_delete",
+      "vendor_application_evidence_immutable_update",
+      "vendor_application_evidence_validate_insert",
+      "vendor_application_evidence_vendor_state_insert",
+      "vendors_evidence_approval_guard",
+    ],
+  );
+
+  const sqlite = new DatabaseSync(":memory:");
+  sqlite.exec(`CREATE TABLE _sql_schema_migrations (
+    id INTEGER PRIMARY KEY,
+    applied_at TEXT NOT NULL DEFAULT (datetime('now'))
+  )`);
+  sqlite.exec(STORE_SCHEMA_V1_SQL);
+  sqlite.exec(STORE_SCHEMA_V2_MIGRATION_SQL);
+  sqlite.exec(STORE_SCHEMA_V3_MIGRATION_SQL);
+  sqlite.exec(STORE_SCHEMA_V4_MIGRATION_SQL);
+  sqlite.exec(STORE_SCHEMA_V5_MIGRATION_SQL);
+  sqlite.exec(STORE_SCHEMA_V6_MIGRATION_SQL);
+  sqlite.exec(STORE_SCHEMA_V7_MIGRATION_SQL);
+  sqlite.exec(STORE_SCHEMA_V8_MIGRATION_SQL);
+  sqlite.exec(
+    `ALTER TABLE vendors ADD COLUMN evidence_reviewed_revision INTEGER NOT NULL DEFAULT 0
+       CHECK (typeof(evidence_reviewed_revision) = 'integer' AND evidence_reviewed_revision >= 0)`,
+  );
+  const sql = {
+    exec(statement, ...args) {
+      const normalized = statement.trim().toUpperCase();
+      if (args.length > 0 || normalized.startsWith("SELECT") || normalized.startsWith("PRAGMA")) {
+        const rows = sqlite.prepare(statement).all(...args);
+        return { toArray: () => rows };
+      }
+      sqlite.exec(statement);
+      return { toArray: () => [] };
+    },
+  };
+  let initialized;
+  const ctx = {
+    storage: {
+      sql,
+      transactionSync(callback) {
+        sqlite.exec("BEGIN IMMEDIATE");
+        try {
+          const result = callback();
+          sqlite.exec("COMMIT");
+          return result;
+        } catch (error) {
+          sqlite.exec("ROLLBACK");
+          throw error;
+        }
+      },
+      async getAlarm() { return 1; },
+      async setAlarm() {},
+    },
+    blockConcurrencyWhile(callback) {
+      initialized = callback();
+    },
+  };
+
+  new MelaivaStore(ctx, { ENVIRONMENT: "production" });
+  await initialized;
+  sqlite.prepare(
+    `INSERT INTO vendors
+      (id, slug, business_name, status, category, categories_json, city, service_areas_json,
+       description, min_budget, max_budget, currency)
+     VALUES ('post-v9-restart-vendor', 'post-v9-restart-vendor', 'Post V9 Restart Vendor', 'pending',
+             'photography', '["photography"]', 'Jaipur', '["Jaipur"]',
+             'A post-migration old-writer row that must retain required evidence across cold starts.',
+             100000, 500000, 'INR')`,
+  ).run();
+  new MelaivaStore(ctx, { ENVIRONMENT: "production" });
+  await initialized;
+
+  assert.equal(sqlite.prepare("SELECT MAX(id) AS version FROM _sql_schema_migrations").get().version, STORE_SCHEMA_VERSION);
+  assert.equal(
+    sqlite.prepare("SELECT COUNT(*) AS count FROM pragma_table_info('vendors') WHERE name = 'evidence_reviewed_revision'").get().count,
+    1,
+  );
+  assert.equal(
+    sqlite.prepare("SELECT COUNT(*) AS count FROM pragma_table_info('vendors') WHERE name = 'evidence_required'").get().count,
+    1,
+  );
+  assert.equal(
+    sqlite.prepare("SELECT evidence_required FROM vendors WHERE id = 'post-v9-restart-vendor'").get().evidence_required,
+    1,
+  );
+  assert.equal(
+    sqlite.prepare("SELECT COUNT(*) AS count FROM sqlite_master WHERE type = 'table' AND name = 'vendor_application_evidence'").get().count,
+    1,
+  );
+});
+
+test("schema v9 finalize failures roll back atomically and never remove old-writer approval guards", async () => {
+  const sqlite = new DatabaseSync(":memory:");
+  sqlite.exec(`CREATE TABLE _sql_schema_migrations (
+    id INTEGER PRIMARY KEY,
+    applied_at TEXT NOT NULL DEFAULT (datetime('now'))
+  )`);
+  sqlite.exec(STORE_SCHEMA_V1_SQL);
+  sqlite.exec(STORE_SCHEMA_V2_MIGRATION_SQL);
+  sqlite.exec(STORE_SCHEMA_V3_MIGRATION_SQL);
+  sqlite.exec(STORE_SCHEMA_V4_MIGRATION_SQL);
+  sqlite.exec(STORE_SCHEMA_V5_MIGRATION_SQL);
+  sqlite.exec(STORE_SCHEMA_V6_MIGRATION_SQL);
+  sqlite.exec(STORE_SCHEMA_V7_MIGRATION_SQL);
+  sqlite.exec(STORE_SCHEMA_V8_MIGRATION_SQL);
+  sqlite.prepare(
+    `INSERT INTO vendors
+      (id, slug, business_name, status, category, categories_json, city, service_areas_json,
+       description, min_budget, max_budget, currency)
+     VALUES ('pre-v9-atomic-vendor', 'pre-v9-atomic-vendor', 'Pre V9 Atomic Vendor', 'pending',
+             'photography', '["photography"]', 'Jaipur', '["Jaipur"]',
+             'A pre-migration application retained through an injected schema-finalize failure.',
+             100000, 500000, 'INR')`,
+  ).run();
+
+  let failFinalize = true;
+  const sql = {
+    exec(statement, ...args) {
+      const normalized = statement.trim().toUpperCase();
+      if (failFinalize && statement.includes("CREATE TABLE IF NOT EXISTS vendor_application_evidence")) {
+        const failurePoint = statement.indexOf(
+          "CREATE TRIGGER IF NOT EXISTS vendor_application_evidence_immutable_update",
+        );
+        assert.ok(failurePoint > 0);
+        sqlite.exec(statement.slice(0, failurePoint));
+        throw new Error("injected v9 finalize failure");
+      }
+      if (args.length > 0 || normalized.startsWith("SELECT") || normalized.startsWith("PRAGMA")) {
+        const rows = sqlite.prepare(statement).all(...args);
+        return { toArray: () => rows };
+      }
+      sqlite.exec(statement);
+      return { toArray: () => [] };
+    },
+  };
+  let initialized;
+  const ctx = {
+    storage: {
+      sql,
+      transactionSync(callback) {
+        sqlite.exec("BEGIN IMMEDIATE");
+        try {
+          const result = callback();
+          sqlite.exec("COMMIT");
+          return result;
+        } catch (error) {
+          sqlite.exec("ROLLBACK");
+          throw error;
+        }
+      },
+      async getAlarm() { return 1; },
+      async setAlarm() {},
+    },
+    blockConcurrencyWhile(callback) {
+      initialized = callback();
+    },
+  };
+
+  new MelaivaStore(ctx, { ENVIRONMENT: "production" });
+  await assert.rejects(initialized, /injected v9 finalize failure/);
+  assert.equal(sqlite.prepare("SELECT MAX(id) AS version FROM _sql_schema_migrations").get().version, 8);
+  assert.equal(
+    sqlite.prepare("SELECT COUNT(*) AS count FROM pragma_table_info('vendors') WHERE name LIKE 'evidence_%'").get().count,
+    0,
+  );
+  assert.equal(
+    sqlite.prepare("SELECT COUNT(*) AS count FROM sqlite_master WHERE name LIKE '%evidence%'").get().count,
+    0,
+  );
+
+  failFinalize = false;
+  new MelaivaStore(ctx, { ENVIRONMENT: "production" });
+  await initialized;
+  assert.equal(sqlite.prepare("SELECT MAX(id) AS version FROM _sql_schema_migrations").get().version, 9);
+  assert.equal(
+    sqlite.prepare("SELECT evidence_required FROM vendors WHERE id = 'pre-v9-atomic-vendor'").get().evidence_required,
+    0,
+  );
+  sqlite.prepare(
+    `INSERT INTO vendors
+      (id, slug, business_name, status, category, categories_json, city, service_areas_json,
+       description, min_budget, max_budget, currency)
+     VALUES ('post-v9-old-writer', 'post-v9-old-writer', 'Post V9 Old Writer', 'pending',
+             'photography', '["photography"]', 'Jaipur', '["Jaipur"]',
+             'A post-migration row written without evidence fields by a rolled-back Worker.',
+             100000, 500000, 'INR')`,
+  ).run();
+  assert.equal(
+    sqlite.prepare("SELECT evidence_required FROM vendors WHERE id = 'post-v9-old-writer'").get().evidence_required,
+    1,
+  );
+
+  failFinalize = true;
+  new MelaivaStore(ctx, { ENVIRONMENT: "production" });
+  await assert.rejects(initialized, /injected v9 finalize failure/);
+  assert.equal(sqlite.prepare("SELECT MAX(id) AS version FROM _sql_schema_migrations").get().version, 9);
+  assert.throws(
+    () => sqlite.prepare("UPDATE vendors SET status = 'approved', verified = 1 WHERE id = 'post-v9-old-writer'").run(),
+    /evidence must be completed and acknowledged/,
+  );
+  assert.equal(sqlite.prepare("SELECT status FROM vendors WHERE id = 'post-v9-old-writer'").get().status, "pending");
 });
 
 test("schema v8 initialization resumes when the review revision column already exists", async () => {

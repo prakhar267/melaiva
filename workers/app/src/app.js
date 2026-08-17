@@ -454,6 +454,7 @@ const ADMIN_VENDOR_SUMMARY_HEADER = "X-Melaiva-Admin-Vendor-Summary";
 const VENDOR_EVIDENCE_REQUIRED_TRIGGERS = Object.freeze([
   "vendor_application_evidence_validate_insert",
   "vendor_application_evidence_vendor_state_insert_v10",
+  "vendor_application_evidence_active_owner_insert_v10",
   "vendor_application_evidence_active_request_insert_v10",
   "vendor_application_evidence_immutable_update",
   "vendor_application_evidence_immutable_delete",
@@ -581,6 +582,7 @@ const vendorOnboardingSchema = z
 const vendorEvidenceCompletionSchema = z
   .object({
     evidence: vendorEvidenceSchema,
+    expectedVendorId: z.string().trim().min(1).max(128),
     expectedStatus: adminVendorStatusSchema,
     expectedRevision: z.number().int().min(0).max(1_000_000_000),
     expectedEvidenceRevision: z.number().int().min(0).max(VENDOR_EVIDENCE_MAX_REVISION),
@@ -943,7 +945,7 @@ function isVendorEvidenceStateConflict(error) {
 
 function isVendorEvidenceRevisionConflict(error) {
   return error?.code === "vendor_evidence_revision_conflict"
-    || /vendor evidence revision requires the active owner and an information request|legacy vendor evidence cannot resolve an active information request/i
+    || /vendor evidence revision requires the active owner and an information request|legacy vendor evidence cannot resolve an active information request|vendor application evidence requires the active owner/i
       .test(String(error?.message || error));
 }
 
@@ -2179,7 +2181,7 @@ function buildApp() {
         iterations: CLIENT_PASSWORD_ITERATIONS,
         outputBits: 256,
         encoding: "base64url-no-padding",
-        vendorApplicationEvidenceRevision: 2,
+        vendorApplicationEvidenceRevision: 3,
       },
     }),
   );
@@ -3636,6 +3638,7 @@ function buildApp() {
     const scope = "vendor-onboarding-evidence";
     const normalizedRequest = {
       evidence: normalizedEvidence,
+      expectedVendorId: input.expectedVendorId,
       expectedStatus: input.expectedStatus,
       expectedRevision: input.expectedRevision,
       expectedEvidenceRevision: input.expectedEvidenceRevision,
@@ -3663,6 +3666,9 @@ function buildApp() {
       .bind(user.id)
       .first();
     if (!vendor) throw new ApiError(404, "vendor_not_found", "Create a vendor application before submitting evidence");
+    if (input.expectedVendorId !== vendor.id) {
+      throw new ApiError(409, "vendor_evidence_conflict", "This application changed; refresh before submitting evidence");
+    }
     const currentRevision = Math.max(0, Number(vendor.review_revision) || 0);
     const currentEvidenceRevision = Math.max(0, Number(vendor.evidence_latest_revision) || 0);
     const currentInformationRequestRevision = Math.max(0, Number(vendor.information_request_revision) || 0);
@@ -3933,6 +3939,9 @@ function buildApp() {
     try {
       await db.batch(statements);
     } catch (error) {
+      if (isVendorEvidenceRevisionConflict(error)) {
+        throw new ApiError(409, "vendor_evidence_conflict", "This account or application changed; sign in and try again");
+      }
       if (isUniqueConstraint(error)) {
         const concurrentReplay = await findIdempotentResult(db, scope, requestKey, user.id, requestHash);
         if (concurrentReplay) {

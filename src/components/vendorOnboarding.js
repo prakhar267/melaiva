@@ -234,6 +234,7 @@ export function buildVendorEvidenceSubmissionPayload(evidence, context) {
   }
   return {
     evidence: buildVendorEvidence(evidence),
+    expectedVendorId: context.vendorId,
     expectedStatus: context.effectiveStatus,
     expectedRevision: context.reviewRevision,
     expectedEvidenceRevision: Number.isInteger(context.evidenceRevision) ? context.evidenceRevision : 0,
@@ -241,8 +242,8 @@ export function buildVendorEvidenceSubmissionPayload(evidence, context) {
   };
 }
 
-export function shouldPreflightVendorEvidenceSubmission({ evidenceOnly, submissionUnconfirmed }) {
-  return Boolean(evidenceOnly && !submissionUnconfirmed);
+export function shouldPreflightVendorEvidenceSubmission({ evidenceOnly }) {
+  return Boolean(evidenceOnly);
 }
 
 export function vendorEvidenceContextsMatch(expected, current) {
@@ -253,6 +254,35 @@ export function vendorEvidenceContextsMatch(expected, current) {
     && expected.evidenceRevision === current.evidenceRevision
     && expected.informationRequestRevision === current.informationRequestRevision
     && (expected.currentInformationRequest?.revision || 0) === (current.currentInformationRequest?.revision || 0);
+}
+
+export function vendorEvidencePreflightMatches({
+  expectedContext,
+  accessResult,
+  submissionUnconfirmed = false,
+} = {}) {
+  const sameVendor = Boolean(
+    expectedContext?.vendorId
+    && accessResult?.context?.vendorId === expectedContext.vendorId,
+  );
+  if (!sameVendor) return false;
+  if (submissionUnconfirmed) return true;
+  return ["eligible", "revision"].includes(accessResult.state)
+    && vendorEvidenceContextsMatch(expectedContext, accessResult.context);
+}
+
+export function shouldClearVendorEvidencePrivateDraft({
+  evidenceOnly = false,
+  wasEvidenceOnly = false,
+  identityChanged = false,
+  accessResolved = false,
+  incomingContext,
+} = {}) {
+  return Boolean(
+    (wasEvidenceOnly && !evidenceOnly)
+    || (identityChanged && (evidenceOnly || wasEvidenceOnly))
+    || (evidenceOnly && accessResolved && !incomingContext),
+  );
 }
 
 export function vendorEvidenceContextRefreshDecision({

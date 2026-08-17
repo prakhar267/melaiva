@@ -53,6 +53,7 @@ test("Durable Object storage errors preserve only safe conflict classifications"
   const classifications = [
     ["UNIQUE constraint failed: users.email", "unique_constraint"],
     ["vendor application evidence requires a pending or rejected vendor", "vendor_evidence_state_conflict"],
+    ["vendor application evidence requires the active owner", "vendor_evidence_revision_conflict"],
     [
       "legacy vendor evidence cannot resolve an active information request",
       "vendor_evidence_revision_conflict",
@@ -1280,6 +1281,7 @@ test("schema v10 fresh install and interrupted v9-column restart converge withou
        ORDER BY name`,
     ).all().map((row) => row.name),
     [
+      "vendor_application_evidence_active_owner_insert_v10",
       "vendor_application_evidence_active_request_insert_v10",
       "vendor_application_evidence_immutable_delete",
       "vendor_application_evidence_immutable_update",

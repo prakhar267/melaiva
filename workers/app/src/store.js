@@ -1154,6 +1154,7 @@ DROP TRIGGER IF EXISTS vendor_application_evidence_vendor_state_insert;
 DROP TRIGGER IF EXISTS vendors_evidence_approval_guard;
 DROP TRIGGER IF EXISTS audit_events_vendor_review_sensitive_insert;
 DROP TRIGGER IF EXISTS vendor_application_evidence_vendor_state_insert_v10;
+DROP TRIGGER IF EXISTS vendor_application_evidence_active_owner_insert_v10;
 DROP TRIGGER IF EXISTS vendor_application_evidence_active_request_insert_v10;
 DROP TRIGGER IF EXISTS vendor_application_evidence_mirror_insert_v10;
 DROP TRIGGER IF EXISTS vendor_application_evidence_revisions_compatibility_insert_v10;
@@ -1182,6 +1183,17 @@ WHEN NOT EXISTS (
 )
 BEGIN
   SELECT RAISE(ABORT, 'vendor application evidence requires a pending or rejected vendor');
+END;
+
+CREATE TRIGGER vendor_application_evidence_active_owner_insert_v10
+BEFORE INSERT ON vendor_application_evidence
+WHEN NOT EXISTS (
+  SELECT 1 FROM vendors vendor
+  JOIN users owner ON owner.id = vendor.user_id
+  WHERE vendor.id = NEW.vendor_id AND owner.status = 'active'
+)
+BEGIN
+  SELECT RAISE(ABORT, 'vendor application evidence requires the active owner');
 END;
 
 CREATE TRIGGER vendor_application_evidence_active_request_insert_v10
@@ -1759,6 +1771,7 @@ const VENDOR_EVIDENCE_TRIGGER_NAMES = Object.freeze([
 const VENDOR_EVIDENCE_V10_TRIGGER_NAMES = Object.freeze([
   "vendor_application_evidence_validate_insert",
   "vendor_application_evidence_vendor_state_insert_v10",
+  "vendor_application_evidence_active_owner_insert_v10",
   "vendor_application_evidence_active_request_insert_v10",
   "vendor_application_evidence_immutable_update",
   "vendor_application_evidence_immutable_delete",
@@ -2115,7 +2128,7 @@ export class MelaivaStore {
         ? "unique_constraint"
         : /vendor application evidence requires a pending or rejected vendor/i.test(message)
           ? "vendor_evidence_state_conflict"
-          : /vendor evidence revision requires the active owner and an information request|legacy vendor evidence cannot resolve an active information request/i.test(message)
+          : /vendor evidence revision requires the active owner and an information request|legacy vendor evidence cannot resolve an active information request|vendor application evidence requires the active owner/i.test(message)
             ? "vendor_evidence_revision_conflict"
             : /vendor information requests contain invalid or sensitive content/i.test(message)
               ? "vendor_information_request_conflict"

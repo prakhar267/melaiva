@@ -4,9 +4,18 @@ import { DatabaseSync } from "node:sqlite";
 import test from "node:test";
 
 import { buildApp } from "../src/app.js";
-import { STORE_SCHEMA_SQL } from "../src/store.js";
+import {
+  STORE_SCHEMA_SQL,
+  STORE_SCHEMA_V1_SQL,
+  STORE_SCHEMA_V2_MIGRATION_SQL,
+  STORE_SCHEMA_V3_MIGRATION_SQL,
+  STORE_SCHEMA_V4_MIGRATION_SQL,
+  STORE_SCHEMA_V5_MIGRATION_SQL,
+  STORE_SCHEMA_V6_MIGRATION_SQL,
+} from "../src/store.js";
 
 const SESSION_SECRET = "booking-message-test-secret-with-at-least-thirty-two-characters";
+const STORE_SCHEMA_V5_SQL = `${STORE_SCHEMA_V1_SQL}\n${STORE_SCHEMA_V2_MIGRATION_SQL}\n${STORE_SCHEMA_V3_MIGRATION_SQL}\n${STORE_SCHEMA_V4_MIGRATION_SQL}\n${STORE_SCHEMA_V5_MIGRATION_SQL}`;
 
 class SqliteStatement {
   constructor(database, sql, args = []) {
@@ -38,14 +47,14 @@ class SqliteStatement {
 }
 
 class SqliteD1 {
-  constructor() {
+  constructor(schemaSql = STORE_SCHEMA_SQL) {
     this.sqlite = new DatabaseSync(":memory:");
     this.beforeBatch = null;
     this.sqlite.exec(`CREATE TABLE IF NOT EXISTS _sql_schema_migrations (
       id INTEGER PRIMARY KEY,
       applied_at TEXT NOT NULL DEFAULT (datetime('now'))
     )`);
-    this.sqlite.exec(STORE_SCHEMA_SQL);
+    this.sqlite.exec(schemaSql);
   }
 
   prepare(sql) {
@@ -151,8 +160,8 @@ function seedBooking(db, { suffix, auctionId, ownerId, vendorUserId, vendorStatu
   return { auctionId, bidId, bookingId, vendorId };
 }
 
-async function createFixture() {
-  const db = new SqliteD1();
+async function createFixture({ schemaSql = STORE_SCHEMA_SQL } = {}) {
+  const db = new SqliteD1(schemaSql);
   const env = {
     DB: db,
     SESSION_SECRET,
@@ -213,6 +222,20 @@ function postMessage(fixture, actor, bookingId, key, body) {
   });
 }
 
+function insertStoredMessage(db, { id, bookingId, senderUserId, body, createdAt }) {
+  return db.sqlite
+    .prepare(
+      `INSERT INTO booking_messages
+       (id, booking_id, sender_user_id, body, created_at, stream_position)
+       VALUES (?, ?, ?, ?, ?,
+               COALESCE(
+                 (SELECT MAX(stream_position) + 1 FROM booking_messages WHERE booking_id = ?),
+                 1
+               ))`,
+    )
+    .run(id, bookingId, senderUserId, body, createdAt, bookingId);
+}
+
 async function responseErrorCode(response) {
   return (await response.json()).error.code;
 }
@@ -243,19 +266,35 @@ test("booking conversations authorize only the owner, winning vendor, and read-o
     body: "Can we confirm the first coordination call?",
   });
   assert.equal(ownerSend.status, 201, await ownerSend.clone().text());
-  const ownerMessage = (await ownerSend.json()).data;
+  const ownerPayload = await ownerSend.json();
+  const ownerMessage = ownerPayload.data;
   assert.equal(ownerMessage.senderRole, "couple");
   assert.equal(ownerMessage.senderLabel, "Celebration host");
   assert.equal(ownerMessage.mine, true);
+  assert.equal(ownerMessage.sequence, 1);
+  assert.equal(ownerPayload.meta.messageCount, 1);
 
   const vendorSend = await postMessage(fixture, approvedVendor, approved.bookingId, "vendor-message-0001", {
     body: "Yes, Tuesday afternoon works for our team.",
   });
   assert.equal(vendorSend.status, 201, await vendorSend.clone().text());
-  const vendorMessage = (await vendorSend.json()).data;
+  const vendorPayload = await vendorSend.json();
+  const vendorMessage = vendorPayload.data;
   assert.equal(vendorMessage.senderRole, "vendor");
   assert.equal(vendorMessage.senderLabel, "Studio Approved");
   assert.equal(vendorMessage.mine, true);
+  assert.equal(vendorMessage.sequence, 2);
+  assert.equal(vendorPayload.meta.messageCount, 2);
+
+  const ownerReplay = await postMessage(fixture, owner, approved.bookingId, "owner-message-0001", {
+    body: "Can we confirm the first coordination call?",
+  });
+  assert.equal(ownerReplay.status, 201, await ownerReplay.clone().text());
+  const ownerReplayPayload = await ownerReplay.json();
+  assert.equal(ownerReplayPayload.meta.replayed, true);
+  assert.equal(ownerReplayPayload.meta.messageCount, 2);
+  assert.equal(ownerReplayPayload.data.id, ownerMessage.id);
+  assert.equal(ownerReplayPayload.data.sequence, 1);
 
   const vendorView = await requestJson(app, env, `/bookings/${approved.bookingId}/messages`, { cookie: approvedVendor.cookie });
   const vendorViewData = (await vendorView.json()).data;
@@ -277,13 +316,13 @@ test("booking conversations authorize only the owner, winning vendor, and read-o
   assert.equal(await responseErrorCode(outsiderWrite), "conversation_not_found");
   assert.equal(db.sqlite.prepare("SELECT COUNT(*) AS count FROM booking_messages WHERE booking_id = ?").get(approved.bookingId).count, 2);
 
-  db.sqlite
-    .prepare(
-      `INSERT INTO booking_messages (id, booking_id, sender_user_id, body, created_at)
-       VALUES ('message-before-suspension', ?, ?, 'A retained message from before partner suspension.',
-               '2027-10-03T09:00:00.000Z')`,
-    )
-    .run(paused.bookingId, owner.user.id);
+  insertStoredMessage(db, {
+    id: "message-before-suspension",
+    bookingId: paused.bookingId,
+    senderUserId: owner.user.id,
+    body: "A retained message from before partner suspension.",
+    createdAt: "2027-10-03T09:00:00.000Z",
+  });
   const pausedVendorRead = await requestJson(app, env, `/bookings/${paused.bookingId}/messages`, { cookie: pausedVendor.cookie });
   assert.equal(pausedVendorRead.status, 200, await pausedVendorRead.clone().text());
   const pausedVendorPayload = await pausedVendorRead.json();
@@ -340,14 +379,18 @@ test("message writes validate input, replay atomically, isolate scopes, and enfo
   assert.equal(original.status, 201, await original.clone().text());
   const originalData = (await original.json()).data;
   assert.equal(originalData.body, "Please share the final arrival window.");
+  assert.equal(originalData.sequence, 1);
   const replay = await postMessage(fixture, owner, approved.bookingId, replayKey, {
     body: "Please share the final arrival window.",
   });
   assert.equal(replay.status, 201, await replay.clone().text());
   const replayPayload = await replay.json();
   assert.equal(replayPayload.meta.replayed, true);
+  assert.equal(replayPayload.meta.messageCount, 1);
   assert.equal(replayPayload.data.id, originalData.id);
+  assert.equal(replayPayload.data.sequence, originalData.sequence);
   assert.equal(db.sqlite.prepare("SELECT COUNT(*) AS count FROM booking_messages WHERE id = ?").get(originalData.id).count, 1);
+  assert.equal(db.sqlite.prepare("SELECT stream_position FROM booking_messages WHERE id = ?").get(originalData.id).stream_position, 1);
   assert.equal(
     db.sqlite.prepare("SELECT COUNT(*) AS count FROM audit_events WHERE action = 'booking.message_sent' AND entity_id = ?").get(originalData.id).count,
     1,
@@ -409,6 +452,13 @@ test("message writes validate input, replay atomically, isolate scopes, and enfo
     body: "This write should roll back with its audit failure.",
   });
   assert.equal(successfulRetry.status, 201, await successfulRetry.clone().text());
+  assert.deepEqual(
+    db.sqlite
+      .prepare("SELECT stream_position FROM booking_messages WHERE booking_id = ? ORDER BY stream_position")
+      .all(approved.bookingId)
+      .map((row) => row.stream_position),
+    [1, 2, 3, 4],
+  );
 
   const nowSeconds = Math.floor(Date.now() / 1_000);
   const bucket = Math.floor(nowSeconds / 3_600) * 3_600;
@@ -468,13 +518,16 @@ test("message paging is deterministic and rejects cursors from other booking thr
     ["message-04", approvedVendor.user.id, "Fourth coordination note", "2027-10-03T10:02:00.000Z"],
     ["message-05", owner.user.id, "Fifth coordination note", "2027-10-03T10:03:00.000Z"],
   ];
-  const insert = db.sqlite.prepare(
-    "INSERT INTO booking_messages (id, booking_id, sender_user_id, body, created_at) VALUES (?, ?, ?, ?, ?)",
-  );
   for (const [id, senderId, body, createdAt] of messages) {
-    insert.run(id, approved.bookingId, senderId, body, createdAt);
+    insertStoredMessage(db, { id, bookingId: approved.bookingId, senderUserId: senderId, body, createdAt });
   }
-  insert.run("paused-cursor", paused.bookingId, owner.user.id, "A cursor in another private thread", "2027-10-03T11:00:00.000Z");
+  insertStoredMessage(db, {
+    id: "paused-cursor",
+    bookingId: paused.bookingId,
+    senderUserId: owner.user.id,
+    body: "A cursor in another private thread",
+    createdAt: "2027-10-03T11:00:00.000Z",
+  });
 
   const first = await requestJson(app, env, `/bookings/${approved.bookingId}/messages?limit=2`, { cookie: owner.cookie });
   assert.equal(first.status, 200, await first.clone().text());
@@ -483,6 +536,8 @@ test("message paging is deterministic and rejects cursors from other booking thr
   assert.deepEqual(firstPayload.data.map((message) => message.mine), [false, true]);
   assert.equal(firstPayload.meta.hasMore, true);
   assert.equal(firstPayload.meta.nextCursor, "message-04");
+  assert.equal(firstPayload.meta.pollCursor, "message-05");
+  assert.equal(firstPayload.meta.messageCount, 5);
 
   const second = await requestJson(
     app,
@@ -528,6 +583,15 @@ test("message paging is deterministic and rejects cursors from other booking thr
     assert.equal(await responseErrorCode(isolated), "invalid_cursor");
   }
 
+  const mixedDirections = await requestJson(
+    app,
+    env,
+    `/bookings/${approved.bookingId}/messages?cursor=message-04&after=message-04`,
+    { cookie: owner.cookie },
+  );
+  assert.equal(mixedDirections.status, 422, await mixedDirections.clone().text());
+  assert.equal(await responseErrorCode(mixedDirections), "invalid_pagination");
+
   const bookings = await requestJson(app, env, "/bookings", { cookie: owner.cookie });
   const bookingData = (await bookings.json()).data;
   assert.equal(bookingData.find((booking) => booking.id === approved.bookingId).messageCount, 5);
@@ -535,4 +599,254 @@ test("message paging is deterministic and rejects cursors from other booking thr
   const award = await requestJson(app, env, `/auctions/${approved.auctionId}/award`, { cookie: owner.cookie });
   assert.equal(award.status, 200, await award.clone().text());
   assert.equal((await award.json()).data.messageCount, 5);
+});
+
+test("forward message polling is gap-free across tied and backdated timestamps and refreshes permissions", async () => {
+  const fixture = await createFixture();
+  const { app, env, db, owner, outsider, approved, paused } = fixture;
+
+  const empty = await requestJson(app, env, `/bookings/${approved.bookingId}/messages?limit=2`, { cookie: owner.cookie });
+  assert.equal(empty.status, 200, await empty.clone().text());
+  assert.deepEqual((await empty.clone().json()).data, []);
+  const emptyMeta = (await empty.json()).meta;
+  assert.equal(emptyMeta.pollCursor, "0");
+  assert.equal(emptyMeta.messageCount, 0);
+
+  const inserted = [
+    ["poll-z", "Cursor anchor", "2027-10-03T10:00:00.000Z"],
+    ["poll-a", "Later insert with the same timestamp and a lower identifier", "2027-10-03T10:00:00.000Z"],
+    ["poll-backdated", "Later insert carrying an earlier display timestamp", "2027-09-01T10:00:00.000Z"],
+    ["poll-03", "Third message in the forward burst", "2027-10-03T10:01:00.000Z"],
+    ["poll-04", "Fourth message in the forward burst", "2027-10-03T10:02:00.000Z"],
+    ["poll-05", "Fifth message in the forward burst", "2027-10-03T10:03:00.000Z"],
+  ];
+  insertStoredMessage(db, {
+    id: inserted[0][0],
+    bookingId: approved.bookingId,
+    senderUserId: owner.user.id,
+    body: inserted[0][1],
+    createdAt: inserted[0][2],
+  });
+
+  const fromStart = await requestJson(app, env, `/bookings/${approved.bookingId}/messages?after=0&limit=2`, {
+    cookie: owner.cookie,
+  });
+  assert.equal(fromStart.status, 200, await fromStart.clone().text());
+  const fromStartPayload = await fromStart.json();
+  assert.deepEqual(fromStartPayload.data.map((message) => message.id), ["poll-z"]);
+  assert.equal(fromStartPayload.meta.pollCursor, "poll-z");
+  assert.equal(fromStartPayload.meta.messageCount, 1);
+
+  for (const [id, body, createdAt] of inserted.slice(1)) {
+    insertStoredMessage(db, {
+      id,
+      bookingId: approved.bookingId,
+      senderUserId: owner.user.id,
+      body,
+      createdAt,
+    });
+  }
+
+  let pollCursor = fromStartPayload.meta.pollCursor;
+  const received = [];
+  const pageSizes = [];
+  do {
+    const response = await requestJson(
+      app,
+      env,
+      `/bookings/${approved.bookingId}/messages?after=${pollCursor}&limit=2`,
+      { cookie: owner.cookie },
+    );
+    assert.equal(response.status, 200, await response.clone().text());
+    const payload = await response.json();
+    received.push(...payload.data.map((message) => message.id));
+    pageSizes.push(payload.data.length);
+    assert.equal(payload.meta.messageCount, inserted.length);
+    assert.equal(payload.meta.nextCursor, null);
+    assert.deepEqual(
+      payload.data.map((message) => message.sequence),
+      payload.data.map((_, index) => received.length - payload.data.length + index + 2),
+    );
+    pollCursor = payload.meta.pollCursor;
+    if (!payload.meta.hasMore) break;
+  } while (pageSizes.length < 10);
+
+  assert.deepEqual(received, inserted.slice(1).map(([id]) => id));
+  assert.deepEqual(pageSizes, [2, 2, 1]);
+  assert.equal(pollCursor, "poll-05");
+
+  for (const [bookingId, after] of [
+    [approved.bookingId, "missing-forward-cursor"],
+    [paused.bookingId, "poll-z"],
+    [approved.bookingId, "not/a/safe/cursor"],
+  ]) {
+    const isolated = await requestJson(app, env, `/bookings/${bookingId}/messages?after=${encodeURIComponent(after)}`, {
+      cookie: owner.cookie,
+    });
+    assert.equal(isolated.status, 422, await isolated.clone().text());
+    assert.equal(await responseErrorCode(isolated), "invalid_cursor");
+  }
+  const outsiderPoll = await requestJson(app, env, `/bookings/${approved.bookingId}/messages?after=${pollCursor}`, {
+    cookie: outsider.cookie,
+  });
+  assert.equal(outsiderPoll.status, 404);
+  assert.equal(await responseErrorCode(outsiderPoll), "conversation_not_found");
+
+  db.sqlite.prepare("UPDATE vendors SET status = 'suspended' WHERE id = ?").run(approved.vendorId);
+  const pausedPoll = await requestJson(app, env, `/bookings/${approved.bookingId}/messages?after=${pollCursor}`, {
+    cookie: owner.cookie,
+  });
+  assert.equal(pausedPoll.status, 200, await pausedPoll.clone().text());
+  const pausedPayload = await pausedPoll.json();
+  assert.deepEqual(pausedPayload.data, []);
+  assert.equal(pausedPayload.meta.pollCursor, pollCursor);
+  assert.equal(pausedPayload.meta.messageCount, inserted.length);
+  assert.equal(pausedPayload.meta.permissions.canSend, false);
+  assert.match(pausedPayload.meta.permissions.pausedReason, /not currently approved/i);
+});
+
+test("message writes and replays remain atomic during a schema-v5 rolling window", async () => {
+  const fixture = await createFixture({ schemaSql: STORE_SCHEMA_V5_SQL });
+  const { db, owner, approvedVendor, approved, paused } = fixture;
+  db.sqlite
+    .prepare(
+      `INSERT INTO booking_messages (id, booking_id, sender_user_id, body, created_at)
+       VALUES (?, ?, ?, ?, ?)`,
+    )
+    .run(
+      "other-booking-legacy-message",
+      paused.bookingId,
+      owner.user.id,
+      "An interleaved row must not create a gap in another booking's sequence.",
+      "2027-10-03T09:00:00.000Z",
+    );
+
+  const first = await postMessage(fixture, owner, approved.bookingId, "v5-owner-message-0001", {
+    body: "Can a newly deployed Worker still write to the previous schema?",
+  });
+  assert.equal(first.status, 201, await first.clone().text());
+  const firstPayload = await first.json();
+  assert.equal(firstPayload.data.sequence, 1);
+  assert.equal(firstPayload.meta.messageCount, 1);
+
+  const second = await postMessage(fixture, approvedVendor, approved.bookingId, "v5-vendor-message-0001", {
+    body: "Yes, and its response remains exactly ordered and counted.",
+  });
+  assert.equal(second.status, 201, await second.clone().text());
+  const secondPayload = await second.json();
+  assert.equal(secondPayload.data.sequence, 2);
+  assert.equal(secondPayload.meta.messageCount, 2);
+
+  const replay = await postMessage(fixture, owner, approved.bookingId, "v5-owner-message-0001", {
+    body: "Can a newly deployed Worker still write to the previous schema?",
+  });
+  assert.equal(replay.status, 201, await replay.clone().text());
+  const replayPayload = await replay.json();
+  assert.equal(replayPayload.meta.replayed, true);
+  assert.equal(replayPayload.meta.messageCount, 2);
+  assert.equal(replayPayload.data.id, firstPayload.data.id);
+  assert.equal(replayPayload.data.sequence, 1);
+  assert.equal(
+    db.sqlite.prepare("SELECT COUNT(*) AS count FROM booking_messages WHERE booking_id = ?").get(approved.bookingId).count,
+    2,
+  );
+  assert.equal(
+    db.sqlite
+      .prepare("SELECT COUNT(*) AS count FROM audit_events WHERE action = 'booking.message_sent' AND entity_id = ?")
+      .get(firstPayload.data.id).count,
+    1,
+  );
+  assert.equal(
+    db.sqlite.prepare("PRAGMA table_info(booking_messages)").all().some((column) => column.name === "stream_position"),
+    false,
+  );
+
+  db.sqlite.exec(STORE_SCHEMA_V6_MIGRATION_SQL);
+  const migratedReplay = await postMessage(fixture, owner, approved.bookingId, "v5-owner-message-0001", {
+    body: "Can a newly deployed Worker still write to the previous schema?",
+  });
+  assert.equal(migratedReplay.status, 201, await migratedReplay.clone().text());
+  const migratedReplayPayload = await migratedReplay.json();
+  assert.equal(migratedReplayPayload.meta.replayed, true);
+  assert.equal(migratedReplayPayload.meta.messageCount, 2);
+  assert.equal(migratedReplayPayload.data.id, firstPayload.data.id);
+  assert.equal(migratedReplayPayload.data.sequence, 1);
+});
+
+test("a schema-v5 polling cursor cannot skip a same-timestamp lower id after migration", async () => {
+  const fixture = await createFixture({ schemaSql: STORE_SCHEMA_V5_SQL });
+  const { app, env, db, owner, approved, paused } = fixture;
+  const legacyInsert = db.sqlite.prepare(
+    `INSERT INTO booking_messages (id, booking_id, sender_user_id, body, created_at)
+     VALUES (?, ?, ?, ?, ?)`,
+  );
+  legacyInsert.run(
+    "legacy-poll-z",
+    approved.bookingId,
+    owner.user.id,
+    "A message written before the stream-position migration.",
+    "2027-10-03T10:00:00.000Z",
+  );
+
+  const initial = await requestJson(app, env, `/bookings/${approved.bookingId}/messages`, { cookie: owner.cookie });
+  assert.equal(initial.status, 200, await initial.clone().text());
+  const initialPayload = await initial.json();
+  assert.deepEqual(initialPayload.data.map((message) => message.id), ["legacy-poll-z"]);
+  assert.deepEqual(initialPayload.data.map((message) => message.sequence), [1]);
+  assert.equal(initialPayload.meta.pollCursor, "legacy-poll-z");
+  assert.equal(initialPayload.meta.messageCount, 1);
+
+  for (let index = 0; index < 100; index += 1) {
+    legacyInsert.run(
+      `interleaved-${String(index).padStart(3, "0")}`,
+      paused.bookingId,
+      owner.user.id,
+      "A different booking must not leak its global rowid into this conversation's sequence.",
+      `2027-10-03T10:00:${String(index % 60).padStart(2, "0")}.000Z`,
+    );
+  }
+  legacyInsert.run(
+    "legacy-poll-a",
+    approved.bookingId,
+    owner.user.id,
+    "A later legacy insert with the same timestamp and a lower identifier.",
+    "2027-10-03T10:00:00.000Z",
+  );
+  assert.equal(
+    db.sqlite.prepare("SELECT rowid AS position FROM booking_messages WHERE id = 'legacy-poll-a'").get().position,
+    102,
+  );
+  const legacyFromStart = await requestJson(app, env, `/bookings/${approved.bookingId}/messages?after=0`, {
+    cookie: owner.cookie,
+  });
+  assert.equal(legacyFromStart.status, 200, await legacyFromStart.clone().text());
+  const legacyFromStartPayload = await legacyFromStart.json();
+  assert.deepEqual(legacyFromStartPayload.data.map((message) => message.id), ["legacy-poll-z", "legacy-poll-a"]);
+  assert.deepEqual(legacyFromStartPayload.data.map((message) => message.sequence), [1, 2]);
+  assert.equal(legacyFromStartPayload.meta.pollCursor, "legacy-poll-a");
+  assert.equal(legacyFromStartPayload.meta.messageCount, 2);
+
+  db.sqlite.exec(STORE_SCHEMA_V6_MIGRATION_SQL);
+  assert.deepEqual(
+    db.sqlite
+      .prepare("SELECT id, stream_position FROM booking_messages WHERE booking_id = ? ORDER BY stream_position")
+      .all(approved.bookingId)
+      .map((row) => ({ ...row })),
+    [
+      { id: "legacy-poll-z", stream_position: 1 },
+      { id: "legacy-poll-a", stream_position: 2 },
+    ],
+  );
+  const refresh = await requestJson(
+    app,
+    env,
+    `/bookings/${approved.bookingId}/messages?after=${initialPayload.meta.pollCursor}`,
+    { cookie: owner.cookie },
+  );
+  assert.equal(refresh.status, 200, await refresh.clone().text());
+  const refreshPayload = await refresh.json();
+  assert.deepEqual(refreshPayload.data.map((message) => message.id), ["legacy-poll-a"]);
+  assert.deepEqual(refreshPayload.data.map((message) => message.sequence), [2]);
+  assert.equal(refreshPayload.meta.pollCursor, "legacy-poll-a");
+  assert.equal(refreshPayload.meta.messageCount, 2);
 });

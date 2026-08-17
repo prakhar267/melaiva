@@ -13,6 +13,7 @@ const MAX_JSON_BYTES = 32 * 1024;
 // remains bounded while covering canonical JSON's worst-case escaping overhead.
 const MAX_BID_JSON_BYTES = 256 * 1024;
 const DEFAULT_CURRENCY = "INR";
+const MESSAGE_STREAM_START_CURSOR = "0";
 
 const encoder = new TextEncoder();
 const decoder = new TextDecoder();
@@ -1237,6 +1238,125 @@ function mapBookingMessage(row, booking, user) {
         : "Melaiva support",
     mine: row.sender_user_id === user.id,
     createdAt: row.created_at,
+    sequence: Number(row.stream_position),
+  };
+}
+
+async function bookingMessageState(db, booking, messageId, user, streamAvailable) {
+  const streamPositionSql = streamAvailable
+    ? "message.stream_position"
+    : `(SELECT COUNT(*)
+       FROM booking_messages preceding
+       WHERE preceding.booking_id = message.booking_id
+         AND preceding.rowid <= message.rowid)`;
+  const messageCountSql = streamAvailable
+    ? `COALESCE(
+        (
+          SELECT latest.stream_position
+          FROM booking_messages latest
+          WHERE latest.booking_id = message.booking_id
+          ORDER BY latest.stream_position DESC
+          LIMIT 1
+        ),
+        0
+      )`
+    : `(SELECT COUNT(*)
+       FROM booking_messages counted
+       WHERE counted.booking_id = message.booking_id)`;
+  const row = await db
+    .prepare(
+      `SELECT message.id, message.booking_id, message.sender_user_id, message.body,
+              message.created_at, ${streamPositionSql} AS stream_position,
+              ${messageCountSql} AS message_count
+       FROM booking_messages message
+       WHERE message.id = ? AND message.booking_id = ?
+       LIMIT 1`,
+    )
+    .bind(messageId, booking.id)
+    .first();
+  if (!row) throw new ApiError(409, "message_not_sent", "This message is unavailable; refresh and try again");
+  return {
+    message: mapBookingMessage(row, booking, user),
+    messageCount: Number(row.message_count || 0),
+  };
+}
+
+async function hasBookingMessageStreamPosition(db) {
+  const result = await db.prepare("PRAGMA table_info(booking_messages)").all();
+  return (result.results || []).some((column) => column.name === "stream_position");
+}
+
+// A new Worker can briefly reach a schema-v5 Durable Object during a rolling
+// deployment. Keep that read path functional without weakening the steady-state
+// v6 cursor; the full count here disappears as soon as v6 finalization completes.
+async function legacyBookingMessagePage(db, bookingId, { polling, requestedCursor, limit }) {
+  let cursorRow = null;
+  if (polling && requestedCursor === MESSAGE_STREAM_START_CURSOR) {
+    cursorRow = { id: MESSAGE_STREAM_START_CURSOR, legacy_position: 0 };
+  } else if (requestedCursor !== undefined) {
+    cursorRow = await db
+      .prepare(
+        `SELECT rowid AS legacy_position, id, created_at
+         FROM booking_messages WHERE id = ? AND booking_id = ? LIMIT 1`,
+      )
+      .bind(requestedCursor, bookingId)
+      .first();
+    if (!cursorRow) throw new ApiError(422, "invalid_cursor", "Message cursor is invalid");
+  }
+  const cursorCondition = polling && cursorRow
+    ? "AND candidate.rowid > ?"
+    : cursorRow
+      ? "AND (candidate.created_at < ? OR (candidate.created_at = ? AND candidate.id < ?))"
+      : "";
+  const pageOrder = polling ? "legacy_position ASC" : "created_at DESC, id DESC";
+  const cursorBinds = polling && cursorRow
+    ? [Number(cursorRow.legacy_position)]
+    : cursorRow
+      ? [cursorRow.created_at, cursorRow.created_at, cursorRow.id]
+      : [];
+  const result = await db
+    .prepare(
+      `SELECT page.id, page.booking_id, page.sender_user_id, page.body, page.created_at,
+              page.stream_position, metadata.message_count, metadata.latest_cursor
+       FROM (
+         SELECT COUNT(*) AS message_count,
+                (
+                  SELECT latest.id FROM booking_messages latest
+                  WHERE latest.booking_id = ? ORDER BY latest.rowid DESC LIMIT 1
+                ) AS latest_cursor
+         FROM booking_messages counted WHERE counted.booking_id = ?
+       ) metadata
+       LEFT JOIN (
+         SELECT candidate.rowid AS legacy_position, candidate.id, candidate.booking_id,
+                candidate.sender_user_id, candidate.body, candidate.created_at,
+                (
+                  SELECT COUNT(*)
+                  FROM booking_messages preceding
+                  WHERE preceding.booking_id = candidate.booking_id
+                    AND preceding.rowid <= candidate.rowid
+                ) AS stream_position
+         FROM booking_messages candidate
+         WHERE candidate.booking_id = ? ${cursorCondition}
+         ORDER BY ${pageOrder}
+         LIMIT ?
+       ) page ON 1 = 1
+       ORDER BY ${pageOrder}`,
+    )
+    .bind(bookingId, bookingId, bookingId, ...cursorBinds, limit + 1)
+    .all();
+  const rows = result.results || [];
+  const metadata = rows[0] || {};
+  const candidates = rows.filter((row) => row.id);
+  const hasMore = candidates.length > limit;
+  const pageRows = candidates.slice(0, limit);
+  return {
+    chronologicalRows: polling ? pageRows : pageRows.slice().reverse(),
+    hasMore,
+    messageCount: Number(metadata.message_count || 0),
+    nextCursor: !polling && hasMore ? pageRows[pageRows.length - 1]?.id || null : null,
+    pollCursor: polling
+      ? pageRows[pageRows.length - 1]?.id || requestedCursor
+      : metadata.latest_cursor || MESSAGE_STREAM_START_CURSOR,
   };
 }
 
@@ -1936,52 +2056,114 @@ function buildApp() {
   app.get(`${API_PREFIX}/bookings/:id/messages`, async (c) => {
     const user = await currentUser(c);
     const limit = parsePositiveInt(c.req.query("limit"), 50, 50);
-    const cursor = c.req.query("cursor") || null;
+    const cursor = c.req.query("cursor");
+    const after = c.req.query("after");
     const db = requireDatabase(c.env);
     const booking = await bookingForConversation(db, c.req.param("id"), user);
-    let cursorRow = null;
-    if (cursor) {
-      if (!/^[A-Za-z0-9-]{1,100}$/.test(cursor)) {
-        throw new ApiError(422, "invalid_cursor", "Message cursor is invalid");
-      }
-      cursorRow = await db
-        .prepare("SELECT id, created_at FROM booking_messages WHERE id = ? AND booking_id = ? LIMIT 1")
-        .bind(cursor, booking.id)
-        .first();
-      if (!cursorRow) throw new ApiError(422, "invalid_cursor", "Message cursor is invalid");
+    if (cursor !== undefined && after !== undefined) {
+      throw new ApiError(422, "invalid_pagination", "Use either cursor or after, not both");
     }
-    const result = await db
-      .prepare(
-        `SELECT id, booking_id, sender_user_id, body, created_at
-         FROM booking_messages
-         WHERE booking_id = ?
-           AND (
-             ? IS NULL
-             OR created_at < ?
-             OR (created_at = ? AND id < ?)
-           )
-         ORDER BY created_at DESC, id DESC
-         LIMIT ?`,
-      )
-      .bind(
-        booking.id,
-        cursorRow?.created_at || null,
-        cursorRow?.created_at || null,
-        cursorRow?.created_at || null,
-        cursorRow?.id || null,
-        limit + 1,
-      )
-      .all();
-    const newestFirst = result.results || [];
-    const hasMore = newestFirst.length > limit;
-    const pageRows = newestFirst.slice(0, limit);
-    const messages = pageRows.slice().reverse().map((row) => mapBookingMessage(row, booking, user));
+    const polling = after !== undefined;
+    const requestedCursor = polling ? after : cursor;
+    if (
+      requestedCursor !== undefined
+      && !(polling && requestedCursor === MESSAGE_STREAM_START_CURSOR)
+      && !/^[A-Za-z0-9-]{1,100}$/.test(requestedCursor)
+    ) {
+      throw new ApiError(422, "invalid_cursor", "Message cursor is invalid");
+    }
+    const legacyResponse = async () => {
+      const page = await legacyBookingMessagePage(db, booking.id, { polling, requestedCursor, limit });
+      return c.json({
+        data: page.chronologicalRows.map((row) => mapBookingMessage(row, booking, user)),
+        meta: {
+          limit,
+          hasMore: page.hasMore,
+          nextCursor: page.nextCursor,
+          pollCursor: page.pollCursor,
+          messageCount: page.messageCount,
+          permissions: conversationPermissions(booking, user),
+        },
+      });
+    };
+    let cursorRow = null;
+    let result;
+    try {
+      if (polling && requestedCursor === MESSAGE_STREAM_START_CURSOR) {
+        cursorRow = { id: MESSAGE_STREAM_START_CURSOR, stream_position: 0 };
+      } else if (requestedCursor !== undefined) {
+        cursorRow = await db
+          .prepare("SELECT id, stream_position FROM booking_messages WHERE id = ? AND booking_id = ? LIMIT 1")
+          .bind(requestedCursor, booking.id)
+          .first();
+        if (!cursorRow) throw new ApiError(422, "invalid_cursor", "Message cursor is invalid");
+      }
+      const direction = polling ? "ASC" : "DESC";
+      const cursorCondition = cursorRow
+        ? `AND stream_position ${polling ? ">" : "<"} ?`
+        : "";
+      result = await db
+        .prepare(
+          `SELECT page.id, page.booking_id, page.sender_user_id, page.body, page.created_at,
+                  page.stream_position, metadata.message_count, metadata.latest_cursor
+           FROM (
+             SELECT COALESCE(latest.stream_position, 0) AS message_count,
+                    latest.id AS latest_cursor
+             FROM (SELECT 1) seed
+             LEFT JOIN (
+               SELECT id, stream_position
+               FROM booking_messages
+               WHERE booking_id = ?
+               ORDER BY stream_position DESC
+               LIMIT 1
+             ) latest ON 1 = 1
+           ) metadata
+           LEFT JOIN (
+             SELECT id, booking_id, sender_user_id, body, created_at, stream_position
+             FROM booking_messages
+             WHERE booking_id = ? ${cursorCondition}
+             ORDER BY stream_position ${direction}
+             LIMIT ?
+           ) page ON 1 = 1
+           ORDER BY page.stream_position ${direction}`,
+        )
+        .bind(
+          booking.id,
+          booking.id,
+          ...(cursorRow ? [Number(cursorRow.stream_position)] : []),
+          limit + 1,
+        )
+        .all();
+    } catch (error) {
+      if (error instanceof ApiError) throw error;
+      let streamAvailable;
+      try {
+        streamAvailable = await hasBookingMessageStreamPosition(db);
+      } catch {
+        throw error;
+      }
+      if (streamAvailable) throw error;
+      return legacyResponse();
+    }
+    const rows = result.results || [];
+    if (rows.some((row) => row.id && row.stream_position === null)) return legacyResponse();
+    const metadata = rows[0] || {};
+    const candidates = rows.filter((row) => row.id);
+    const hasMore = candidates.length > limit;
+    const pageRows = candidates.slice(0, limit);
+    const chronologicalRows = polling ? pageRows : pageRows.slice().reverse();
+    const messages = chronologicalRows.map((row) => mapBookingMessage(row, booking, user));
+    const pollCursor = polling
+      ? pageRows[pageRows.length - 1]?.id || requestedCursor
+      : metadata.latest_cursor || MESSAGE_STREAM_START_CURSOR;
     return c.json({
       data: messages,
       meta: {
         limit,
         hasMore,
-        nextCursor: hasMore ? pageRows[pageRows.length - 1]?.id || null : null,
+        nextCursor: !polling && hasMore ? pageRows[pageRows.length - 1]?.id || null : null,
+        pollCursor,
+        messageCount: Number(metadata.message_count || 0),
         permissions: conversationPermissions(booking, user),
       },
     });
@@ -1999,9 +2181,19 @@ function buildApp() {
     if (!permissions.canSend) {
       throw new ApiError(403, "messaging_paused", permissions.pausedReason);
     }
+    const streamAvailable = await hasBookingMessageStreamPosition(db);
     const scope = `booking-message:${booking.id}`;
     const replay = await findIdempotentResult(db, scope, requestKey, user.id, requestHash);
-    if (replay) return c.json({ data: replay.value, meta: { replayed: true } }, replay.status);
+    if (replay) {
+      const state = await bookingMessageState(db, booking, replay.value.id, user, streamAvailable);
+      return c.json(
+        {
+          data: { ...replay.value, sequence: state.message.sequence },
+          meta: { replayed: true, messageCount: state.messageCount },
+        },
+        replay.status,
+      );
+    }
 
     const requestKeyHash = await idempotencyHash(scope, requestKey, user.id);
     await db
@@ -2021,18 +2213,24 @@ function buildApp() {
         sender_user_id: user.id,
         body: input.body,
         created_at: createdAt,
+        stream_position: null,
       },
       booking,
       user,
     );
+    const idempotencySequenceSql = streamAvailable
+      ? "message.stream_position"
+      : `(SELECT COUNT(*)
+         FROM booking_messages preceding
+         WHERE preceding.booking_id = message.booking_id
+           AND preceding.rowid <= message.rowid)`;
     const idempotencyStatement = db
       .prepare(
         `INSERT INTO idempotency_keys
          (scope, key_hash, user_id, request_hash, response_status, response_json, expires_at)
-         SELECT ?, ?, ?, ?, 201, ?, ?
-         WHERE EXISTS (
-           SELECT 1 FROM booking_messages WHERE id = ? AND booking_id = ?
-         )`,
+         SELECT ?, ?, ?, ?, 201, json_set(?, '$.sequence', ${idempotencySequenceSql}), ?
+         FROM booking_messages message
+         WHERE message.id = ? AND message.booking_id = ?`,
       )
       .bind(
         scope,
@@ -2044,19 +2242,40 @@ function buildApp() {
         id,
         booking.id,
       );
+    const messageInsertStatement = streamAvailable
+      ? db
+        .prepare(
+          `INSERT INTO booking_messages (id, booking_id, sender_user_id, body, created_at, stream_position)
+           SELECT ?, booking.id, ?, ?, ?,
+                  COALESCE(
+                    (
+                      SELECT MAX(existing_message.stream_position) + 1
+                      FROM booking_messages existing_message
+                      WHERE existing_message.booking_id = booking.id
+                    ),
+                    1
+                  )
+           FROM bookings booking
+           JOIN vendors vendor ON vendor.id = booking.vendor_id
+           WHERE booking.id = ?
+             AND vendor.status = 'approved'
+             AND (booking.couple_user_id = ? OR vendor.user_id = ?)`,
+        )
+        .bind(id, user.id, input.body, createdAt, booking.id, user.id, user.id)
+      : db
+        .prepare(
+          `INSERT INTO booking_messages (id, booking_id, sender_user_id, body, created_at)
+           SELECT ?, booking.id, ?, ?, ?
+           FROM bookings booking
+           JOIN vendors vendor ON vendor.id = booking.vendor_id
+           WHERE booking.id = ?
+             AND vendor.status = 'approved'
+             AND (booking.couple_user_id = ? OR vendor.user_id = ?)`,
+        )
+        .bind(id, user.id, input.body, createdAt, booking.id, user.id, user.id);
     try {
       const results = await db.batch([
-        db
-          .prepare(
-            `INSERT INTO booking_messages (id, booking_id, sender_user_id, body, created_at)
-             SELECT ?, booking.id, ?, ?, ?
-             FROM bookings booking
-             JOIN vendors vendor ON vendor.id = booking.vendor_id
-             WHERE booking.id = ?
-               AND vendor.status = 'approved'
-               AND (booking.couple_user_id = ? OR vendor.user_id = ?)`,
-          )
-          .bind(id, user.id, input.body, createdAt, booking.id, user.id, user.id),
+        messageInsertStatement,
         idempotencyStatement,
         db
           .prepare(
@@ -2075,12 +2294,26 @@ function buildApp() {
       if (isUniqueConstraint(error)) {
         const concurrentReplay = await findIdempotentResult(db, scope, requestKey, user.id, requestHash);
         if (concurrentReplay) {
-          return c.json({ data: concurrentReplay.value, meta: { replayed: true } }, concurrentReplay.status);
+          const state = await bookingMessageState(
+            db,
+            booking,
+            concurrentReplay.value.id,
+            user,
+            streamAvailable,
+          );
+          return c.json(
+            {
+              data: { ...concurrentReplay.value, sequence: state.message.sequence },
+              meta: { replayed: true, messageCount: state.messageCount },
+            },
+            concurrentReplay.status,
+          );
         }
       }
       throw error;
     }
-    return c.json({ data: responseValue }, 201);
+    const state = await bookingMessageState(db, booking, id, user, streamAvailable);
+    return c.json({ data: state.message, meta: { messageCount: state.messageCount } }, 201);
   });
 
   app.get(`${API_PREFIX}/auctions/:id/award`, async (c) => {

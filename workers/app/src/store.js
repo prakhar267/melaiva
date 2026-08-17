@@ -1,4 +1,4 @@
-const STORE_SCHEMA_VERSION = 5;
+const STORE_SCHEMA_VERSION = 6;
 const MAINTENANCE_INTERVAL_MS = 60 * 60 * 1000;
 
 const STORE_SCHEMA_V1_SQL = `
@@ -396,7 +396,110 @@ INSERT OR IGNORE INTO _sql_schema_migrations (id) VALUES (5);
 PRAGMA optimize;
 `;
 
-const STORE_SCHEMA_SQL = `${STORE_SCHEMA_V1_SQL}\n${STORE_SCHEMA_V2_MIGRATION_SQL}\n${STORE_SCHEMA_V3_MIGRATION_SQL}\n${STORE_SCHEMA_V4_MIGRATION_SQL}\n${STORE_SCHEMA_V5_MIGRATION_SQL}`;
+const STORE_SCHEMA_V6_FINALIZE_SQL = `
+DROP TRIGGER IF EXISTS booking_messages_stream_position_insert;
+DROP TRIGGER IF EXISTS booking_messages_stream_position_sequence;
+DROP TRIGGER IF EXISTS booking_messages_stream_position_assign;
+DROP TRIGGER IF EXISTS booking_messages_stream_position_update;
+DROP TRIGGER IF EXISTS booking_messages_stream_identity_update;
+DROP TRIGGER IF EXISTS booking_messages_stream_identity_delete;
+
+WITH ranked_messages AS (
+  SELECT id,
+         ROW_NUMBER() OVER (
+           PARTITION BY booking_id
+           ORDER BY rowid ASC
+         ) AS stream_position
+  FROM booking_messages
+)
+UPDATE booking_messages
+SET stream_position = (
+  SELECT ranked.stream_position
+  FROM ranked_messages ranked
+  WHERE ranked.id = booking_messages.id
+)
+WHERE stream_position IS NULL;
+
+CREATE UNIQUE INDEX IF NOT EXISTS idx_booking_messages_stream
+  ON booking_messages(booking_id, stream_position);
+
+CREATE TRIGGER IF NOT EXISTS booking_messages_stream_position_insert
+BEFORE INSERT ON booking_messages
+WHEN NEW.stream_position IS NOT NULL
+  AND (
+    typeof(NEW.stream_position) != 'integer'
+    OR NEW.stream_position < 1
+  )
+BEGIN
+  SELECT RAISE(ABORT, 'booking message stream position must be a positive integer');
+END;
+
+CREATE TRIGGER IF NOT EXISTS booking_messages_stream_position_sequence
+BEFORE INSERT ON booking_messages
+WHEN NEW.stream_position IS NOT NULL
+  AND typeof(NEW.stream_position) = 'integer'
+  AND NEW.stream_position >= 1
+  AND NEW.stream_position != COALESCE(
+    (
+      SELECT MAX(existing_message.stream_position) + 1
+      FROM booking_messages existing_message
+      WHERE existing_message.booking_id = NEW.booking_id
+    ),
+    1
+  )
+BEGIN
+  SELECT RAISE(ABORT, 'booking message stream position must be the next position');
+END;
+
+CREATE TRIGGER IF NOT EXISTS booking_messages_stream_position_assign
+AFTER INSERT ON booking_messages
+WHEN NEW.stream_position IS NULL
+BEGIN
+  UPDATE booking_messages
+  SET stream_position = COALESCE(
+    (
+      SELECT MAX(existing_message.stream_position) + 1
+      FROM booking_messages existing_message
+      WHERE existing_message.booking_id = NEW.booking_id
+        AND existing_message.id != NEW.id
+    ),
+    1
+  )
+  WHERE id = NEW.id AND stream_position IS NULL;
+END;
+
+CREATE TRIGGER IF NOT EXISTS booking_messages_stream_position_update
+BEFORE UPDATE OF stream_position ON booking_messages
+WHEN OLD.stream_position IS NOT NULL
+  OR NEW.stream_position IS NULL
+  OR typeof(NEW.stream_position) != 'integer'
+  OR NEW.stream_position < 1
+BEGIN
+  SELECT RAISE(ABORT, 'booking message stream position is immutable');
+END;
+
+CREATE TRIGGER IF NOT EXISTS booking_messages_stream_identity_update
+BEFORE UPDATE OF id, booking_id ON booking_messages
+BEGIN
+  SELECT RAISE(ABORT, 'booking message stream identity is immutable');
+END;
+
+CREATE TRIGGER IF NOT EXISTS booking_messages_stream_identity_delete
+BEFORE DELETE ON booking_messages
+BEGIN
+  SELECT RAISE(ABORT, 'booking message stream records are immutable');
+END;
+
+INSERT OR IGNORE INTO _sql_schema_migrations (id) VALUES (6);
+PRAGMA optimize;
+`;
+
+const STORE_SCHEMA_V6_MIGRATION_SQL = `
+ALTER TABLE booking_messages ADD COLUMN stream_position INTEGER;
+${STORE_SCHEMA_V6_FINALIZE_SQL}
+`;
+
+const STORE_SCHEMA_SQL = `${STORE_SCHEMA_V1_SQL}\n${STORE_SCHEMA_V2_MIGRATION_SQL}\n${STORE_SCHEMA_V3_MIGRATION_SQL}\n${STORE_SCHEMA_V4_MIGRATION_SQL}\n${STORE_SCHEMA_V5_MIGRATION_SQL}\n${STORE_SCHEMA_V6_MIGRATION_SQL}`;
 
 const DEMO_CATALOG_SQL = `
 INSERT OR IGNORE INTO vendors
@@ -471,6 +574,13 @@ export class MelaivaStore {
       }
       if (version > 0 && version < 5) {
         this.sql.exec(STORE_SCHEMA_V5_MIGRATION_SQL).toArray();
+      }
+      if (version > 0 && version < 6) {
+        const messageColumns = this.sql.exec("PRAGMA table_info(booking_messages)").toArray();
+        if (!messageColumns.some((column) => column.name === "stream_position")) {
+          this.sql.exec("ALTER TABLE booking_messages ADD COLUMN stream_position INTEGER").toArray();
+        }
+        this.sql.exec(STORE_SCHEMA_V6_FINALIZE_SQL).toArray();
       }
       if (env?.ENABLE_DEMO_CATALOG === "true" && env?.ENVIRONMENT !== "production") {
         this.sql.exec(DEMO_CATALOG_SQL).toArray();
@@ -607,6 +717,8 @@ export {
   STORE_SCHEMA_V3_MIGRATION_SQL,
   STORE_SCHEMA_V4_MIGRATION_SQL,
   STORE_SCHEMA_V5_MIGRATION_SQL,
+  STORE_SCHEMA_V6_FINALIZE_SQL,
+  STORE_SCHEMA_V6_MIGRATION_SQL,
   STORE_SCHEMA_VERSION,
   executeSql,
 };

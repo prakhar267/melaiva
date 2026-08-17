@@ -30,6 +30,7 @@ import {
 import { dashboardTasks, formatCurrency, sampleOffers } from "../data.js";
 import { createIdempotencyKey, readApiResponse } from "../api.js";
 import { BookingMessages } from "../components/BookingMessages.jsx";
+import { targetScrollLeftForControl } from "../components/bookingMessages.js";
 
 const budgetRows = [
   { name: "Venue & stay", allocated: 900000, committed: 710000, tone: "aubergine" },
@@ -111,16 +112,53 @@ function PreferredVendorSummary({ vendor }) {
 }
 
 function DashboardNav({ active, setActive, offersCount = 0, tasksCount = 0, conversationsCount = 0 }) {
+  const navRef = useRef(null);
+  const buttonRefs = useRef(new Map());
   const items = [
     ["overview", LayoutDashboard, "Overview"],
     ["offers", FileText, "Offers", offersCount],
     ["tasks", ClipboardCheck, "Tasks", tasksCount],
     ["messages", MessageSquareText, "Messages", conversationsCount],
   ];
+  useEffect(() => {
+    let frame = null;
+    const reducedMotion = window.matchMedia?.("(prefers-reduced-motion: reduce)")?.matches;
+
+    function revealActive(behavior = "auto") {
+      const nav = navRef.current;
+      const button = buttonRefs.current.get(active);
+      if (!nav || !button) return;
+      const navRect = nav.getBoundingClientRect();
+      const buttonRect = button.getBoundingClientRect();
+      const left = targetScrollLeftForControl({
+        scrollLeft: nav.scrollLeft,
+        clientWidth: nav.clientWidth,
+        itemOffsetLeft: nav.scrollLeft + buttonRect.left - navRect.left,
+        itemOffsetWidth: buttonRect.width,
+        maxScrollLeft: nav.scrollWidth - nav.clientWidth,
+      });
+      if (Math.abs(left - nav.scrollLeft) < 1) return;
+      nav.scrollTo({ left, behavior });
+    }
+
+    function scheduleReveal() {
+      window.cancelAnimationFrame(frame);
+      frame = window.requestAnimationFrame(() => revealActive("auto"));
+    }
+
+    revealActive(reducedMotion ? "auto" : "smooth");
+    window.addEventListener("resize", scheduleReveal);
+    document.fonts?.addEventListener?.("loadingdone", scheduleReveal);
+    return () => {
+      window.cancelAnimationFrame(frame);
+      window.removeEventListener("resize", scheduleReveal);
+      document.fonts?.removeEventListener?.("loadingdone", scheduleReveal);
+    };
+  }, [active, conversationsCount, offersCount, tasksCount]);
   return (
-    <nav className="dashboard-nav" aria-label="Celebration dashboard">
+    <nav className="dashboard-nav" aria-label="Celebration dashboard" ref={navRef}>
       {items.map(([id, Icon, label, badge]) => (
-        <button key={id} className={active === id ? "is-active" : ""} onClick={() => setActive(id)} aria-pressed={active === id}>
+        <button ref={(node) => { if (node) buttonRefs.current.set(id, node); else buttonRefs.current.delete(id); }} type="button" key={id} className={active === id ? "is-active" : ""} onClick={() => setActive(id)} aria-pressed={active === id}>
           <Icon size={17} /><span>{label}</span>{Number(badge) > 0 && <small>{badge}</small>}
         </button>
       ))}
@@ -536,7 +574,7 @@ function LiveOffers({ auction, bids, loading, error, decidingId, closing, award,
   );
 }
 
-function LiveDashboard({ user, auctions, selectedAuction, onSelect, bids, bidsLoading, bidsError, decidingId, closingOfferWindow, award, awardLoading, awardError, onRetryAward, onDecision, onRequestClose, onRequestAward, active, setActive, preferredBookingId, onSelectMessage }) {
+function LiveDashboard({ user, auctions, selectedAuction, onSelect, bids, bidsLoading, bidsError, decidingId, closingOfferWindow, award, awardLoading, awardError, onRetryAward, onDecision, onRequestClose, onRequestAward, active, setActive, preferredBookingId, onSelectMessage, messageFocusRequest, onRequestMessageFocus, onMessageFocusHandled }) {
   const totalOffers = auctions.reduce((sum, auction) => sum + Number(auction.bidCount || 0), 0);
   const conversationCount = auctions.filter((auction) => auction.status === "awarded").length;
   return (
@@ -550,9 +588,9 @@ function LiveDashboard({ user, auctions, selectedAuction, onSelect, bids, bidsLo
           <>
             <DashboardNav active={active} setActive={setActive} offersCount={totalOffers} conversationsCount={conversationCount} />
             {active === "overview" && <div className="live-dashboard-grid"><RequestSelector auctions={auctions} selectedId={selectedAuction?.id} onSelect={onSelect} /><LiveRequestSummary auction={selectedAuction} /></div>}
-            {active === "offers" && <><RequestSelector auctions={auctions} selectedId={selectedAuction?.id} onSelect={onSelect} /><LiveOffers auction={selectedAuction} bids={bids} loading={bidsLoading} error={bidsError} decidingId={decidingId} closing={closingOfferWindow} award={award} awardLoading={awardLoading} awardError={awardError} onRetryAward={onRetryAward} onDecision={onDecision} onRequestClose={onRequestClose} onRequestAward={onRequestAward} onMessage={(bookingId) => { onSelectMessage(bookingId); setActive("messages"); }} /></>}
+            {active === "offers" && <><RequestSelector auctions={auctions} selectedId={selectedAuction?.id} onSelect={onSelect} /><LiveOffers auction={selectedAuction} bids={bids} loading={bidsLoading} error={bidsError} decidingId={decidingId} closing={closingOfferWindow} award={award} awardLoading={awardLoading} awardError={awardError} onRetryAward={onRetryAward} onDecision={onDecision} onRequestClose={onRequestClose} onRequestAward={onRequestAward} onMessage={(bookingId) => { onSelectMessage(bookingId); onRequestMessageFocus(); setActive("messages"); }} /></>}
             {active === "tasks" && <div className="dashboard-card dashboard-empty"><span><ClipboardCheck size={27} /></span><h2>No task list yet</h2><p>Request and offer decisions are live. Personal task management is the next workspace module.</p></div>}
-            {active === "messages" && <BookingMessages audience="owner" preferredBookingId={preferredBookingId} onViewScope={(thread) => { onSelect(thread.auctionId); setActive("offers"); }} emptyActionLabel="Review offers" onEmptyAction={() => setActive("offers")} />}
+            {active === "messages" && <BookingMessages audience="owner" preferredBookingId={preferredBookingId} focusRequest={messageFocusRequest} onFocusRequestHandled={onMessageFocusHandled} onViewScope={(thread) => { onSelect(thread.auctionId); setActive("offers"); }} emptyActionLabel="Review offers" onEmptyAction={() => setActive("offers")} />}
           </>
         ) : (
           <div className="dashboard-card dashboard-empty"><span><Sparkles size={28} /></span><h2>Start with one thoughtful brief</h2><p>Share the date, city, scope and range once. Your requests and real offers will appear here.</p><Link className="button button--primary" to="/request">Create my first request</Link></div>
@@ -584,6 +622,8 @@ export function DashboardPage({ notify, onOpenAuth, authRevision = 0 }) {
   const [awardRefreshKey, setAwardRefreshKey] = useState(0);
   const [refreshKey, setRefreshKey] = useState(0);
   const [messageBookingId, setMessageBookingId] = useState(null);
+  const [messageFocusRequest, setMessageFocusRequest] = useState(null);
+  const messageFocusSequence = useRef(0);
   const bidAcceptanceKeys = useRef(new Map());
   const selectedIdRef = useRef(selectedId);
   const bidsAuctionIdRef = useRef(bidsAuctionId);
@@ -776,7 +816,7 @@ export function DashboardPage({ notify, onOpenAuth, authRevision = 0 }) {
     const awardBusy = Boolean(awardDialog && decidingId === `${awardDialog.auctionId}:${awardDialog.bidId}`);
     const visibleAward = awardAuctionId === selectedId ? award : null;
     const visibleAwardLoading = selectedAuction?.status === "awarded" && (awardAuctionId !== selectedId || awardLoading);
-    return <div className="dashboard-page page-surface"><LiveDashboard user={user} auctions={auctions} selectedAuction={selectedAuction} onSelect={setSelectedId} bids={visibleBids} bidsLoading={visibleBidsLoading} bidsError={bidsAuctionId === selectedId ? bidsError : ""} decidingId={decidingId} closingOfferWindow={closingOfferWindow} award={visibleAward} awardLoading={visibleAwardLoading} awardError={awardAuctionId === selectedId ? awardError : ""} onRetryAward={() => setAwardRefreshKey((value) => value + 1)} onDecision={decideOnBid} onRequestClose={setCloseDialogAuctionId} onRequestAward={(bid) => selectedAuction && setAwardDialog({ auctionId: selectedAuction.id, bidId: bid.id })} active={active} setActive={setActive} preferredBookingId={messageBookingId} onSelectMessage={setMessageBookingId} /><CloseOfferWindowDialog auction={dialogAuction} open={Boolean(dialogAuction)} closing={closingOfferWindow} onClose={() => !closingOfferWindow && setCloseDialogAuctionId(null)} onConfirm={closeOfferWindow} /><AwardOfferDialog auction={awardAuction} bid={awardBid} open={Boolean(awardAuction && awardBid)} busy={awardBusy} onClose={() => !awardBusy && setAwardDialog(null)} onConfirm={() => awardDialog && decideOnBid(awardDialog.bidId, "accept", awardDialog.auctionId)} /></div>;
+    return <div className="dashboard-page page-surface"><LiveDashboard user={user} auctions={auctions} selectedAuction={selectedAuction} onSelect={setSelectedId} bids={visibleBids} bidsLoading={visibleBidsLoading} bidsError={bidsAuctionId === selectedId ? bidsError : ""} decidingId={decidingId} closingOfferWindow={closingOfferWindow} award={visibleAward} awardLoading={visibleAwardLoading} awardError={awardAuctionId === selectedId ? awardError : ""} onRetryAward={() => setAwardRefreshKey((value) => value + 1)} onDecision={decideOnBid} onRequestClose={setCloseDialogAuctionId} onRequestAward={(bid) => selectedAuction && setAwardDialog({ auctionId: selectedAuction.id, bidId: bid.id })} active={active} setActive={setActive} preferredBookingId={messageBookingId} onSelectMessage={setMessageBookingId} messageFocusRequest={messageFocusRequest} onRequestMessageFocus={() => { messageFocusSequence.current += 1; setMessageFocusRequest(messageFocusSequence.current); }} onMessageFocusHandled={() => setMessageFocusRequest(null)} /><CloseOfferWindowDialog auction={dialogAuction} open={Boolean(dialogAuction)} closing={closingOfferWindow} onClose={() => !closingOfferWindow && setCloseDialogAuctionId(null)} onConfirm={closeOfferWindow} /><AwardOfferDialog auction={awardAuction} bid={awardBid} open={Boolean(awardAuction && awardBid)} busy={awardBusy} onClose={() => !awardBusy && setAwardDialog(null)} onConfirm={() => awardDialog && decideOnBid(awardDialog.bidId, "accept", awardDialog.auctionId)} /></div>;
   }
 
   return (

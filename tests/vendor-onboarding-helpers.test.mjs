@@ -5,33 +5,48 @@ import {
   buildVendorEvidence,
   buildVendorEvidenceSubmissionPayload,
   canCompleteVendorEvidence,
+  createVendorEvidenceLifecycleState,
   evidenceFocusIndexAfterRemoval,
+  evidenceFocusNeedsScroll,
   normalizeVendorEvidenceContext,
   prefillVendorEvidence,
   registrationReferenceError,
   shouldClearVendorEvidencePrivateDraft,
   shouldPreflightVendorEvidenceSubmission,
+  VENDOR_EVIDENCE_DISCARD_FAILURE_MESSAGE,
   validateVendorApplication,
   validateVendorEvidence,
   vendorEvidenceCompletionEligibility,
   vendorEvidenceConflictState,
   vendorEvidenceContextRefreshDecision,
   vendorEvidenceContextsMatch,
+  vendorEvidenceExplicitReloadPlan,
+  vendorEvidenceLifecycleTransition,
   vendorEvidencePreflightIdentityMatches,
   vendorEvidencePreflightMatches,
 } from "../src/components/vendorOnboarding.js";
 import {
   supportsAdminVendorSummaryContract,
   supportsVendorApplicationEvidence,
+  VENDOR_APPLICATION_EVIDENCE_HEADERS,
+  workerVersionAffinityHeaders,
+  WORKER_VERSION_AFFINITY_HEADER,
 } from "../src/components/vendorApplicationCompatibility.js";
 
 test("vendor evidence compatibility fails closed across mixed Worker versions", () => {
-  assert.equal(supportsVendorApplicationEvidence({ data: { vendorApplicationEvidenceRevision: 4 } }), true);
+  assert.equal(supportsVendorApplicationEvidence({ data: { vendorApplicationEvidenceRevision: 5 } }), true);
   assert.equal(supportsVendorApplicationEvidence({ data: {} }), false);
-  assert.equal(supportsVendorApplicationEvidence({ data: { vendorApplicationEvidenceRevision: "4" } }), false);
+  assert.equal(supportsVendorApplicationEvidence({ data: { vendorApplicationEvidenceRevision: "5" } }), false);
+  assert.equal(supportsVendorApplicationEvidence({ data: { vendorApplicationEvidenceRevision: 4 } }), false);
   assert.equal(supportsVendorApplicationEvidence({ data: { vendorApplicationEvidenceRevision: 3 } }), false);
   assert.equal(supportsVendorApplicationEvidence({ data: { vendorApplicationEvidenceRevision: 2 } }), false);
   assert.equal(supportsVendorApplicationEvidence({ data: { vendorApplicationEvidenceRevision: 1 } }), false);
+  assert.deepEqual(VENDOR_APPLICATION_EVIDENCE_HEADERS, { "X-Melaiva-Vendor-Evidence": "5" });
+  assert.deepEqual(workerVersionAffinityHeaders("vendor-123"), {
+    [WORKER_VERSION_AFFINITY_HEADER]: "vendor-123",
+  });
+  assert.deepEqual(workerVersionAffinityHeaders(" vendor-123 "), {});
+  assert.deepEqual(workerVersionAffinityHeaders(`vendor-${"x".repeat(128)}`), {});
 
   const summaryPayload = { meta: { contract: "vendor-summary-v2" } };
   assert.equal(supportsAdminVendorSummaryContract(summaryPayload, "2"), true);
@@ -42,6 +57,102 @@ test("vendor evidence compatibility fails closed across mixed Worker versions", 
     meta: { total: 1 },
   };
   assert.equal(supportsAdminVendorSummaryContract(legacyFullDetailPayload, null), false);
+});
+
+test("evidence focus scrolling changes only when the target is outside the viewport", () => {
+  assert.equal(evidenceFocusNeedsScroll({ top: 0, bottom: 40 }, 800), false);
+  assert.equal(evidenceFocusNeedsScroll({ top: -1, bottom: 39 }, 800), true);
+  assert.equal(evidenceFocusNeedsScroll({ top: 780, bottom: 820 }, 800), true);
+  assert.equal(evidenceFocusNeedsScroll(null, 800), false);
+});
+
+test("evidence lifecycle keeps a captured payload locked through ambiguous focus changes", () => {
+  const initial = createVendorEvidenceLifecycleState();
+  const focused = vendorEvidenceLifecycleTransition(initial, {
+    type: "capture_focus",
+    focusDescriptor: "portfolioUrls:0",
+  });
+  const locked = vendorEvidenceLifecycleTransition(focused, { type: "begin_submission" });
+  assert.equal(locked.locked, true);
+  assert.equal(locked.submissionSequence, 1);
+  assert.equal(vendorEvidenceLifecycleTransition(locked, { type: "begin_submission" }), locked);
+  assert.equal(locked.submissionSequence, 1);
+  assert.deepEqual(vendorEvidenceLifecycleTransition(locked, { type: "form_changed" }), locked);
+
+  const dispatched = vendorEvidenceLifecycleTransition(locked, { type: "mutation_started" });
+  assert.equal(dispatched.mutationInFlight, true);
+  assert.equal(dispatched.keyPreserved, true);
+  const revalidating = vendorEvidenceLifecycleTransition(dispatched, {
+    type: "focus_revalidation",
+    mutationInFlight: true,
+  });
+  assert.equal(revalidating.generation, 1);
+  assert.equal(revalidating.locked, true);
+  assert.equal(revalidating.submissionUnconfirmed, true);
+  assert.equal(revalidating.keyPreserved, true);
+  assert.equal(revalidating.focusDescriptor, "portfolioUrls:0");
+
+  const unconfirmed = vendorEvidenceLifecycleTransition(revalidating, { type: "mutation_unconfirmed" });
+  const settled = vendorEvidenceLifecycleTransition(unconfirmed, { type: "mutation_settled" });
+  assert.equal(settled.locked, false);
+  assert.equal(settled.mutationInFlight, false);
+  assert.equal(settled.submissionUnconfirmed, true);
+  assert.equal(settled.keyPreserved, true);
+  assert.equal(settled.focusDescriptor, "portfolioUrls:0");
+  const focusConsumed = vendorEvidenceLifecycleTransition(settled, { type: "consume_focus" });
+  assert.equal(focusConsumed.focusDescriptor, null);
+  const confirmed = vendorEvidenceLifecycleTransition(settled, { type: "submission_confirmed" });
+  assert.equal(confirmed.submissionUnconfirmed, false);
+  assert.equal(confirmed.keyPreserved, false);
+});
+
+test("discard failure stays cleared and retry or account change removes stale copy", () => {
+  let lifecycle = createVendorEvidenceLifecycleState();
+  lifecycle = vendorEvidenceLifecycleTransition(lifecycle, {
+    type: "capture_focus",
+    focusDescriptor: "registration-reference",
+  });
+  lifecycle = vendorEvidenceLifecycleTransition(lifecycle, { type: "begin_submission" });
+  lifecycle = vendorEvidenceLifecycleTransition(lifecycle, { type: "mutation_started" });
+  lifecycle = vendorEvidenceLifecycleTransition(lifecycle, { type: "explicit_discard" });
+  assert.deepEqual({
+    draftCleared: lifecycle.draftCleared,
+    explicitDiscard: lifecycle.explicitDiscard,
+    locked: lifecycle.locked,
+    mutationInFlight: lifecycle.mutationInFlight,
+    focusDescriptor: lifecycle.focusDescriptor,
+    keyPreserved: lifecycle.keyPreserved,
+    submissionUnconfirmed: lifecycle.submissionUnconfirmed,
+  }, {
+    draftCleared: true,
+    explicitDiscard: true,
+    locked: false,
+    mutationInFlight: false,
+    focusDescriptor: null,
+    keyPreserved: false,
+    submissionUnconfirmed: false,
+  });
+
+  lifecycle = vendorEvidenceLifecycleTransition(lifecycle, {
+    type: "focus_revalidation",
+    mutationInFlight: false,
+  });
+  assert.equal(lifecycle.explicitDiscard, true);
+  assert.equal(lifecycle.locked, false);
+  lifecycle = vendorEvidenceLifecycleTransition(lifecycle, { type: "discard_load_failed" });
+  assert.equal(lifecycle.draftCleared, true);
+  assert.equal(lifecycle.accessErrorMessage, VENDOR_EVIDENCE_DISCARD_FAILURE_MESSAGE);
+
+  const retried = vendorEvidenceLifecycleTransition(lifecycle, { type: "access_retry" });
+  assert.equal(retried.draftCleared, true);
+  assert.equal(retried.accessErrorMessage, "");
+
+  const failedAgain = vendorEvidenceLifecycleTransition(lifecycle, { type: "discard_load_failed" });
+  const accountChanged = vendorEvidenceLifecycleTransition(failedAgain, { type: "clear_private" });
+  assert.equal(accountChanged.draftCleared, true);
+  assert.equal(accountChanged.explicitDiscard, false);
+  assert.equal(accountChanged.accessErrorMessage, "");
+  assert.equal(accountChanged.generation, lifecycle.generation + 1);
 });
 
 test("vendor evidence requires distinct public portfolio and reference links", () => {
@@ -455,6 +566,52 @@ test("account transitions clear private evidence before another onboarding flow 
   }), false);
 });
 
+test("explicit reload discards a dirty draft even when the application became terminal", () => {
+  const completeContext = {
+    vendorId: "vendor-1",
+    effectiveStatus: "pending",
+    reviewRevision: 7,
+    evidenceRevision: 2,
+    informationRequestRevision: 2,
+  };
+  assert.deepEqual(vendorEvidenceExplicitReloadPlan({
+    state: "complete",
+    context: completeContext,
+  }), {
+    vendorId: "vendor-1",
+    shouldPrefill: false,
+  });
+  assert.deepEqual(vendorEvidenceExplicitReloadPlan({
+    state: "status_unavailable",
+    context: { ...completeContext, effectiveStatus: "approved" },
+  }), {
+    vendorId: "vendor-1",
+    shouldPrefill: false,
+  });
+
+  const nextRequestContext = {
+    ...completeContext,
+    effectiveStatus: "needs_information",
+    reviewRevision: 8,
+    informationRequestRevision: 3,
+    currentInformationRequest: { revision: 3 },
+  };
+  assert.deepEqual(vendorEvidenceContextRefreshDecision({
+    currentContext: completeContext,
+    incomingContext: nextRequestContext,
+    dirty: false,
+    formInitialized: false,
+  }), {
+    accountChanged: false,
+    shouldResetForm: true,
+    conflict: false,
+  });
+  assert.equal(vendorEvidenceExplicitReloadPlan({
+    state: "revision",
+    context: nextRequestContext,
+  }).shouldPrefill, true);
+});
+
 test("ambiguous retries revalidate exact vendor identity before replaying", () => {
   assert.equal(shouldPreflightVendorEvidenceSubmission({ evidenceOnly: true, submissionUnconfirmed: false }), true);
   assert.equal(shouldPreflightVendorEvidenceSubmission({ evidenceOnly: true, submissionUnconfirmed: true }), true);
@@ -495,4 +652,19 @@ test("ambiguous retries revalidate exact vendor identity before replaying", () =
     expectedContext,
     accessResult: { state: "revision", context: { ...expectedContext, reviewRevision: 7 } },
   }), false);
+
+  for (const mutationStatus of [403, 404, 409]) {
+    assert.equal(vendorEvidencePreflightIdentityMatches(expectedContext, {
+      mutationStatus,
+      context: null,
+    }), false);
+    assert.equal(vendorEvidencePreflightIdentityMatches(expectedContext, {
+      mutationStatus,
+      context: { ...expectedContext, vendorId: "vendor-2" },
+    }), false);
+    assert.equal(vendorEvidencePreflightIdentityMatches(expectedContext, {
+      mutationStatus,
+      context: { ...expectedContext },
+    }), true);
+  }
 });

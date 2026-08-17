@@ -324,12 +324,13 @@ test("CORS preflight reflects only configured origins and supports credentials",
   const app = buildApp();
   const env = { ...environment(), ALLOWED_ORIGINS: "https://app.example.test" };
   const response = await app.request(
-    "https://api.example.test/api/v1/auth/me",
+    "https://api.example.test/api/v1/vendors/onboarding/evidence",
     {
       method: "OPTIONS",
       headers: {
         origin: "https://app.example.test",
-        "access-control-request-method": "GET",
+        "access-control-request-method": "PUT",
+        "access-control-request-headers": "x-melaiva-vendor-evidence, cloudflare-workers-version-key",
       },
     },
     env,
@@ -338,6 +339,8 @@ test("CORS preflight reflects only configured origins and supports credentials",
   assert.equal(response.status, 204);
   assert.equal(response.headers.get("access-control-allow-origin"), "https://app.example.test");
   assert.equal(response.headers.get("access-control-allow-credentials"), "true");
+  assert.match(response.headers.get("access-control-allow-headers"), /X-Melaiva-Vendor-Evidence/u);
+  assert.match(response.headers.get("access-control-allow-headers"), /Cloudflare-Workers-Version-Key/u);
   assert.match(response.headers.get("vary"), /Origin/);
 });
 

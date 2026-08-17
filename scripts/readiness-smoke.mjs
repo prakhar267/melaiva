@@ -5,9 +5,48 @@ if (!baseUrl.startsWith("https://")) {
   throw new Error("Set MELAIVA_SMOKE_BASE_URL to the deployed HTTPS origin.");
 }
 
+function parsePositiveInteger(value, name) {
+  if (!/^[1-9][0-9]*$/u.test(value || "")) {
+    throw new Error(`${name} must be a positive integer.`);
+  }
+  const parsed = Number(value);
+  if (!Number.isSafeInteger(parsed)) throw new Error(`${name} is outside the supported range.`);
+  return parsed;
+}
+
+const expectedRevisionInput = (process.env.MELAIVA_SMOKE_EXPECTED_EVIDENCE_REVISION || "").trim();
+const minimumRevisionInput = (process.env.MELAIVA_SMOKE_MINIMUM_EVIDENCE_REVISION || "").trim();
+if (expectedRevisionInput && minimumRevisionInput) {
+  throw new Error("Set only one evidence revision expectation.");
+}
+const expectedEvidenceRevision = expectedRevisionInput
+  ? parsePositiveInteger(expectedRevisionInput, "MELAIVA_SMOKE_EXPECTED_EVIDENCE_REVISION")
+  : minimumRevisionInput
+    ? null
+    : 5;
+const minimumEvidenceRevision = minimumRevisionInput
+  ? parsePositiveInteger(minimumRevisionInput, "MELAIVA_SMOKE_MINIMUM_EVIDENCE_REVISION")
+  : null;
+
+const workerVersionOverride = (process.env.MELAIVA_SMOKE_WORKER_VERSION_OVERRIDE || "").trim();
+const workerName = (process.env.MELAIVA_SMOKE_WORKER_NAME || "").trim();
+if (Boolean(workerVersionOverride) !== Boolean(workerName)) {
+  throw new Error("Set both MELAIVA_SMOKE_WORKER_VERSION_OVERRIDE and MELAIVA_SMOKE_WORKER_NAME.");
+}
+if (workerVersionOverride && !/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/iu.test(workerVersionOverride)) {
+  throw new Error("MELAIVA_SMOKE_WORKER_VERSION_OVERRIDE must be a Worker version UUID.");
+}
+if (workerName && !/^[a-z0-9][a-z0-9-]{0,62}$/u.test(workerName)) {
+  throw new Error("MELAIVA_SMOKE_WORKER_NAME is invalid.");
+}
+
+const versionOverrideHeaders = workerVersionOverride
+  ? { "Cloudflare-Workers-Version-Overrides": `${workerName}="${workerVersionOverride}"` }
+  : {};
+
 async function request(path, { accept = "application/json" } = {}) {
   const response = await fetch(`${baseUrl}${path}`, {
-    headers: { Accept: accept },
+    headers: { Accept: accept, ...versionOverrideHeaders },
     redirect: "error",
     signal: AbortSignal.timeout(20_000),
   });
@@ -27,8 +66,14 @@ if (health?.data?.status !== "ok" || health?.data?.database !== "ok" || health?.
 
 const authConfigResponse = await request("/api/v1/auth/config");
 const authConfig = JSON.parse(authConfigResponse.body);
-if (authConfig?.data?.vendorApplicationEvidenceRevision !== 4) {
-  throw new Error("Vendor application evidence capability is unavailable or at the wrong revision.");
+const evidenceRevision = authConfig?.data?.vendorApplicationEvidenceRevision;
+if (!Number.isSafeInteger(evidenceRevision)
+  || (expectedEvidenceRevision !== null && evidenceRevision !== expectedEvidenceRevision)
+  || (minimumEvidenceRevision !== null && evidenceRevision < minimumEvidenceRevision)) {
+  const expectation = expectedEvidenceRevision !== null
+    ? `exactly revision ${expectedEvidenceRevision}`
+    : `at least revision ${minimumEvidenceRevision}`;
+  throw new Error(`Vendor application evidence capability must be ${expectation}.`);
 }
 
 const catalogResponse = await request("/api/v1/catalog/vendors?limit=1");
@@ -53,7 +98,7 @@ console.log(JSON.stringify({
   services: {
     database: health.data.database,
     authentication: health.data.authentication,
-    vendorApplicationEvidence: "revision-4",
+    vendorApplicationEvidence: `revision-${evidenceRevision}`,
     catalog: "ok",
     applicationShell: "ok",
   },

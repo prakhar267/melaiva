@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { readFile } from "node:fs/promises";
+import { readdir, readFile } from "node:fs/promises";
 import path from "node:path";
 import test from "node:test";
 import { fileURLToPath } from "node:url";
@@ -9,6 +9,25 @@ const workflowPath = path.join(root, ".github", "workflows", "deploy.yml");
 
 async function read(relativePath) {
   return readFile(path.join(root, relativePath), "utf8");
+}
+
+async function findFiles(relativeDirectory, predicate) {
+  const ignoredDirectories = new Set([".git", "artifacts", "dist", "node_modules"]);
+  const matches = [];
+
+  async function visit(directory) {
+    for (const entry of await readdir(path.join(root, directory), { withFileTypes: true })) {
+      const relativePath = path.join(directory, entry.name);
+      if (entry.isDirectory()) {
+        if (!ignoredDirectories.has(entry.name)) await visit(relativePath);
+      } else if (entry.isFile() && predicate(relativePath)) {
+        matches.push(relativePath);
+      }
+    }
+  }
+
+  await visit(relativeDirectory);
+  return matches.sort();
 }
 
 test("hosted production release is a read-only validation that fails closed", async () => {
@@ -38,16 +57,30 @@ test("hosted production release is a read-only validation that fails closed", as
 });
 
 test("no workflow or package shortcut can bypass the local production release gates", async () => {
-  const [ciWorkflow, monitorWorkflow, workerPackage, workerReadme] = await Promise.all([
-    read(".github/workflows/ci.yml"),
-    read(".github/workflows/monitor-production.yml"),
-    read("workers/app/package.json"),
+  const [workflowPaths, packagePaths, workerReadme] = await Promise.all([
+    findFiles(".github/workflows", (file) => /\.ya?ml$/u.test(file)),
+    findFiles(".", (file) => path.basename(file) === "package.json"),
     read("workers/app/README.md"),
   ]);
-  const allWorkflows = [await read(".github/workflows/deploy.yml"), ciWorkflow, monitorWorkflow].join("\n");
-  const scripts = JSON.parse(workerPackage).scripts;
+  const [workflowSources, packageSources] = await Promise.all([
+    Promise.all(workflowPaths.map(read)),
+    Promise.all(packagePaths.map(read)),
+  ]);
+  const allWorkflows = workflowSources.join("\n");
 
-  assert.equal(scripts.deploy, undefined);
+  assert.ok(workflowPaths.length >= 3, workflowPaths.join("\n"));
+  assert.ok(packagePaths.includes("package.json"));
+  assert.ok(packagePaths.includes(path.join("workers", "app", "package.json")));
+  for (let index = 0; index < packagePaths.length; index += 1) {
+    const scripts = JSON.parse(packageSources[index]).scripts || {};
+    for (const [name, command] of Object.entries(scripts)) {
+      assert.doesNotMatch(
+        command,
+        /wrangler (?:deploy\b|versions (?:upload|deploy)\b)|git (?:push|update-ref)|api\.cloudflare\.com[^\n]*\/deployments/u,
+        `${packagePaths[index]} script ${name} can mutate a release`,
+      );
+    }
+  }
   assert.doesNotMatch(workerReadme, /npm run deploy/u);
   assert.doesNotMatch(allWorkflows, /api\.cloudflare\.com[^\n]*\/deployments/u);
   assert.doesNotMatch(allWorkflows, /git (?:push|update-ref)/u);

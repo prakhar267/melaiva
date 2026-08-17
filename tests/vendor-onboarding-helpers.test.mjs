@@ -17,6 +17,7 @@ import {
   vendorEvidenceConflictState,
   vendorEvidenceContextRefreshDecision,
   vendorEvidenceContextsMatch,
+  vendorEvidencePreflightIdentityMatches,
   vendorEvidencePreflightMatches,
 } from "../src/components/vendorOnboarding.js";
 import {
@@ -461,6 +462,11 @@ test("ambiguous retries revalidate exact vendor identity before replaying", () =
     informationRequestRevision: 2,
     currentInformationRequest: { revision: 2 },
   };
+  assert.equal(vendorEvidencePreflightIdentityMatches(expectedContext, { context: { ...expectedContext } }), true);
+  assert.equal(vendorEvidencePreflightIdentityMatches(expectedContext, { context: null }), false);
+  assert.equal(vendorEvidencePreflightIdentityMatches(expectedContext, {
+    context: { ...expectedContext, vendorId: "vendor-2" },
+  }), false);
   assert.equal(vendorEvidencePreflightMatches({
     expectedContext,
     accessResult: { state: "complete", context: { ...expectedContext, reviewRevision: 7 } },

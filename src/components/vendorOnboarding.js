@@ -256,16 +256,19 @@ export function vendorEvidenceContextsMatch(expected, current) {
     && (expected.currentInformationRequest?.revision || 0) === (current.currentInformationRequest?.revision || 0);
 }
 
+export function vendorEvidencePreflightIdentityMatches(expectedContext, accessResult) {
+  return Boolean(
+    expectedContext?.vendorId
+    && accessResult?.context?.vendorId === expectedContext.vendorId,
+  );
+}
+
 export function vendorEvidencePreflightMatches({
   expectedContext,
   accessResult,
   submissionUnconfirmed = false,
 } = {}) {
-  const sameVendor = Boolean(
-    expectedContext?.vendorId
-    && accessResult?.context?.vendorId === expectedContext.vendorId,
-  );
-  if (!sameVendor) return false;
+  if (!vendorEvidencePreflightIdentityMatches(expectedContext, accessResult)) return false;
   if (submissionUnconfirmed) return true;
   return ["eligible", "revision"].includes(accessResult.state)
     && vendorEvidenceContextsMatch(expectedContext, accessResult.context);

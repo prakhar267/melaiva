@@ -56,6 +56,7 @@ import {
   vendorEvidenceCompletionEligibility,
   vendorEvidenceConflictState,
   vendorEvidenceContextRefreshDecision,
+  vendorEvidencePreflightIdentityMatches,
   vendorEvidencePreflightMatches,
   vendorEvidenceFieldRequested,
   vendorEvidenceServerFieldErrors,
@@ -635,6 +636,7 @@ function createVendorOnboardingForm() {
 async function readVendorEvidenceCompletionAccess({ signal } = {}) {
   const response = await fetch("/api/v1/vendors/onboarding/evidence", { cache: "no-store", credentials: "include", signal });
   if (response.status === 401) return { state: "guest", vendorStatus: null, context: null };
+  if (response.status === 403) return { state: "status_unavailable", vendorStatus: null, context: null };
   if (response.status === 404) return { state: "no_application", vendorStatus: null, context: null };
   const payload = await readApiResponse(response, "Application eligibility could not be checked.");
   const context = normalizeVendorEvidenceContext(payload);
@@ -968,6 +970,22 @@ export function VendorOnboardingPage({ notify, onOpenAuth, authRevision = 0 }) {
       if (shouldPreflightVendorEvidenceSubmission({ evidenceOnly, submissionUnconfirmed: retryingUnconfirmedSubmission })) {
         const accessResult = await readVendorEvidenceCompletionAccess();
         if (!submissionIsCurrent()) return;
+        if (!vendorEvidencePreflightIdentityMatches(expectedContext, accessResult)) {
+          clearPrivateEvidenceDraft();
+          setEvidenceAccess(accessResult.state);
+          setEvidenceVendorStatus(accessResult.vendorStatus);
+          if (accessResult.context) {
+            evidenceContextRef.current = accessResult.context;
+            setEvidenceContext(accessResult.context);
+            if (["eligible", "revision"].includes(accessResult.state)) {
+              setForm((current) => ({ ...current, ...prefillVendorEvidence(accessResult.context) }));
+              formInitializedRef.current = true;
+              loadedVendorIdRef.current = accessResult.context.vendorId;
+            }
+          }
+          if (accessResult.state === "guest") onOpenAuth();
+          return;
+        }
         if (!vendorEvidencePreflightMatches({
           expectedContext,
           accessResult,
@@ -983,6 +1001,13 @@ export function VendorOnboardingPage({ notify, onOpenAuth, authRevision = 0 }) {
       submissionStarted = true;
       const response = await fetch(evidenceOnly ? "/api/v1/vendors/onboarding/evidence" : "/api/v1/vendors/onboarding", { method: evidenceOnly ? "PUT" : "POST", headers: { "Content-Type": "application/json", "Idempotency-Key": submissionKey }, credentials: "include", body: JSON.stringify(payload) });
       if (!submissionIsCurrent()) return;
+      if (response.status === 401 && evidenceOnly) {
+        clearPrivateEvidenceDraft();
+        setEvidenceAccess("guest");
+        setEvidenceVendorStatus(null);
+        onOpenAuth();
+        return;
+      }
       if (response.status === 401) { onOpenAuth(); throw Object.assign(new Error("Sign in or create an account, then submit this form again."), { code: "SIGN_IN" }); }
       const responsePayload = await readApiResponse(response, "The application could not be submitted.");
       if (!submissionIsCurrent()) return;
@@ -1060,7 +1085,7 @@ export function VendorOnboardingPage({ notify, onOpenAuth, authRevision = 0 }) {
   if (evidenceOnly && evidenceAccess === "guest") return <OnboardingGate icon={LockKeyhole} eyebrow="Private application record" title="Sign in to complete application evidence" message="Evidence can be attached only to your own pending or declined partner application. Private evidence from an unverified session is cleared and nothing was submitted."><button className="button button--primary" type="button" onClick={onOpenAuth}>Sign in</button><Link className="button button--outline" to="/vendor">Return to vendor workspace</Link></OnboardingGate>;
   if (evidenceOnly && evidenceAccess === "no_application") return <OnboardingGate icon={Store} eyebrow="No partner application found" title="Start a partner application first" message="This account has no vendor application that can receive an evidence snapshot."><Link className="button button--primary" to="/vendor/onboarding">Start application</Link><Link className="button button--outline" to="/vendor">Return to vendor workspace</Link></OnboardingGate>;
   if (evidenceOnly && evidenceAccess === "complete") return <OnboardingGate icon={FileCheck2} eyebrow="Evidence already submitted" title="No evidence update is currently open" message="Your latest structured evidence is already with the partner team. Another revision can be submitted only when the partner team opens a specific information request."><Link className="button button--primary" to="/vendor">Check application status</Link></OnboardingGate>;
-  if (evidenceOnly && evidenceAccess === "status_unavailable") return <OnboardingGate icon={ShieldAlert} eyebrow="Evidence update unavailable" title="This application cannot add evidence in its current state" message={`Evidence updates are available for an incomplete application or an open information request. This application is ${evidenceVendorStatus || "in an unknown review state"}; any entries already made remain in this tab and nothing was submitted.`}><Link className="button button--primary" to="/vendor">Open vendor workspace</Link></OnboardingGate>;
+  if (evidenceOnly && evidenceAccess === "status_unavailable") return <OnboardingGate icon={ShieldAlert} eyebrow="Evidence update unavailable" title="This application cannot add evidence in its current state" message={evidenceVendorStatus ? `Evidence updates are available for an incomplete application or an open information request. This application is ${evidenceVendorStatus}; any entries already made remain in this tab and nothing was submitted.` : "This session could not prove an active vendor account, so private entries were cleared and nothing was submitted."}><Link className="button button--primary" to="/vendor">Open vendor workspace</Link></OnboardingGate>;
   if (evidenceOnly && evidenceAccess === "error") return <OnboardingGate icon={CircleAlert} eyebrow="Eligibility check unavailable" title="This application could not be checked" message="No evidence was submitted. Private entries are retained only while this account can be verified; retry the read-only eligibility check when the service is available."><button className="button button--primary" type="button" onClick={() => setEvidenceAccessRetryKey((value) => value + 1)}><RefreshCw size={16} /> Try again</button><Link className="button button--outline" to="/vendor">Return to vendor workspace</Link></OnboardingGate>;
   return (
     <div className="onboarding-page page-surface">

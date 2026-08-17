@@ -32,6 +32,7 @@ import { createIdempotencyKey, readApiResponse } from "../api.js";
 import { BookingMessages } from "../components/BookingMessages.jsx";
 import { formatUnreadMessageCount, targetScrollLeftForControl } from "../components/bookingMessages.js";
 import { useBookingInbox } from "../components/useBookingInbox.js";
+import { normalizeEligibleVendorCount } from "../components/requestCoverage.js";
 
 const budgetRows = [
   { name: "Venue & stay", allocated: 900000, committed: 710000, tone: "aubergine" },
@@ -233,15 +234,21 @@ function RequestSelector({ auctions, selectedId, onSelect }) {
     <section className="live-request-list" aria-label="Your celebration requests">
       <div className="live-section-heading"><div><div className="eyebrow">Your requests</div><h2>Briefs in motion</h2></div><Link className="button button--small button--outline" to="/request"><Plus size={15} /> New request</Link></div>
       <div className="live-request-list__items">
-        {auctions.map((auction) => (
-          <button type="button" key={auction.id} className={`live-request-card ${selectedId === auction.id ? "is-selected" : ""}`} onClick={() => onSelect(auction.id)} aria-pressed={selectedId === auction.id}>
-            <span className={`status-pill status-pill--${auction.status === "open" ? "teal" : "neutral"}`}><span /> {auction.status}</span>
+        {auctions.map((auction) => {
+          const eligibleVendorCount = normalizeEligibleVendorCount(auction.eligibleVendorCount);
+          const acceptingResponses = auction.status === "open" && new Date(auction.biddingEndsAt).getTime() > Date.now();
+          const statusLabel = auction.status === "open" && !acceptingResponses ? "window ended" : auction.status;
+          return <button type="button" key={auction.id} className={`live-request-card ${selectedId === auction.id ? "is-selected" : ""}`} onClick={() => onSelect(auction.id)} aria-pressed={selectedId === auction.id}>
+            <span className={`status-pill status-pill--${acceptingResponses ? "teal" : "neutral"}`}><span /> {statusLabel}</span>
             <strong>{auction.title}</strong>
             {auction.preferredVendor && <small className="live-request-card__preferred"><Sparkles size={13} /> Preferred · {auction.preferredVendor.businessName}</small>}
             <small><MapPin size={13} /> {auction.city} · {formatDate(auction.eventDate)}</small>
+            {!acceptingResponses && auction.status === "open"
+              ? <small className="live-request-card__coverage"><Clock3 size={13} /> Offer window ended</small>
+              : acceptingResponses && eligibleVendorCount !== null && <small className={eligibleVendorCount === 0 ? "live-request-card__coverage live-request-card__coverage--empty" : "live-request-card__coverage"}>{eligibleVendorCount === 0 ? <CircleAlert size={13} /> : <Users size={13} />}{eligibleVendorCount === 0 ? "No reviewed partners currently match" : `${eligibleVendorCount} reviewed partner${eligibleVendorCount === 1 ? "" : "s"} currently match`}</small>}
             <span>{auction.bidCount} offer{auction.bidCount === 1 ? "" : "s"} received <ArrowRight size={14} /></span>
-          </button>
-        ))}
+          </button>;
+        })}
       </div>
     </section>
   );
@@ -249,9 +256,11 @@ function RequestSelector({ auctions, selectedId, onSelect }) {
 
 function LiveRequestSummary({ auction }) {
   if (!auction) return null;
+  const acceptingResponses = auction.status === "open" && new Date(auction.biddingEndsAt).getTime() > Date.now();
+  const statusLabel = auction.status === "open" && !acceptingResponses ? "window ended" : auction.status;
   return (
     <section className="dashboard-card live-request-summary">
-      <div className="dashboard-card__heading"><div><span className="card-icon"><CalendarDays size={18} /></span><div><h2>{auction.title}</h2><p>Reference {auction.id.slice(0, 8).toUpperCase()}</p></div></div><span className={`status-pill status-pill--${auction.status === "open" ? "teal" : "neutral"}`}><span /> {auction.status}</span></div>
+      <div className="dashboard-card__heading"><div><span className="card-icon"><CalendarDays size={18} /></span><div><h2>{auction.title}</h2><p>Reference {auction.id.slice(0, 8).toUpperCase()}</p></div></div><span className={`status-pill status-pill--${acceptingResponses ? "teal" : "neutral"}`}><span /> {statusLabel}</span></div>
       <div className="live-request-summary__facts">
         <div><small>Celebration</small><strong>{formatDate(auction.eventDate)}</strong></div>
         <div><small>Destination</small><strong>{auction.city}</strong></div>
@@ -261,7 +270,7 @@ function LiveRequestSummary({ auction }) {
       <PreferredVendorSummary vendor={auction.preferredVendor} />
       <div className="live-request-summary__services"><small>Services requested</small><div>{auction.categories.map((category) => <span key={category}>{categoryName(category)}</span>)}</div></div>
       <div className="live-request-summary__brief"><small>Your brief</small><p>{auction.requirements}</p></div>
-      <p className="live-request-summary__close"><Clock3 size={15} /> Offer window {auction.status === "open" ? `closes ${formatDate(auction.biddingEndsAt, { hour: "numeric", minute: "2-digit" })}` : `is ${auction.status}`}.</p>
+      <p className="live-request-summary__close"><Clock3 size={15} /> Offer window {acceptingResponses ? `closes ${formatDate(auction.biddingEndsAt, { hour: "numeric", minute: "2-digit" })}` : auction.status === "open" ? `ended ${formatDate(auction.biddingEndsAt, { hour: "numeric", minute: "2-digit" })}` : `is ${auction.status}`}.</p>
     </section>
   );
 }
@@ -269,25 +278,37 @@ function LiveRequestSummary({ auction }) {
 function SealedOffersState({ auction, closing, onRequestClose }) {
   const offerCount = Number(auction.bidCount || 0);
   const hasOffers = offerCount > 0;
+  const acceptingResponses = auction.status === "open" && new Date(auction.biddingEndsAt).getTime() > Date.now();
+  const eligibleVendorCount = normalizeEligibleVendorCount(auction.eligibleVendorCount);
+  const noCurrentCoverage = acceptingResponses && !hasOffers && eligibleVendorCount === 0;
+  const coverageUnknown = acceptingResponses && !hasOffers && eligibleVendorCount === null;
+  const StatusIcon = !acceptingResponses ? Clock3 : noCurrentCoverage ? CircleAlert : LockKeyhole;
   return (
-    <section className="dashboard-card sealed-offers-state" aria-labelledby="sealed-offers-title">
-      <span className="sealed-offers-state__icon"><LockKeyhole size={28} /></span>
-      <div className="eyebrow">Private until you are ready</div>
-      <h2 id="sealed-offers-title">{hasOffers ? `${offerCount} sealed offer${offerCount === 1 ? " is" : "s are"} waiting` : "Your offer window is open"}</h2>
+    <section className={`dashboard-card sealed-offers-state ${noCurrentCoverage ? "sealed-offers-state--no-coverage" : ""}`} aria-labelledby="sealed-offers-title">
+      <span className="sealed-offers-state__icon"><StatusIcon size={28} /></span>
+      <div className="eyebrow">{!acceptingResponses ? "Response window ended" : noCurrentCoverage ? "Live coverage gap" : "Private until you are ready"}</div>
+      <h2 id="sealed-offers-title">{!acceptingResponses ? "Finalize the window to continue" : hasOffers ? `${offerCount} sealed offer${offerCount === 1 ? " is" : "s are"} waiting` : noCurrentCoverage ? "No reviewed partner is currently eligible" : "Your offer window is open"}</h2>
       <p>
-        {hasOffers
+        {!acceptingResponses
+          ? `No new partner can respond. Finalize this request to ${hasOffers ? `reveal and compare ${offerCount} sealed offer${offerCount === 1 ? "" : "s"}` : "confirm that no offers were received"}.`
+          : hasOffers
           ? "Partner names, pricing and proposals stay hidden from everyone else until you close the window and compare them together."
-          : "Approved partners can still respond. Their names, pricing and proposals remain private until this window closes."}
+          : noCurrentCoverage
+            ? "This request remains open, but no response is currently expected. Coverage can change if a matching partner is approved before the window closes; Melaiva does not send coverage notifications yet."
+            : coverageUnknown
+              ? "Live partner coverage could not be confirmed. A response is not guaranteed; check this dashboard again before the window closes."
+              : `${eligibleVendorCount} reviewed partner${eligibleVendorCount === 1 ? " currently matches" : "s currently match"} this brief. They can decide whether to respond, and every offer remains sealed.`}
       </p>
       <dl className="sealed-offers-state__facts">
         <div><dt>Offers received</dt><dd>{offerCount}</dd></div>
+        <div><dt>Currently eligible</dt><dd>{acceptingResponses ? eligibleVendorCount === null ? "Not confirmed" : eligibleVendorCount : "Window ended"}</dd></div>
         <div><dt>Scheduled close</dt><dd>{formatDate(auction.biddingEndsAt, { hour: "numeric", minute: "2-digit" })}</dd></div>
       </dl>
       <button className={`button ${hasOffers ? "button--primary" : "button--outline"}`} type="button" aria-haspopup="dialog" disabled={closing} onClick={() => onRequestClose(auction.id)}>
         {closing ? <span className="button-loader" aria-hidden="true" /> : <FileText size={17} />}
-        {closing ? "Closing securely…" : hasOffers ? `Close window and compare ${offerCount}` : "Close offer window early"}
+        {closing ? acceptingResponses ? "Closing securely…" : "Finalizing securely…" : !acceptingResponses ? hasOffers ? `Finalize and compare ${offerCount}` : "Finalize offer window" : hasOffers ? `Close window and compare ${offerCount}` : "Close offer window early"}
       </button>
-      <small><ShieldCheck size={14} /> Closing stops new proposals and cannot be undone.</small>
+      <small><ShieldCheck size={14} /> {acceptingResponses ? "Closing stops new proposals and cannot be undone." : "Finalizing confirms the ended response window and cannot be undone."}</small>
     </section>
   );
 }
@@ -297,6 +318,7 @@ function CloseOfferWindowDialog({ auction, open, closing, onClose, onConfirm }) 
   const onCloseRef = useRef(onClose);
   const closingRef = useRef(closing);
   const titleId = useId();
+  const descriptionId = useId();
   const offerCount = Number(auction?.bidCount || 0);
 
   useEffect(() => {
@@ -346,26 +368,31 @@ function CloseOfferWindowDialog({ auction, open, closing, onClose, onConfirm }) 
 
   if (!open || !auction) return null;
   const hasOffers = offerCount > 0;
+  const acceptingResponses = auction.status === "open" && new Date(auction.biddingEndsAt).getTime() > Date.now();
   return (
     <div className="modal-backdrop" onMouseDown={(event) => event.target === event.currentTarget && !closing && onClose()}>
-      <section className="modal-card close-offer-dialog" role="dialog" aria-modal="true" aria-labelledby={titleId} ref={dialogRef} tabIndex="-1">
-        <button className="icon-button modal-card__close" type="button" onClick={onClose} disabled={closing} aria-label="Keep offer window open" data-dialog-initial-focus="true"><X size={20} /></button>
+      <section className="modal-card close-offer-dialog" role="dialog" aria-modal="true" aria-labelledby={titleId} aria-describedby={descriptionId} ref={dialogRef} tabIndex="-1">
+        <button className="icon-button modal-card__close" type="button" onClick={onClose} disabled={closing} aria-label={acceptingResponses ? "Keep offer window open" : "Review finalization later"} data-dialog-initial-focus="true"><X size={20} /></button>
         <span className={`close-offer-dialog__icon ${hasOffers ? "" : "close-offer-dialog__icon--warning"}`}><LockKeyhole size={26} /></span>
         <div className="eyebrow">Final window decision</div>
-        <h2 id={titleId}>{hasOffers ? `Reveal ${offerCount} sealed offer${offerCount === 1 ? "" : "s"}?` : "Close without any offers?"}</h2>
-        <p>
-          {hasOffers
-            ? "Closing now stops new proposals and reveals every partner, price and scope together for a private comparison."
-            : "No offers have arrived yet. Closing now stops every new proposal and leaves this request without options to compare."}
+        <h2 id={titleId}>{hasOffers ? `Reveal ${offerCount} sealed offer${offerCount === 1 ? "" : "s"}?` : acceptingResponses ? "Close without any offers?" : "Finalize without any offers?"}</h2>
+        <p id={descriptionId}>
+          {!acceptingResponses
+            ? hasOffers
+              ? "The response window has already ended. Finalizing now reveals every partner, price and scope together for a private comparison."
+              : "The response window has already ended and no offers arrived. Finalizing confirms the outcome so this request can move out of its open state."
+            : hasOffers
+              ? "Closing now stops new proposals and reveals every partner, price and scope together for a private comparison."
+              : "No offers have arrived yet. Closing now stops every new proposal and leaves this request without options to compare."}
         </p>
         <dl>
           <div><dt>Request</dt><dd>{auction.title}</dd></div>
-          <div><dt>Scheduled close</dt><dd>{formatDate(auction.biddingEndsAt, { hour: "numeric", minute: "2-digit" })}</dd></div>
+          <div><dt>{acceptingResponses ? "Scheduled close" : "Response window ended"}</dt><dd>{formatDate(auction.biddingEndsAt, { hour: "numeric", minute: "2-digit" })}</dd></div>
         </dl>
-        <div className="close-offer-dialog__warning"><CircleAlert size={17} /><span>This window cannot be reopened after you close it.</span></div>
+        <div className="close-offer-dialog__warning"><CircleAlert size={17} /><span>{acceptingResponses ? "This window cannot be reopened after you close it." : "Finalizing this ended window cannot be undone."}</span></div>
         <div className="close-offer-dialog__actions">
-          <button className="button button--outline" type="button" onClick={onClose} disabled={closing}>Keep window open</button>
-          <button className="button button--primary" type="button" onClick={onConfirm} disabled={closing}>{closing ? <span className="button-loader" aria-hidden="true" /> : <FileText size={17} />}{closing ? "Closing securely…" : hasOffers ? "Close and compare" : "Close without offers"}</button>
+          <button className="button button--outline" type="button" onClick={onClose} disabled={closing}>{acceptingResponses ? "Keep window open" : "Review later"}</button>
+          <button className="button button--primary" type="button" onClick={onConfirm} disabled={closing}>{closing ? <span className="button-loader" aria-hidden="true" /> : <FileText size={17} />}{closing ? acceptingResponses ? "Closing securely…" : "Finalizing securely…" : acceptingResponses ? hasOffers ? "Close and compare" : "Close without offers" : hasOffers ? "Finalize and compare" : "Finalize without offers"}</button>
         </div>
       </section>
     </div>
@@ -627,6 +654,7 @@ export function DashboardPage({ notify, onOpenAuth, authRevision = 0 }) {
   const [refreshKey, setRefreshKey] = useState(0);
   const [messageBookingId, setMessageBookingId] = useState(null);
   const [messageFocusRequest, setMessageFocusRequest] = useState(null);
+  const [, setCoverageClock] = useState(() => Date.now());
   const bookingInbox = useBookingInbox({ audience: "owner", enabled: mode === "live" });
   const messageFocusSequence = useRef(0);
   const bidAcceptanceKeys = useRef(new Map());
@@ -634,6 +662,12 @@ export function DashboardPage({ notify, onOpenAuth, authRevision = 0 }) {
   const bidsAuctionIdRef = useRef(bidsAuctionId);
   selectedIdRef.current = selectedId;
   bidsAuctionIdRef.current = bidsAuctionId;
+
+  useEffect(() => {
+    if (mode !== "live") return undefined;
+    const timer = window.setInterval(() => setCoverageClock(Date.now()), 30_000);
+    return () => window.clearInterval(timer);
+  }, [mode]);
 
   useEffect(() => {
     const controller = new AbortController();

@@ -451,6 +451,7 @@ const VENDOR_STATUSES = Object.freeze(["pending", "approved", "rejected", "suspe
 const ADMIN_VENDOR_STATUSES = Object.freeze([...VENDOR_STATUSES, "needs_information"]);
 const VENDOR_APPLICATION_EVIDENCE_REVISION = 5;
 const VENDOR_APPLICATION_EVIDENCE_HEADER = "X-Melaiva-Vendor-Evidence";
+const EXPECTED_REQUEST_OWNER_HEADER = "X-Melaiva-Expected-User-Id";
 const ADMIN_VENDOR_SUMMARY_CONTRACT = "vendor-summary-v2";
 const ADMIN_VENDOR_SUMMARY_HEADER = "X-Melaiva-Admin-Vendor-Summary";
 const VENDOR_EVIDENCE_REQUIRED_TRIGGERS = Object.freeze([
@@ -1200,8 +1201,10 @@ function safeJsonArray(value) {
   }
 }
 
-function vendorMatchesAuction(vendor, auction) {
+function vendorMatchesAuction(vendor, auction, { excludedUserId = null, requireActiveOwner = false } = {}) {
   if (!vendor || vendor.status !== "approved") return false;
+  if (requireActiveOwner && (!vendor.user_id || vendor.owner_status !== "active")) return false;
+  if (excludedUserId && vendor.user_id === excludedUserId) return false;
   const vendorCategories = new Set(
     [vendor.category, ...safeJsonArray(vendor.categories_json)]
       .filter(Boolean)
@@ -1239,6 +1242,13 @@ const VENDOR_AUCTION_MATCH_SQL = `EXISTS (
 )`;
 
 const PREFERRED_VENDOR_ELIGIBILITY_SQL = `preferred_vendor.status = 'approved'
+  AND preferred_vendor.user_id IS NOT NULL
+  AND preferred_vendor.user_id != ?
+  AND EXISTS (
+    SELECT 1 FROM users preferred_owner
+    WHERE preferred_owner.id = preferred_vendor.user_id
+      AND preferred_owner.status = 'active'
+  )
   AND (
     LOWER(TRIM(preferred_vendor.city)) = LOWER(TRIM(?))
     OR EXISTS (
@@ -1255,6 +1265,65 @@ const PREFERRED_VENDOR_ELIGIBILITY_SQL = `preferred_vendor.status = 'approved'
               LOWER(TRIM(CAST(requested_category.value AS TEXT)))
       )
   )`;
+
+const ELIGIBLE_VENDOR_COUNT_FOR_AUCTION_SQL = `CASE
+  WHEN a.status = 'open' AND julianday(a.bidding_ends_at) > julianday('now')
+  THEN (SELECT COUNT(*)
+  FROM vendors eligible_vendor
+  JOIN users eligible_owner
+    ON eligible_owner.id = eligible_vendor.user_id
+   AND eligible_owner.status = 'active'
+  WHERE eligible_vendor.status = 'approved'
+    AND eligible_vendor.user_id != a.couple_user_id
+    AND (
+      LOWER(TRIM(eligible_vendor.city)) = LOWER(TRIM(a.city))
+      OR EXISTS (
+        SELECT 1 FROM json_each(eligible_vendor.service_areas_json) service_area
+        WHERE LOWER(TRIM(CAST(service_area.value AS TEXT))) = LOWER(TRIM(a.city))
+      )
+    )
+    AND EXISTS (
+      SELECT 1 FROM json_each(a.categories_json) auction_category
+      WHERE LOWER(TRIM(CAST(auction_category.value AS TEXT))) = LOWER(TRIM(eligible_vendor.category))
+        OR EXISTS (
+          SELECT 1 FROM json_each(eligible_vendor.categories_json) vendor_category
+          WHERE LOWER(TRIM(CAST(vendor_category.value AS TEXT))) =
+                LOWER(TRIM(CAST(auction_category.value AS TEXT)))
+        )
+    )
+  )
+  ELSE 0
+END`;
+
+async function eligibleVendorCountForRequest(db, { category, city, excludedUserId = null }) {
+  const row = await db
+    .prepare(
+      `SELECT COUNT(*) AS count
+       FROM vendors eligible_vendor
+       JOIN users eligible_owner
+         ON eligible_owner.id = eligible_vendor.user_id
+        AND eligible_owner.status = 'active'
+       WHERE eligible_vendor.status = 'approved'
+         AND (? IS NULL OR eligible_vendor.user_id != ?)
+         AND (
+           LOWER(TRIM(eligible_vendor.city)) = LOWER(TRIM(?))
+           OR EXISTS (
+             SELECT 1 FROM json_each(eligible_vendor.service_areas_json) service_area
+             WHERE LOWER(TRIM(CAST(service_area.value AS TEXT))) = LOWER(TRIM(?))
+           )
+         )
+         AND (
+           LOWER(TRIM(eligible_vendor.category)) = LOWER(TRIM(?))
+           OR EXISTS (
+             SELECT 1 FROM json_each(eligible_vendor.categories_json) vendor_category
+             WHERE LOWER(TRIM(CAST(vendor_category.value AS TEXT))) = LOWER(TRIM(?))
+           )
+         )`,
+    )
+    .bind(excludedUserId, excludedUserId, city, city, category, category)
+    .first();
+  return Math.max(0, Number(row?.count) || 0);
+}
 
 function mapVendor(row) {
   return {
@@ -1536,7 +1605,12 @@ function mapAuction(row, { ownerView = false, vendorView = false } = {}) {
     bidCount: Number(row.bid_count || 0),
     createdAt: row.created_at,
   };
-  if (ownerView) auction.preferredVendor = mapPreferredVendor(row);
+  if (ownerView) {
+    auction.preferredVendor = mapPreferredVendor(row);
+    if (row.eligible_vendor_count !== undefined && row.eligible_vendor_count !== null) {
+      auction.eligibleVendorCount = Math.max(0, Number(row.eligible_vendor_count) || 0);
+    }
+  }
   if (vendorView) {
     auction.directInvite = Boolean(row.direct_invite);
     auction.directInviteStatus = row.direct_invite_status || null;
@@ -2131,7 +2205,7 @@ function buildApp() {
       c.header("Access-Control-Allow-Methods", "GET, HEAD, POST, PUT, PATCH, DELETE, OPTIONS");
       c.header(
         "Access-Control-Allow-Headers",
-        `Content-Type, X-Requested-With, X-Turnstile-Token, Idempotency-Key, Cloudflare-Workers-Version-Key, ${VENDOR_APPLICATION_EVIDENCE_HEADER}, X-Melaiva-Admin-Vendor-Summary`,
+        `Content-Type, X-Requested-With, X-Turnstile-Token, Idempotency-Key, Cloudflare-Workers-Version-Key, ${VENDOR_APPLICATION_EVIDENCE_HEADER}, ${EXPECTED_REQUEST_OWNER_HEADER}, X-Melaiva-Admin-Vendor-Summary`,
       );
       c.header("Access-Control-Max-Age", "86400");
       return c.body(null, 204);
@@ -2332,7 +2406,13 @@ function buildApp() {
     let source = "database";
     try {
       const result = await requireDatabase(c.env)
-        .prepare("SELECT category, COUNT(*) AS count FROM vendors WHERE status = 'approved' GROUP BY category")
+        .prepare(
+          `SELECT vendor.category, COUNT(*) AS count
+           FROM vendors vendor
+           JOIN users owner ON owner.id = vendor.user_id AND owner.status = 'active'
+           WHERE vendor.status = 'approved'
+           GROUP BY vendor.category`,
+        )
         .all();
       counts = new Map();
       for (const row of result.results || []) {
@@ -2352,6 +2432,34 @@ function buildApp() {
     });
   });
 
+  app.get(`${API_PREFIX}/catalog/coverage`, async (c) => {
+    const rawCategory = c.req.query("category")?.trim() || "";
+    const category = canonicalCategory(rawCategory);
+    const city = c.req.query("city")?.trim() || "";
+    const unsafeText = /[\u0000-\u001F\u007F\u202A-\u202E\u2066-\u2069]/u;
+    if (!CATALOG_CATEGORIES.some((item) => item.slug === category)) {
+      throw new ApiError(400, "invalid_filter", "Choose a supported service category");
+    }
+    if (city.length < 2 || city.length > 100 || unsafeText.test(city)) {
+      throw new ApiError(400, "invalid_filter", "Choose a valid city or destination");
+    }
+    const user = await currentUser(c, false);
+    const eligibleVendorCount = await eligibleVendorCountForRequest(requireDatabase(c.env), {
+      category,
+      city,
+      excludedUserId: user?.id || null,
+    });
+    return c.json({
+      data: {
+        category,
+        city,
+        eligibleVendorCount,
+        checkedAt: new Date().toISOString(),
+      },
+      meta: { definition: "approved_category_city" },
+    });
+  });
+
   app.get(`${API_PREFIX}/catalog/vendors`, async (c) => {
     const categoryQuery = c.req.query("category")?.trim().toLowerCase().slice(0, 50);
     const category = categoryQuery ? canonicalCategory(categoryQuery) : undefined;
@@ -2362,29 +2470,33 @@ function buildApp() {
     let vendors;
     let source = "database";
     try {
-      const clauses = ["status = 'approved'"];
+      const clauses = ["vendor.status = 'approved'", "owner.status = 'active'"];
       const binds = [];
       if (category) {
-        clauses.push("(category = ? OR categories_json LIKE ?)");
+        clauses.push("(vendor.category = ? OR vendor.categories_json LIKE ?)");
         binds.push(category, likePattern(category, { quoted: true }));
       }
       if (city) {
-        clauses.push("(LOWER(city) LIKE ? OR LOWER(service_areas_json) LIKE ?)");
+        clauses.push("(LOWER(vendor.city) LIKE ? OR LOWER(vendor.service_areas_json) LIKE ?)");
         const cityTerm = likePattern(city);
         binds.push(cityTerm, cityTerm);
       }
       if (search) {
-        clauses.push("(LOWER(business_name) LIKE ? OR LOWER(description) LIKE ?)");
+        clauses.push("(LOWER(vendor.business_name) LIKE ? OR LOWER(vendor.description) LIKE ?)");
         const term = likePattern(search);
         binds.push(term, term);
       }
       binds.push(limit, (page - 1) * limit);
       const result = await requireDatabase(c.env)
         .prepare(
-          `SELECT id, slug, business_name, category, categories_json, city, service_areas_json, description,
-                  min_budget, max_budget, currency, rating, review_count, image_url, verified
-           FROM vendors WHERE ${clauses.join(" AND ")}
-           ORDER BY verified DESC, rating DESC, review_count DESC
+          `SELECT vendor.id, vendor.slug, vendor.business_name, vendor.category, vendor.categories_json,
+                  vendor.city, vendor.service_areas_json, vendor.description, vendor.min_budget,
+                  vendor.max_budget, vendor.currency, vendor.rating, vendor.review_count,
+                  vendor.image_url, vendor.verified
+           FROM vendors vendor
+           JOIN users owner ON owner.id = vendor.user_id
+           WHERE ${clauses.join(" AND ")}
+           ORDER BY vendor.verified DESC, vendor.rating DESC, vendor.review_count DESC
            LIMIT ? OFFSET ?`,
         )
         .bind(...binds)
@@ -2407,9 +2519,13 @@ function buildApp() {
     try {
       const row = await requireDatabase(c.env)
         .prepare(
-          `SELECT id, slug, business_name, category, categories_json, city, service_areas_json, description,
-                  min_budget, max_budget, currency, rating, review_count, image_url, verified
-           FROM vendors WHERE slug = ? AND status = 'approved' LIMIT 1`,
+          `SELECT vendor.id, vendor.slug, vendor.business_name, vendor.category, vendor.categories_json,
+                  vendor.city, vendor.service_areas_json, vendor.description, vendor.min_budget,
+                  vendor.max_budget, vendor.currency, vendor.rating, vendor.review_count,
+                  vendor.image_url, vendor.verified
+           FROM vendors vendor
+           JOIN users owner ON owner.id = vendor.user_id AND owner.status = 'active'
+           WHERE vendor.slug = ? AND vendor.status = 'approved' LIMIT 1`,
         )
         .bind(slug)
         .first();
@@ -2429,6 +2545,10 @@ function buildApp() {
     const user = await currentUser(c);
     if (!["couple", "vendor", "admin"].includes(user.role)) {
       throw new ApiError(403, "role_not_allowed", "This account cannot create requests");
+    }
+    const expectedUserId = c.req.header(EXPECTED_REQUEST_OWNER_HEADER)?.trim();
+    if (expectedUserId && (!/^[A-Za-z0-9._:-]{8,128}$/u.test(expectedUserId) || expectedUserId !== user.id)) {
+      throw new ApiError(409, "account_changed", "The signed-in account changed before this request could be published");
     }
     const requestKey = idempotencyKey(c, { required: true });
     const input = await parseJson(c, auctionSchema);
@@ -2457,13 +2577,21 @@ function buildApp() {
     if (input.preferredVendorId) {
       const vendor = await db
         .prepare(
-          `SELECT id, slug, business_name, status, category, categories_json, city,
-                  service_areas_json, verified
-           FROM vendors WHERE id = ? LIMIT 1`,
+          `SELECT preferred_vendor.id, preferred_vendor.user_id, preferred_vendor.slug,
+                  preferred_vendor.business_name, preferred_vendor.status, preferred_vendor.category,
+                  preferred_vendor.categories_json, preferred_vendor.city, preferred_vendor.service_areas_json,
+                  preferred_vendor.verified, preferred_owner.status AS owner_status
+           FROM vendors preferred_vendor
+           LEFT JOIN users preferred_owner ON preferred_owner.id = preferred_vendor.user_id
+           WHERE preferred_vendor.id = ? LIMIT 1`,
         )
         .bind(input.preferredVendorId)
         .first();
-      if (!vendorMatchesAuction(vendor, { categories_json: JSON.stringify(canonicalCategories), city: input.city })) {
+      if (!vendorMatchesAuction(
+        vendor,
+        { categories_json: JSON.stringify(canonicalCategories), city: input.city },
+        { excludedUserId: user.id, requireActiveOwner: true },
+      )) {
         throw new ApiError(
           422,
           "preferred_vendor_unavailable",
@@ -2472,6 +2600,11 @@ function buildApp() {
       }
       preferredVendor = preferredVendorContext(vendor);
     }
+    const eligibleVendorCount = await eligibleVendorCountForRequest(db, {
+      category: canonicalCategories[0],
+      city: input.city,
+      excludedUserId: user.id,
+    });
     const id = crypto.randomUUID();
     const createdAt = new Date().toISOString();
     const auctionData = {
@@ -2489,6 +2622,8 @@ function buildApp() {
       status: "open",
       biddingEndsAt: normalizedBiddingEndsAt,
       bidCount: 0,
+      eligibleVendorCount,
+      coverageCheckedAt: createdAt,
       createdAt,
       preferredVendor,
     };
@@ -2519,6 +2654,7 @@ function buildApp() {
           createdAt,
           createdAt,
           input.preferredVendorId,
+          user.id,
           input.city,
           input.city,
           JSON.stringify(canonicalCategories),
@@ -2577,7 +2713,7 @@ function buildApp() {
            SELECT ?, 'auction.created', 'auction', ?, ?
            WHERE EXISTS (SELECT 1 FROM auctions WHERE id = ?)`,
         )
-        .bind(user.id, id, JSON.stringify({ preferredVendorId: input.preferredVendorId || null }), id),
+        .bind(user.id, id, JSON.stringify({ preferredVendorId: input.preferredVendorId || null, eligibleVendorCount }), id),
     );
     let results;
     try {
@@ -2636,7 +2772,8 @@ function buildApp() {
         preferred_vendor.business_name AS preferred_vendor_business_name,
         preferred_vendor.category AS preferred_vendor_category,
         preferred_vendor.city AS preferred_vendor_city,
-        preferred_vendor.verified AS preferred_vendor_verified`;
+        preferred_vendor.verified AS preferred_vendor_verified,
+        ${ELIGIBLE_VENDOR_COUNT_FOR_AUCTION_SQL} AS eligible_vendor_count`;
       where = "a.couple_user_id = ?";
       binds = [user.id];
       mapOptions = { ownerView: true };

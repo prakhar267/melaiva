@@ -48,6 +48,8 @@ async function runSmoke() {
     if (!cookie) throw new Error("Registration did not issue a session cookie.");
 
     const identity = await request("/api/v1/auth/me", { cookie });
+    const identityUserId = identity.payload?.data?.user?.id;
+    if (!identityUserId) throw new Error("Authenticated identity did not include a user id.");
     const forbiddenAdmin = await request("/api/v1/admin/vendors", { cookie, expectedStatus: 403 });
     if (forbiddenAdmin.payload?.error?.code !== "role_not_allowed") {
       throw new Error("A non-admin account did not receive the expected role boundary.");
@@ -55,7 +57,10 @@ async function runSmoke() {
     const auction = await request("/api/v1/auctions", {
       method: "POST",
       cookie,
-      headers: { "Idempotency-Key": `release-${crypto.randomUUID()}` },
+      headers: {
+        "Idempotency-Key": `release-${crypto.randomUUID()}`,
+        "X-Melaiva-Expected-User-Id": identityUserId,
+      },
       body: {
         title: "Release QA celebration request",
         eventType: "wedding",
@@ -72,10 +77,20 @@ async function runSmoke() {
     });
     auctionId = auction.payload?.data?.id;
     if (!auctionId) throw new Error("Auction response did not include an id.");
+    if (!Number.isSafeInteger(auction.payload?.data?.eligibleVendorCount) || auction.payload.data.eligibleVendorCount < 0) {
+      throw new Error("Auction response did not include a valid create-time coverage count.");
+    }
+    if (!Number.isFinite(Date.parse(auction.payload?.data?.coverageCheckedAt))) {
+      throw new Error("Auction response did not include a valid coverage timestamp.");
+    }
 
     const ownAuctions = await request("/api/v1/auctions?mine=true", { cookie });
-    if (!ownAuctions.payload?.data?.some((item) => item.id === auctionId)) {
+    const ownAuction = ownAuctions.payload?.data?.find((item) => item.id === auctionId);
+    if (!ownAuction) {
       throw new Error("Created request was not visible to its owner.");
+    }
+    if (!Number.isSafeInteger(ownAuction.eligibleVendorCount) || ownAuction.eligibleVendorCount < 0) {
+      throw new Error("Owner request list did not include a valid current coverage count.");
     }
 
     const closed = await request(`/api/v1/auctions/${auctionId}/status`, {
@@ -118,6 +133,8 @@ async function runSmoke() {
       role: identity.payload?.data?.user?.role,
       adminBoundary: "non-admin-forbidden",
       requestLifecycle: "created-listed-closed-replayed-cancelled",
+      createCoverageCount: auction.payload.data.eligibleVendorCount,
+      ownerCoverageCount: ownAuction.eligibleVendorCount,
       closedOfferCount: closed.payload.data.bidCount,
       closeReplayUnchanged: closedReplay.payload.meta.unchanged,
       plannerSource: planner.payload?.meta?.source,

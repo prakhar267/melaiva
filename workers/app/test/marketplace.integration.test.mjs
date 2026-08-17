@@ -234,6 +234,190 @@ function normalizedOfferTerms(overrides = {}) {
   };
 }
 
+test("request coverage is exact, owner-aware, replay-stable, and rejects self-invites", async () => {
+  const db = new SqliteD1(STORE_SCHEMA_SQL);
+  const env = {
+    DB: db,
+    SESSION_SECRET,
+    PASSWORD_PEPPER: "coverage-password-pepper-with-at-least-thirty-two-characters",
+    ENVIRONMENT: "production",
+    COOKIE_SECURE: "true",
+  };
+  const app = buildApp();
+  const emptyCoverage = await requestJson(app, env, "/catalog/coverage?category=photography&city=Jaipur");
+  assert.equal(emptyCoverage.status, 200);
+  assert.equal((await emptyCoverage.json()).data.eligibleVendorCount, 0);
+
+  const badCategory = await requestJson(app, env, "/catalog/coverage?category=unknown&city=Jaipur");
+  assert.equal(badCategory.status, 400);
+  assert.equal((await badCategory.json()).error.code, "invalid_filter");
+  const badCity = await requestJson(app, env, `/catalog/coverage?category=photography&city=${encodeURIComponent("Jaipur\u202E")}`);
+  assert.equal(badCity.status, 400);
+
+  const couple = await register(app, env, { name: "Coverage Couple", email: "coverage-couple@example.com", verifier: "G".repeat(43) });
+  const vendorOne = await register(app, env, { name: "Coverage Vendor One", email: "coverage-vendor-1@example.com", verifier: "H".repeat(43) });
+  const vendorTwo = await register(app, env, { name: "Coverage Vendor Two", email: "coverage-vendor-2@example.com", verifier: "I".repeat(43) });
+  const suspendedOwner = await register(app, env, { name: "Coverage Suspended Owner", email: "coverage-suspended@example.com", verifier: "K".repeat(43) });
+  const ownerlessOwner = await register(app, env, { name: "Coverage Former Owner", email: "coverage-ownerless@example.com", verifier: "L".repeat(43) });
+  const admin = await register(app, env, { name: "Coverage Admin", email: "coverage-admin@example.com", verifier: "J".repeat(43) });
+  db.sqlite.prepare("UPDATE users SET role = 'admin' WHERE id = ?").run(admin.user.id);
+
+  const profileOne = await onboardVendor(app, env, vendorOne.cookie, "CoverageOne");
+  const profileTwo = await onboardVendor(app, env, vendorTwo.cookie, "CoverageTwo");
+  const suspendedOwnerProfile = await onboardVendor(app, env, suspendedOwner.cookie, "CoverageSuspended");
+  const ownerlessProfile = await onboardVendor(app, env, ownerlessOwner.cookie, "CoverageOwnerless");
+  for (const profile of [profileOne, profileTwo, suspendedOwnerProfile, ownerlessProfile]) {
+    const approval = await reviewVendor(app, env, admin.cookie, profile.id, "approved", "Coverage evidence reviewed for integration testing.");
+    assert.equal(approval.status, 200, await approval.clone().text());
+  }
+  db.sqlite.prepare("UPDATE users SET status = 'suspended' WHERE id = ?").run(suspendedOwner.user.id);
+  db.sqlite.prepare("UPDATE vendors SET user_id = NULL WHERE id = ?").run(ownerlessProfile.id);
+
+  const categoryCatalog = await requestJson(app, env, "/catalog/categories");
+  const categoryCatalogPayload = await categoryCatalog.json();
+  assert.equal(categoryCatalog.status, 200);
+  assert.equal(
+    categoryCatalogPayload.data.find((category) => category.slug === "photography")?.vendorCount,
+    2,
+  );
+
+  const vendorCatalog = await requestJson(app, env, "/catalog/vendors?category=photography&city=Jaipur&limit=50");
+  const vendorCatalogPayload = await vendorCatalog.json();
+  assert.equal(vendorCatalog.status, 200);
+  assert.equal(vendorCatalogPayload.meta.source, "database");
+  assert.deepEqual(
+    vendorCatalogPayload.data.map((vendor) => vendor.id).sort(),
+    [profileOne.id, profileTwo.id].sort(),
+  );
+
+  for (const profile of [profileOne, profileTwo]) {
+    const activeDetail = await requestJson(app, env, `/catalog/vendors/${profile.slug}`);
+    assert.equal(activeDetail.status, 200, await activeDetail.clone().text());
+    assert.equal((await activeDetail.json()).data.id, profile.id);
+  }
+  for (const profile of [suspendedOwnerProfile, ownerlessProfile]) {
+    const unavailableDetail = await requestJson(app, env, `/catalog/vendors/${profile.slug}`);
+    assert.equal(unavailableDetail.status, 404, await unavailableDetail.clone().text());
+    assert.equal((await unavailableDetail.json()).error.code, "vendor_not_found");
+  }
+
+  const publicCoverage = await requestJson(app, env, "/catalog/coverage?category=photography&city=Jaipur");
+  const publicCoveragePayload = await publicCoverage.json();
+  assert.equal(publicCoverage.status, 200);
+  assert.equal(publicCoveragePayload.data.eligibleVendorCount, 2);
+  assert.equal(publicCoveragePayload.meta.definition, "approved_category_city");
+  assert.match(publicCoveragePayload.data.checkedAt, /Z$/u);
+
+  const ownerAwareCoverage = await requestJson(app, env, "/catalog/coverage?category=photography&city=Jaipur", { cookie: vendorOne.cookie });
+  assert.equal(ownerAwareCoverage.status, 200);
+  assert.equal((await ownerAwareCoverage.json()).data.eligibleVendorCount, 1);
+
+  const eventDate = new Date(Date.now() + 365 * 24 * 60 * 60 * 1000).toISOString().slice(0, 10);
+  const biddingEndsAt = new Date(Date.now() + 30 * 24 * 60 * 60 * 1000).toISOString();
+  const body = {
+    title: "Coverage-aware Jaipur photography brief",
+    eventType: "wedding",
+    eventDate,
+    city: "Jaipur",
+    guestCount: 220,
+    budgetMin: 200000,
+    budgetMax: 450000,
+    currency: "INR",
+    categories: ["photography"],
+    requirements: "A complete photography brief used to verify the exact eligible response pool.",
+    biddingEndsAt,
+  };
+  for (const [preferredVendorId, key] of [
+    [suspendedOwnerProfile.id, "coverage-suspended-owner-0001"],
+    [ownerlessProfile.id, "coverage-ownerless-profile-0001"],
+  ]) {
+    const unavailableInvite = await requestJson(app, env, "/auctions", {
+      cookie: couple.cookie,
+      headers: { "idempotency-key": key },
+      body: { ...body, preferredVendorId },
+    });
+    assert.equal(unavailableInvite.status, 422, await unavailableInvite.clone().text());
+    assert.equal((await unavailableInvite.json()).error.code, "preferred_vendor_unavailable");
+  }
+
+  const selfInvite = await requestJson(app, env, "/auctions", {
+    cookie: vendorOne.cookie,
+    headers: { "idempotency-key": "coverage-self-invite-0001" },
+    body: { ...body, preferredVendorId: profileOne.id },
+  });
+  assert.equal(selfInvite.status, 422, await selfInvite.clone().text());
+  assert.equal((await selfInvite.json()).error.code, "preferred_vendor_unavailable");
+
+  const changedAccount = await requestJson(app, env, "/auctions", {
+    cookie: couple.cookie,
+    headers: {
+      "idempotency-key": "coverage-account-change-0001",
+      "x-melaiva-expected-user-id": vendorOne.user.id,
+    },
+    body,
+  });
+  assert.equal(changedAccount.status, 409, await changedAccount.clone().text());
+  assert.equal((await changedAccount.json()).error.code, "account_changed");
+  assert.equal(db.sqlite.prepare("SELECT COUNT(*) AS count FROM auctions").get().count, 0);
+  assert.equal(db.sqlite.prepare("SELECT COUNT(*) AS count FROM idempotency_keys WHERE scope = 'auction-create'").get().count, 0);
+
+  let ownerSuspendedAfterPreflight = false;
+  db.afterFirst = async (sql, args) => {
+    if (!ownerSuspendedAfterPreflight && sql.includes("FROM vendors preferred_vendor") && args[0] === profileTwo.id) {
+      ownerSuspendedAfterPreflight = true;
+      db.sqlite.prepare("UPDATE users SET status = 'suspended' WHERE id = ?").run(vendorTwo.user.id);
+    }
+  };
+  const racedOwnerSuspension = await requestJson(app, env, "/auctions", {
+    cookie: couple.cookie,
+    headers: { "idempotency-key": "coverage-owner-race-0001" },
+    body: { ...body, preferredVendorId: profileTwo.id },
+  });
+  db.afterFirst = null;
+  assert.equal(ownerSuspendedAfterPreflight, true);
+  assert.equal(racedOwnerSuspension.status, 422, await racedOwnerSuspension.clone().text());
+  assert.equal((await racedOwnerSuspension.json()).error.code, "preferred_vendor_unavailable");
+  assert.equal(db.sqlite.prepare("SELECT COUNT(*) AS count FROM auctions").get().count, 0);
+  assert.equal(db.sqlite.prepare("SELECT COUNT(*) AS count FROM auction_vendor_invites").get().count, 0);
+  assert.equal(db.sqlite.prepare("SELECT COUNT(*) AS count FROM idempotency_keys WHERE scope = 'auction-create'").get().count, 0);
+  db.sqlite.prepare("UPDATE users SET status = 'active' WHERE id = ?").run(vendorTwo.user.id);
+
+  const createHeaders = { "idempotency-key": "coverage-create-0001" };
+  const created = await requestJson(app, env, "/auctions", { cookie: couple.cookie, headers: createHeaders, body });
+  assert.equal(created.status, 201, await created.clone().text());
+  const createdPayload = await created.json();
+  assert.equal(createdPayload.data.eligibleVendorCount, 2);
+  assert.match(createdPayload.data.coverageCheckedAt, /Z$/u);
+
+  const ownerList = await requestJson(app, env, "/auctions?mine=true", { cookie: couple.cookie });
+  assert.equal(ownerList.status, 200);
+  assert.equal((await ownerList.json()).data[0].eligibleVendorCount, 2);
+
+  const suspension = await reviewVendor(
+    app,
+    env,
+    admin.cookie,
+    profileTwo.id,
+    "suspended",
+    "Partner paused to verify dynamic request coverage.",
+    { expectedStatus: "approved", expectedRevision: 1 },
+  );
+  assert.equal(suspension.status, 200, await suspension.clone().text());
+  const updatedOwnerList = await requestJson(app, env, "/auctions?mine=true", { cookie: couple.cookie });
+  assert.equal((await updatedOwnerList.json()).data[0].eligibleVendorCount, 1);
+
+  db.sqlite.prepare("UPDATE auctions SET bidding_ends_at = ? WHERE id = ?").run("2020-01-01T00:00:00.000Z", createdPayload.data.id);
+  const expiredOwnerList = await requestJson(app, env, "/auctions?mine=true", { cookie: couple.cookie });
+  assert.equal((await expiredOwnerList.json()).data[0].eligibleVendorCount, 0);
+
+  const replay = await requestJson(app, env, "/auctions", { cookie: couple.cookie, headers: createHeaders, body });
+  const replayPayload = await replay.json();
+  assert.equal(replay.status, 201);
+  assert.equal(replayPayload.meta.replayed, true);
+  assert.equal(replayPayload.data.eligibleVendorCount, 2);
+  assert.equal(db.sqlite.prepare("SELECT COUNT(*) AS count FROM auctions").get().count, 1);
+});
+
 test("marketplace authorization and state transitions remain private, atomic, and idempotent", async () => {
   const db = new SqliteD1(STORE_SCHEMA_SQL);
   const env = {

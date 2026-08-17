@@ -19,6 +19,11 @@ import {
 } from "lucide-react";
 import { categories, cities, vendors as seededVendors } from "../data.js";
 import { SaveButton } from "../components/Shell.jsx";
+import {
+  marketplaceEmptyStateCopy,
+  marketplaceRequestHref,
+  marketplaceVendorRequestHref,
+} from "../components/requestCoverage.js";
 
 function normalizeVendor(vendor) {
   return {
@@ -92,10 +97,7 @@ function FilterPanel({ draft, setDraft, onApply, onClear, mobile, onClose }) {
   );
 }
 
-function VendorCard({ vendor, saved, onSave, onCompare, compared, view, demo }) {
-  const requestParams = new URLSearchParams({ category: vendor.category });
-  if (!demo && vendor.slug) requestParams.set("vendor", vendor.slug);
-
+function VendorCard({ vendor, saved, onSave, onCompare, compared, view, demo, requestHref }) {
   return (
     <article className={`vendor-card ${view === "list" ? "vendor-card--list" : ""}`}>
       <div className={`vendor-card__visual tone--${vendor.tone}`}>
@@ -115,7 +117,7 @@ function VendorCard({ vendor, saved, onSave, onCompare, compared, view, demo }) 
           <div><small>Typical starting price</small><strong>{vendor.priceLabel}</strong></div>
           <div className="vendor-card__actions">
             <label className="compare-check"><input type="checkbox" checked={compared} onChange={onCompare} /><span>Compare</span></label>
-            <Link className="button button--outline button--small" to={`/request?${requestParams.toString()}`}>{demo ? "Try example brief" : "Create brief"}</Link>
+            <Link className="button button--outline button--small" to={requestHref}>{demo ? "Try example brief" : "Create brief"}</Link>
           </div>
         </div>
       </div>
@@ -135,10 +137,13 @@ export function MarketplacePage({ notify }) {
     search: searchParams.get("search") || "",
     max: searchParams.get("max") || "",
     verified: searchParams.get("verified") !== "false",
+    date: searchParams.get("date") || "",
+    guests: searchParams.get("guests") || "",
   };
   const [draft, setDraft] = useState(current);
   const [query, setQuery] = useState(current.search);
   const [vendors, setVendors] = useState([]);
+  const [baseInventoryAvailable, setBaseInventoryAvailable] = useState(null);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState("");
   const [demoData, setDemoData] = useState(false);
@@ -162,24 +167,48 @@ export function MarketplacePage({ notify }) {
     const controller = new AbortController();
     async function load() {
       setLoading(true);
+      setBaseInventoryAvailable(null);
       setError("");
+      const normalizedSearch = next.search.trim();
       try {
-        const apiParams = new URLSearchParams();
-        if (next.category) apiParams.set("category", next.category);
-        if (next.city) apiParams.set("city", next.city);
-        if (next.search) apiParams.set("search", next.search);
-        apiParams.set("limit", "48");
-        const response = await fetch(`/api/v1/catalog/vendors?${apiParams}`, { signal: controller.signal, credentials: "include" });
-        if (!response.ok) throw new Error("Catalog unavailable");
-        const payload = await response.json();
-        setVendors((payload.data || []).map(normalizeVendor));
+        const baseApiParams = new URLSearchParams();
+        if (next.category) baseApiParams.set("category", next.category);
+        if (next.city) baseApiParams.set("city", next.city);
+        baseApiParams.set("limit", normalizedSearch ? "1" : "48");
+        const resultApiParams = new URLSearchParams(baseApiParams);
+        resultApiParams.set("limit", "48");
+        if (normalizedSearch) resultApiParams.set("search", normalizedSearch);
+
+        async function fetchCatalog(apiParams) {
+          const response = await fetch(`/api/v1/catalog/vendors?${apiParams}`, { signal: controller.signal, credentials: "include" });
+          if (!response.ok) throw new Error("Catalog unavailable");
+          return response.json();
+        }
+
+        let basePayload;
+        let payload;
+        if (normalizedSearch) {
+          [basePayload, payload] = await Promise.all([
+            fetchCatalog(baseApiParams),
+            fetchCatalog(resultApiParams),
+          ]);
+        } else {
+          payload = await fetchCatalog(resultApiParams);
+          basePayload = payload;
+        }
+        const baseData = Array.isArray(basePayload.data) ? basePayload.data : [];
+        const resultData = Array.isArray(payload.data) ? payload.data : [];
+        setBaseInventoryAvailable(baseData.length > 0);
+        setVendors(resultData.map(normalizeVendor));
         setDemoData(payload.meta?.source === "demo");
       } catch (requestError) {
-        if (requestError.name === "AbortError") return;
-        let fallback = seededVendors.map(normalizeVendor);
-        if (next.category) fallback = fallback.filter((vendor) => vendor.category === next.category);
-        if (next.city) fallback = fallback.filter((vendor) => vendor.city === next.city);
-        if (next.search) fallback = fallback.filter((vendor) => `${vendor.name} ${vendor.categoryLabel} ${vendor.city}`.toLowerCase().includes(next.search.toLowerCase()));
+        if (requestError.name === "AbortError" || controller.signal.aborted) return;
+        let baseFallback = seededVendors.map(normalizeVendor);
+        if (next.category) baseFallback = baseFallback.filter((vendor) => vendor.category === next.category);
+        if (next.city) baseFallback = baseFallback.filter((vendor) => vendor.city === next.city);
+        let fallback = [...baseFallback];
+        if (normalizedSearch) fallback = fallback.filter((vendor) => `${vendor.name} ${vendor.categoryLabel} ${vendor.city}`.toLowerCase().includes(normalizedSearch.toLowerCase()));
+        setBaseInventoryAvailable(baseFallback.length > 0);
         setVendors(fallback);
         setDemoData(true);
       } finally {
@@ -206,6 +235,8 @@ export function MarketplacePage({ notify }) {
         if (!value) params.set(key, "false");
       } else if (value) params.set(key, value);
     });
+    if (current.date) params.set("date", current.date);
+    if (current.guests) params.set("guests", current.guests);
     if (query.trim()) params.set("search", query.trim());
     setSearchParams(params);
     setMobileFilters(false);
@@ -213,7 +244,10 @@ export function MarketplacePage({ notify }) {
 
   function clearFilters() {
     const empty = { category: "", city: "", search: "", max: "", verified: true };
-    setDraft(empty); setQuery(""); setSearchParams(new URLSearchParams()); setMobileFilters(false);
+    const params = new URLSearchParams();
+    if (current.date) params.set("date", current.date);
+    if (current.guests) params.set("guests", current.guests);
+    setDraft(empty); setQuery(""); setSearchParams(params); setMobileFilters(false);
   }
 
   function toggleSet(setter, id, title) {
@@ -224,6 +258,20 @@ export function MarketplacePage({ notify }) {
     });
     if (title) notify({ title, message: "You can keep comparing partners during this visit." });
   }
+
+  const requestHref = marketplaceRequestHref(current);
+  const requestScope = [categories.find((category) => category.id === current.category)?.name, current.city]
+    .filter(Boolean)
+    .join(" in ");
+  const emptyState = marketplaceEmptyStateCopy({
+    baseInventoryAvailable,
+    preview: demoData,
+    scope: requestScope,
+  });
+  const canCheckScopedCoverage = categories.some((category) => category.id === current.category) && cities.includes(current.city);
+  const requestActionLabel = emptyState.kind === "preview" || !canCheckScopedCoverage
+    ? "Open request builder"
+    : "Check category & city coverage";
 
   return (
     <div className="marketplace-page page-surface">
@@ -282,6 +330,7 @@ export function MarketplacePage({ notify }) {
                   key={vendor.id}
                   vendor={vendor}
                   demo={demoData}
+                  requestHref={marketplaceVendorRequestHref(vendor, current, { demo: demoData })}
                   view={view}
                   saved={saved.has(vendor.id)}
                   compared={compared.has(vendor.id)}
@@ -295,7 +344,22 @@ export function MarketplacePage({ notify }) {
             </div>
           ) : (
             <div className="empty-state">
-              <span><Search size={26} /></span><h2>No exact matches yet</h2><p>Try a nearby city or broaden your starting budget. Partner inventory is opening city by city.</p><button className="button button--primary" onClick={clearFilters}>Clear filters</button>
+              <span><Search size={26} /></span>
+              <h2>{emptyState.title}</h2>
+              <p>{emptyState.message}</p>
+              <div className="empty-state__actions">
+                {emptyState.kind === "inventory" ? (
+                  <>
+                    <Link className="button button--primary" to={requestHref}>{requestActionLabel} <ArrowRight size={16} /></Link>
+                    <button className="button button--outline" type="button" onClick={clearFilters}>Clear filters</button>
+                  </>
+                ) : (
+                  <>
+                    <button className="button button--primary" type="button" onClick={clearFilters}>Clear filters</button>
+                    <Link className="button button--outline" to={requestHref}>{requestActionLabel} <ArrowRight size={16} /></Link>
+                  </>
+                )}
+              </div>
             </div>
           )}
         </div>

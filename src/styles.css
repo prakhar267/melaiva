@@ -606,6 +606,7 @@ input:focus, select:focus, textarea:focus { outline: none; border-color: var(--t
 .dashboard-nav button.is-active { color: var(--aubergine); }
 .dashboard-nav button.is-active::after { background: var(--aubergine); }
 .dashboard-nav button small { min-width: 19px; height: 19px; display: grid; place-items: center; border-radius: 50%; background: var(--rose-soft); color: var(--rose); font-size: 7px; }
+.dashboard-nav button small.workspace-unread-badge { min-width: 22px; height: 22px; padding: 0 6px; border-radius: 999px; background: var(--aubergine); color: #fff; font-size: 10px; font-weight: 800; }
 .dashboard-grid { display: grid; grid-template-columns: 1.22fr .78fr; gap: 18px; }
 .dashboard-card { min-width: 0; border: 1px solid var(--line); border-radius: 16px; background: var(--paper); box-shadow: 0 5px 20px rgba(58, 25, 59, .035); }
 .dashboard-card--full { min-height: 520px; }
@@ -851,6 +852,7 @@ input:focus, select:focus, textarea:focus { outline: none; border-color: var(--t
 .vendor-workspace-nav button.is-active { color: var(--aubergine); }
 .vendor-workspace-nav button.is-active::after { background: var(--aubergine); }
 .vendor-workspace-nav button span { min-width: 18px; height: 18px; display: grid; place-items: center; border-radius: 50%; background: var(--rose-soft); color: var(--rose); font-size: 6px; }
+.vendor-workspace-nav button span.workspace-unread-badge { min-width: 22px; height: 22px; padding: 0 6px; border-radius: 999px; background: var(--aubergine); color: #fff; font-size: 10px; font-weight: 800; }
 .vendor-tab-panel { min-height: 460px; border: 1px solid var(--line); border-radius: 16px; background: var(--paper); overflow: hidden; }
 .vendor-panel-heading { display: flex; align-items: center; justify-content: space-between; gap: 18px; padding: 20px 22px; border-bottom: 1px solid var(--line); }
 .vendor-panel-heading h2 { color: var(--aubergine); font-family: var(--font-display); font-size: 20px; font-weight: 600; }
@@ -906,11 +908,16 @@ input:focus, select:focus, textarea:focus { outline: none; border-color: var(--t
 .booking-threads > button { width: 100%; min-height: 98px; display: grid; grid-template-columns: auto minmax(0, 1fr); gap: 10px; padding: 15px; border: 0; border-bottom: 1px solid var(--line); background: transparent; text-align: left; transition: background .18s, box-shadow .18s; }
 .booking-threads > button:hover { background: var(--paper); }
 .booking-threads > button.is-active { background: var(--paper); box-shadow: inset 3px 0 var(--teal); }
+.booking-threads > button.has-unread:not(.is-active) { background: #fffaf0; }
+.booking-threads > button.has-unread .booking-thread__icon { background: var(--marigold-soft); color: #76500a; }
+.booking-threads > button.has-unread .booking-thread__copy strong { font-weight: 800; }
 .booking-thread__icon { width: 34px; height: 34px; display: grid; place-items: center; border-radius: 10px; background: var(--teal-soft); color: var(--teal); }
 .booking-thread__copy { min-width: 0; display: grid; align-content: start; gap: 3px; }
 .booking-thread__copy strong { color: var(--aubergine); font-size: 14px; line-height: 1.35; overflow-wrap: anywhere; }
 .booking-thread__copy small { color: var(--muted); font-size: 12px; line-height: 1.45; overflow-wrap: anywhere; }
 .booking-thread__copy em { color: var(--teal); font-size: 11px; font-style: normal; font-weight: 700; }
+.booking-thread__message-meta { display: flex; flex-wrap: wrap; align-items: center; gap: 5px 8px; }
+.booking-thread__unread { min-height: 22px; display: inline-flex; align-items: center; padding: 2px 8px; border-radius: 999px; background: var(--aubergine); color: #fff; font-size: 10px; font-weight: 800; line-height: 1.2; }
 .booking-threads .status-pill { grid-column: 2; justify-self: start; font-size: 10px; }
 .booking-conversation { min-width: 0; display: flex; flex-direction: column; background: var(--paper); }
 .booking-conversation__context { display: grid; grid-template-columns: minmax(180px, 1fr) auto auto; gap: 15px; align-items: center; padding: 14px 18px; border-bottom: 1px solid var(--line); background: var(--ivory); }
@@ -927,6 +934,7 @@ input:focus, select:focus, textarea:focus { outline: none; border-color: var(--t
 .booking-message-history { min-height: 335px; max-height: 560px; display: flex; flex-direction: column; gap: 13px; overflow-y: auto; padding: 20px; background: linear-gradient(#fff, #fdfbf7); }
 .booking-message-history__older { min-height: 36px; align-self: center; display: flex; align-items: center; gap: 5px; padding: 0 13px; border: 1px solid var(--line); border-radius: 999px; background: var(--paper); color: var(--aubergine); font-size: 8px; font-weight: 700; }
 .booking-message-history__latest { position: sticky; top: 0; z-index: 2; min-height: 38px; align-self: center; display: flex; align-items: center; gap: 6px; padding: 0 14px; border: 1px solid #b8d7d4; border-radius: 999px; background: #edf7f5; color: #185f61; box-shadow: var(--shadow-sm); font-size: 11px; font-weight: 700; }
+.booking-message-history__end { width: 100%; height: 2px; flex: 0 0 2px; pointer-events: none; }
 .booking-message-history__error, .booking-message-composer__error { color: #a13f43; font-size: 13px; line-height: 1.5; }
 .booking-message-history__empty { min-height: 260px; display: grid; place-items: center; align-content: center; text-align: center; }
 .booking-message-history__empty > span, .booking-messages__state > span { width: 55px; height: 55px; display: grid; place-items: center; border-radius: 50%; background: var(--teal-soft); color: var(--teal); }

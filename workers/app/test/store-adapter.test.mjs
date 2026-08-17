@@ -12,6 +12,7 @@ import {
   STORE_SCHEMA_V5_MIGRATION_SQL,
   STORE_SCHEMA_V6_FINALIZE_SQL,
   STORE_SCHEMA_V6_MIGRATION_SQL,
+  STORE_SCHEMA_V7_MIGRATION_SQL,
   STORE_SCHEMA_VERSION,
   createDurableDatabase,
   executeSql,
@@ -665,7 +666,340 @@ test("schema v6 backfills stable per-booking message positions and enforces stre
   );
 });
 
-test("schema v6 initialization resumes after the stream column was already added", async () => {
+test("schema v7 baselines participant-local cursors at the exact thread head and remains safe for old writers", () => {
+  const sqlite = createV3AwardDatabase();
+  const populated = seedAcceptedAward(sqlite, "read-state", { auditCreatedAt: "2027-10-01T04:05:06.000Z" });
+  const empty = seedAcceptedAward(sqlite, "read-state-empty", { auditCreatedAt: "2027-10-02T04:05:06.000Z" });
+  sqlite.exec(STORE_SCHEMA_V4_MIGRATION_SQL);
+  sqlite.exec(STORE_SCHEMA_V5_MIGRATION_SQL);
+  sqlite.exec(STORE_SCHEMA_V6_MIGRATION_SQL);
+  const populatedBooking = sqlite.prepare("SELECT id FROM bookings WHERE accepted_bid_id = ?").get(populated.bidId);
+  const emptyBooking = sqlite.prepare("SELECT id FROM bookings WHERE accepted_bid_id = ?").get(empty.bidId);
+  const legacyInsert = sqlite.prepare(
+    `INSERT INTO booking_messages (id, booking_id, sender_user_id, body, created_at)
+     VALUES (?, ?, ?, ?, ?)`,
+  );
+  legacyInsert.run(
+    "read-head-z",
+    populatedBooking.id,
+    "migration-couple",
+    "The first retained message has a tied display timestamp.",
+    "2027-10-03T10:00:00.000Z",
+  );
+  legacyInsert.run(
+    "read-head-a",
+    populatedBooking.id,
+    "migration-vendor-user",
+    "The second retained message sorts lower by identifier.",
+    "2027-10-03T10:00:00.000Z",
+  );
+  legacyInsert.run(
+    "read-head-backdated",
+    populatedBooking.id,
+    "migration-vendor-user",
+    "The actual thread head carries an earlier display timestamp.",
+    "2027-09-01T10:00:00.000Z",
+  );
+  const messagesBefore = sqlite
+    .prepare(
+      `SELECT id, booking_id, sender_user_id, body, created_at, stream_position
+       FROM booking_messages ORDER BY booking_id, stream_position`,
+    )
+    .all();
+
+  sqlite.exec(STORE_SCHEMA_V7_MIGRATION_SQL);
+  sqlite.exec(STORE_SCHEMA_V7_MIGRATION_SQL);
+
+  assert.equal(sqlite.prepare("SELECT MAX(id) AS version FROM _sql_schema_migrations").get().version, 7);
+  assert.deepEqual(
+    sqlite
+      .prepare(
+        `SELECT id, booking_id, sender_user_id, body, created_at, stream_position
+         FROM booking_messages ORDER BY booking_id, stream_position`,
+      )
+      .all(),
+    messagesBefore,
+  );
+  assert.deepEqual(
+    sqlite
+      .prepare(
+        `SELECT booking_id, participant_user_id, last_read_message_id
+         FROM booking_message_read_cursors ORDER BY booking_id, participant_user_id`,
+      )
+      .all()
+      .map((row) => ({ ...row })),
+    [
+      {
+        booking_id: populatedBooking.id,
+        participant_user_id: "migration-couple",
+        last_read_message_id: "read-head-backdated",
+      },
+      {
+        booking_id: populatedBooking.id,
+        participant_user_id: "migration-vendor-user",
+        last_read_message_id: "read-head-backdated",
+      },
+      {
+        booking_id: emptyBooking.id,
+        participant_user_id: "migration-couple",
+        last_read_message_id: null,
+      },
+      {
+        booking_id: emptyBooking.id,
+        participant_user_id: "migration-vendor-user",
+        last_read_message_id: null,
+      },
+    ],
+  );
+  assert.equal(
+    sqlite
+      .prepare("SELECT stream_position FROM booking_messages WHERE id = 'read-head-backdated'")
+      .get().stream_position,
+    3,
+  );
+
+  sqlite
+    .prepare(
+      `INSERT INTO users
+       (id, name, email, password_hash, password_salt, password_iterations, role, status)
+       VALUES ('migration-outsider', 'Migration Outsider', 'migration-outsider@example.com',
+               'hash', 'salt', 100000, 'couple', 'active')`,
+    )
+    .run();
+  assert.throws(
+    () => sqlite
+      .prepare(
+        `INSERT INTO booking_message_read_cursors
+         (booking_id, participant_user_id, last_read_message_id)
+         VALUES (?, 'migration-outsider', 'read-head-backdated')`,
+      )
+      .run(populatedBooking.id),
+    /read cursor owner must be a participant/,
+  );
+  legacyInsert.run(
+    "read-other-thread",
+    emptyBooking.id,
+    "migration-couple",
+    "A message in another private booking cannot become this cursor.",
+    "2027-10-04T10:00:00.000Z",
+  );
+  assert.throws(
+    () => sqlite
+      .prepare(
+        `UPDATE booking_message_read_cursors SET last_read_message_id = 'read-other-thread'
+         WHERE booking_id = ? AND participant_user_id = 'migration-couple'`,
+      )
+      .run(populatedBooking.id),
+    /cannot move backward or leave its thread/,
+  );
+  assert.throws(
+    () => sqlite
+      .prepare(
+        `UPDATE booking_message_read_cursors SET last_read_message_id = 'read-head-a'
+         WHERE booking_id = ? AND participant_user_id = 'migration-couple'`,
+      )
+      .run(populatedBooking.id),
+    /cannot move backward or leave its thread/,
+  );
+  assert.throws(
+    () => sqlite
+      .prepare(
+        `UPDATE booking_message_read_cursors SET participant_user_id = 'migration-outsider'
+         WHERE booking_id = ? AND participant_user_id = 'migration-couple'`,
+      )
+      .run(populatedBooking.id),
+    /read cursor (?:identity is immutable|owner must be a participant)/,
+  );
+  assert.throws(
+    () => sqlite
+      .prepare(
+        `DELETE FROM booking_message_read_cursors
+         WHERE booking_id = ? AND participant_user_id = 'migration-couple'`,
+      )
+      .run(populatedBooking.id),
+    /read cursors are retained/,
+  );
+
+  const oldWriterAward = seedAcceptedAward(sqlite, "read-state-old-writer");
+  sqlite
+    .prepare(
+      `INSERT INTO bookings
+       (id, auction_id, accepted_bid_id, couple_user_id, vendor_id, status,
+        accepted_scope_json, awarded_at)
+       SELECT 'old-writer-booking', auction.id, bid.id, auction.couple_user_id, bid.vendor_id,
+              'contract_pending', '{}', '2027-10-05T00:00:00.000Z'
+       FROM auctions auction
+       JOIN bids bid ON bid.auction_id = auction.id
+       WHERE auction.id = ? AND bid.id = ?`,
+    )
+    .run(oldWriterAward.auctionId, oldWriterAward.bidId);
+  assert.deepEqual(
+    sqlite
+      .prepare(
+        `SELECT participant_user_id, last_read_message_id
+         FROM booking_message_read_cursors
+         WHERE booking_id = 'old-writer-booking' ORDER BY participant_user_id`,
+      )
+      .all()
+      .map((row) => ({ ...row })),
+    [
+      { participant_user_id: "migration-couple", last_read_message_id: null },
+      { participant_user_id: "migration-vendor-user", last_read_message_id: null },
+    ],
+  );
+  legacyInsert.run(
+    "old-writer-message",
+    "old-writer-booking",
+    "migration-couple",
+    "A rolled-back Worker can still append a positioned message.",
+    "2027-10-05T10:00:00.000Z",
+  );
+  assert.equal(
+    sqlite.prepare("SELECT stream_position FROM booking_messages WHERE id = 'old-writer-message'").get().stream_position,
+    1,
+  );
+  assert.equal(
+    sqlite
+      .prepare(
+        `SELECT last_read_message_id FROM booking_message_read_cursors
+         WHERE booking_id = 'old-writer-booking' AND participant_user_id = 'migration-vendor-user'`,
+      )
+      .get().last_read_message_id,
+    null,
+  );
+  for (let index = 0; index < 400; index += 1) {
+    legacyInsert.run(
+      `old-writer-volume-${String(index).padStart(3, "0")}`,
+      "old-writer-booking",
+      index % 2 === 0 ? "migration-couple" : "migration-vendor-user",
+      "A bounded volume record verifies the unread range query stays indexed.",
+      "2027-10-05T10:00:00.000Z",
+    );
+  }
+  const unreadSql = `SELECT COUNT(*) AS unread_count
+    FROM booking_messages incoming INDEXED BY idx_booking_messages_stream
+    WHERE incoming.booking_id = ?
+      AND incoming.sender_user_id != ?
+      AND incoming.stream_position > COALESCE(
+        (
+          SELECT anchor.stream_position
+          FROM booking_message_read_cursors cursor
+          LEFT JOIN booking_messages anchor
+            ON anchor.id = cursor.last_read_message_id
+           AND anchor.booking_id = cursor.booking_id
+          WHERE cursor.booking_id = ? AND cursor.participant_user_id = ?
+        ),
+        0
+      )`;
+  assert.equal(
+    sqlite
+      .prepare(unreadSql)
+      .get("old-writer-booking", "migration-vendor-user", "old-writer-booking", "migration-vendor-user")
+      .unread_count,
+    201,
+  );
+  assert.match(
+    sqlite
+      .prepare(`EXPLAIN QUERY PLAN ${unreadSql}`)
+      .all("old-writer-booking", "migration-vendor-user", "old-writer-booking", "migration-vendor-user")
+      .map((row) => row.detail)
+      .join("\n"),
+    /idx_booking_messages_stream \(booking_id=\? AND stream_position>\?\)/,
+  );
+});
+
+test("schema v7 initialization resumes partial cursor rows without resetting or failing on empty threads", async () => {
+  const sqlite = createV3AwardDatabase();
+  const populated = seedAcceptedAward(sqlite, "partial-read-state");
+  const empty = seedAcceptedAward(sqlite, "partial-read-state-empty");
+  sqlite.exec(STORE_SCHEMA_V4_MIGRATION_SQL);
+  sqlite.exec(STORE_SCHEMA_V5_MIGRATION_SQL);
+  sqlite.exec(STORE_SCHEMA_V6_MIGRATION_SQL);
+  const populatedBooking = sqlite.prepare("SELECT id FROM bookings WHERE accepted_bid_id = ?").get(populated.bidId);
+  const emptyBooking = sqlite.prepare("SELECT id FROM bookings WHERE accepted_bid_id = ?").get(empty.bidId);
+  sqlite
+    .prepare(
+      `INSERT INTO booking_messages (id, booking_id, sender_user_id, body, stream_position)
+       VALUES ('partial-read-first', ?, 'migration-couple', 'Keep this earlier explicit participant cursor.', 1),
+              ('partial-read-head', ?, 'migration-vendor-user', 'Do not reset the cursor to this newer head.', 2)`,
+    )
+    .run(populatedBooking.id, populatedBooking.id);
+  sqlite.exec(`CREATE TABLE booking_message_read_cursors (
+    booking_id TEXT NOT NULL REFERENCES bookings(id) ON DELETE RESTRICT,
+    participant_user_id TEXT NOT NULL REFERENCES users(id) ON DELETE RESTRICT,
+    last_read_message_id TEXT REFERENCES booking_messages(id) ON DELETE RESTRICT,
+    updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    PRIMARY KEY (booking_id, participant_user_id)
+  )`);
+  sqlite
+    .prepare(
+      `INSERT INTO booking_message_read_cursors
+       (booking_id, participant_user_id, last_read_message_id)
+       VALUES (?, 'migration-couple', 'partial-read-first'),
+              (?, 'migration-couple', NULL),
+              (?, 'migration-vendor-user', NULL)`,
+    )
+    .run(populatedBooking.id, emptyBooking.id, emptyBooking.id);
+  assert.equal(sqlite.prepare("SELECT MAX(id) AS version FROM _sql_schema_migrations").get().version, 6);
+
+  const sql = {
+    exec(statement, ...args) {
+      const normalized = statement.trim().toUpperCase();
+      if (args.length > 0 || normalized.startsWith("SELECT") || normalized.startsWith("PRAGMA")) {
+        const rows = sqlite.prepare(statement).all(...args);
+        return { toArray: () => rows };
+      }
+      sqlite.exec(statement);
+      return { toArray: () => [] };
+    },
+  };
+  let initialized;
+  const ctx = {
+    storage: {
+      sql,
+      async getAlarm() { return 1; },
+      async setAlarm() {},
+    },
+    blockConcurrencyWhile(callback) {
+      initialized = callback();
+    },
+  };
+
+  new MelaivaStore(ctx, { ENVIRONMENT: "production" });
+  await initialized;
+
+  assert.equal(sqlite.prepare("SELECT MAX(id) AS version FROM _sql_schema_migrations").get().version, 7);
+  assert.deepEqual(
+    sqlite
+      .prepare(
+        `SELECT participant_user_id, last_read_message_id
+         FROM booking_message_read_cursors
+         WHERE booking_id = ? ORDER BY participant_user_id`,
+      )
+      .all(populatedBooking.id)
+      .map((row) => ({ ...row })),
+    [
+      { participant_user_id: "migration-couple", last_read_message_id: "partial-read-first" },
+      { participant_user_id: "migration-vendor-user", last_read_message_id: "partial-read-head" },
+    ],
+  );
+  assert.deepEqual(
+    sqlite
+      .prepare(
+        `SELECT participant_user_id, last_read_message_id
+         FROM booking_message_read_cursors
+         WHERE booking_id = ? ORDER BY participant_user_id`,
+      )
+      .all(emptyBooking.id)
+      .map((row) => ({ ...row })),
+    [
+      { participant_user_id: "migration-couple", last_read_message_id: null },
+      { participant_user_id: "migration-vendor-user", last_read_message_id: null },
+    ],
+  );
+});
+
+test("schema initialization resumes after the v6 stream column was already added", async () => {
   const sqlite = createV3AwardDatabase();
   const seeded = seedAcceptedAward(sqlite, "partial-stream", { auditCreatedAt: "2027-10-01T04:05:06.000Z" });
   sqlite.exec(STORE_SCHEMA_V4_MIGRATION_SQL);
@@ -706,10 +1040,24 @@ test("schema v6 initialization resumes after the stream column was already added
   new MelaivaStore(ctx, { ENVIRONMENT: "production" });
   await initialized;
 
-  assert.equal(sqlite.prepare("SELECT MAX(id) AS version FROM _sql_schema_migrations").get().version, 6);
+  assert.equal(sqlite.prepare("SELECT MAX(id) AS version FROM _sql_schema_migrations").get().version, STORE_SCHEMA_VERSION);
   assert.equal(
     sqlite.prepare("SELECT stream_position FROM booking_messages WHERE id = 'partial-stream-message'").get().stream_position,
     1,
+  );
+  assert.deepEqual(
+    sqlite
+      .prepare(
+        `SELECT participant_user_id, last_read_message_id
+         FROM booking_message_read_cursors
+         WHERE booking_id = ? ORDER BY participant_user_id`,
+      )
+      .all(booking.id)
+      .map((row) => ({ ...row })),
+    [
+      { participant_user_id: "migration-couple", last_read_message_id: "partial-stream-message" },
+      { participant_user_id: "migration-vendor-user", last_read_message_id: "partial-stream-message" },
+    ],
   );
 });
 

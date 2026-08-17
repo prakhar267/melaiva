@@ -286,6 +286,12 @@ const bookingMessageSchema = z
   })
   .strict();
 
+const bookingMessageReadSchema = z
+  .object({
+    messageId: z.string().regex(/^[A-Za-z0-9-]{1,100}$/, "Message cursor is invalid"),
+  })
+  .strict();
+
 const bidDecisionSchema = z
   .object({ action: z.enum(["shortlist", "reject", "accept"]) })
   .strict();
@@ -1179,6 +1185,7 @@ function mapAward(row, user) {
     awardedAt: row.awarded_at,
     audienceRole,
     messageCount: Number(row.message_count || 0),
+    ...optionalUnreadMessageCount(row.unread_message_count),
     snapshot,
   };
 }
@@ -1242,6 +1249,48 @@ function mapBookingMessage(row, booking, user) {
   };
 }
 
+function optionalUnreadMessageCount(value) {
+  if (value === undefined || value === null) return {};
+  return { unreadMessageCount: Math.max(0, Number(value) || 0) };
+}
+
+function unreadMessageCountSql(bookingIdSql) {
+  return `(SELECT COUNT(*)
+           FROM booking_messages incoming INDEXED BY idx_booking_messages_stream
+           WHERE incoming.booking_id = ${bookingIdSql}
+             AND incoming.sender_user_id != ?
+             AND incoming.stream_position > COALESCE(
+               (
+                 SELECT anchor.stream_position
+                 FROM booking_message_read_cursors cursor
+                 LEFT JOIN booking_messages anchor
+                   ON anchor.id = cursor.last_read_message_id
+                  AND anchor.booking_id = cursor.booking_id
+                 WHERE cursor.booking_id = ${bookingIdSql}
+                   AND cursor.participant_user_id = ?
+               ),
+               0
+             ))`;
+}
+
+function bookingMessageCountSql(bookingIdSql, streamAvailable) {
+  if (!streamAvailable) {
+    return `(SELECT COUNT(*)
+             FROM booking_messages counted_message
+             WHERE counted_message.booking_id = ${bookingIdSql})`;
+  }
+  return `COALESCE(
+            (
+              SELECT latest_message.stream_position
+              FROM booking_messages latest_message
+              WHERE latest_message.booking_id = ${bookingIdSql}
+              ORDER BY latest_message.stream_position DESC
+              LIMIT 1
+            ),
+            0
+          )`;
+}
+
 async function bookingMessageState(db, booking, messageId, user, streamAvailable) {
   const streamPositionSql = streamAvailable
     ? "message.stream_position"
@@ -1263,27 +1312,84 @@ async function bookingMessageState(db, booking, messageId, user, streamAvailable
     : `(SELECT COUNT(*)
        FROM booking_messages counted
        WHERE counted.booking_id = message.booking_id)`;
+  const readCursorsAvailable = user.role !== "admin" && await hasBookingMessageReadCursors(db);
+  const unreadSelect = readCursorsAvailable
+    ? `, ${unreadMessageCountSql("message.booking_id")} AS unread_message_count`
+    : "";
   const row = await db
     .prepare(
       `SELECT message.id, message.booking_id, message.sender_user_id, message.body,
               message.created_at, ${streamPositionSql} AS stream_position,
-              ${messageCountSql} AS message_count
+              ${messageCountSql} AS message_count${unreadSelect}
        FROM booking_messages message
        WHERE message.id = ? AND message.booking_id = ?
        LIMIT 1`,
     )
-    .bind(messageId, booking.id)
+    .bind(...(readCursorsAvailable ? [user.id, user.id] : []), messageId, booking.id)
     .first();
   if (!row) throw new ApiError(409, "message_not_sent", "This message is unavailable; refresh and try again");
   return {
     message: mapBookingMessage(row, booking, user),
     messageCount: Number(row.message_count || 0),
+    ...optionalUnreadMessageCount(row.unread_message_count),
   };
 }
 
 async function hasBookingMessageStreamPosition(db) {
   const result = await db.prepare("PRAGMA table_info(booking_messages)").all();
   return (result.results || []).some((column) => column.name === "stream_position");
+}
+
+async function hasBookingMessageReadCursors(db) {
+  const row = await db
+    .prepare(
+      `SELECT 1 AS available
+       FROM sqlite_master
+       WHERE type = 'table' AND name = 'booking_message_read_cursors'
+         AND EXISTS (SELECT 1 FROM _sql_schema_migrations WHERE id = 7)
+       LIMIT 1`,
+    )
+    .first();
+  return Boolean(row?.available);
+}
+
+async function bookingUnreadState(db, bookingId, participantUserId) {
+  const row = await db
+    .prepare(
+      `SELECT cursor.last_read_message_id,
+              COALESCE(anchor.stream_position, 0) AS read_through_sequence,
+              COALESCE(
+                (
+                  SELECT latest.stream_position
+                  FROM booking_messages latest
+                  WHERE latest.booking_id = ?
+                  ORDER BY latest.stream_position DESC
+                  LIMIT 1
+                ),
+                0
+              ) AS message_count,
+              (
+                SELECT COUNT(*)
+                FROM booking_messages incoming INDEXED BY idx_booking_messages_stream
+                WHERE incoming.booking_id = ?
+                  AND incoming.sender_user_id != ?
+                  AND incoming.stream_position > COALESCE(anchor.stream_position, 0)
+              ) AS unread_message_count
+       FROM (SELECT 1) seed
+       LEFT JOIN booking_message_read_cursors cursor
+         ON cursor.booking_id = ? AND cursor.participant_user_id = ?
+       LEFT JOIN booking_messages anchor
+         ON anchor.id = cursor.last_read_message_id
+        AND anchor.booking_id = cursor.booking_id`,
+    )
+    .bind(bookingId, bookingId, participantUserId, bookingId, participantUserId)
+    .first();
+  return {
+    readThroughMessageId: row?.last_read_message_id || null,
+    readThroughSequence: Math.max(0, Number(row?.read_through_sequence) || 0),
+    messageCount: Math.max(0, Number(row?.message_count) || 0),
+    unreadMessageCount: Math.max(0, Number(row?.unread_message_count) || 0),
+  };
 }
 
 // A new Worker can briefly reach a schema-v5 Durable Object during a rolling
@@ -2035,22 +2141,68 @@ function buildApp() {
     const page = parsePositiveInt(c.req.query("page"), 1, 10_000);
     const limit = parsePositiveInt(c.req.query("limit"), 20, 50);
     const db = requireDatabase(c.env);
+    const streamAvailable = await hasBookingMessageStreamPosition(db);
+    const readCursorsAvailable = user.role !== "admin" && await hasBookingMessageReadCursors(db);
+    const unreadSelect = readCursorsAvailable
+      ? `, ${unreadMessageCountSql("booking.id")} AS unread_message_count`
+      : "";
     const where = user.role === "admin" ? "1 = 1" : "(booking.couple_user_id = ? OR vendor.user_id = ?)";
     const binds = user.role === "admin" ? [] : [user.id, user.id];
     const result = await db
       .prepare(
         `SELECT booking.*, vendor.user_id AS vendor_user_id, vendor.status AS vendor_status,
-                (SELECT COUNT(*) FROM booking_messages message WHERE message.booking_id = booking.id) AS message_count
+                ${bookingMessageCountSql("booking.id", streamAvailable)} AS message_count
+                ${unreadSelect}
          FROM bookings booking
          JOIN vendors vendor ON vendor.id = booking.vendor_id
          WHERE ${where}
          ORDER BY booking.awarded_at DESC, booking.id DESC
          LIMIT ? OFFSET ?`,
       )
-      .bind(...binds, limit, (page - 1) * limit)
+      .bind(...(readCursorsAvailable ? [user.id, user.id] : []), ...binds, limit, (page - 1) * limit)
       .all();
     const awards = (result.results || []).map((row) => mapAward(row, user));
     return c.json({ data: awards, meta: { page, limit, hasMore: awards.length === limit } });
+  });
+
+  app.get(`${API_PREFIX}/bookings/message-summary`, async (c) => {
+    const user = await currentUser(c);
+    const page = parsePositiveInt(c.req.query("page"), 1, 10_000);
+    const limit = parsePositiveInt(c.req.query("limit"), 50, 50);
+    const db = requireDatabase(c.env);
+    const streamAvailable = await hasBookingMessageStreamPosition(db);
+    const readCursorsAvailable = user.role !== "admin" && await hasBookingMessageReadCursors(db);
+    const unreadSelect = readCursorsAvailable
+      ? `, ${unreadMessageCountSql("booking.id")} AS unread_message_count`
+      : "";
+    const where = user.role === "admin" ? "1 = 1" : "(booking.couple_user_id = ? OR vendor.user_id = ?)";
+    const whereBinds = user.role === "admin" ? [] : [user.id, user.id];
+    const result = await db
+      .prepare(
+        `SELECT booking.id, booking.couple_user_id, vendor.user_id AS vendor_user_id,
+                ${bookingMessageCountSql("booking.id", streamAvailable)} AS message_count
+                ${unreadSelect}
+         FROM bookings booking
+         JOIN vendors vendor ON vendor.id = booking.vendor_id
+         WHERE ${where}
+         ORDER BY booking.awarded_at DESC, booking.id DESC
+         LIMIT ? OFFSET ?`,
+      )
+      .bind(
+        ...(readCursorsAvailable ? [user.id, user.id] : []),
+        ...whereBinds,
+        limit + 1,
+        (page - 1) * limit,
+      )
+      .all();
+    const rows = result.results || [];
+    const summaries = rows.slice(0, limit).map((row) => ({
+      id: row.id,
+      audienceRole: user.role === "admin" ? "admin" : row.couple_user_id === user.id ? "owner" : "vendor",
+      messageCount: Math.max(0, Number(row.message_count) || 0),
+      ...optionalUnreadMessageCount(row.unread_message_count),
+    }));
+    return c.json({ data: summaries, meta: { page, limit, hasMore: rows.length > limit } });
   });
 
   app.get(`${API_PREFIX}/bookings/:id/messages`, async (c) => {
@@ -2060,6 +2212,7 @@ function buildApp() {
     const after = c.req.query("after");
     const db = requireDatabase(c.env);
     const booking = await bookingForConversation(db, c.req.param("id"), user);
+    const readCursorsAvailable = user.role !== "admin" && await hasBookingMessageReadCursors(db);
     if (cursor !== undefined && after !== undefined) {
       throw new ApiError(422, "invalid_pagination", "Use either cursor or after, not both");
     }
@@ -2074,6 +2227,7 @@ function buildApp() {
     }
     const legacyResponse = async () => {
       const page = await legacyBookingMessagePage(db, booking.id, { polling, requestedCursor, limit });
+      const unreadState = readCursorsAvailable ? await bookingUnreadState(db, booking.id, user.id) : null;
       return c.json({
         data: page.chronologicalRows.map((row) => mapBookingMessage(row, booking, user)),
         meta: {
@@ -2081,7 +2235,8 @@ function buildApp() {
           hasMore: page.hasMore,
           nextCursor: page.nextCursor,
           pollCursor: page.pollCursor,
-          messageCount: page.messageCount,
+          messageCount: unreadState?.messageCount ?? page.messageCount,
+          ...optionalUnreadMessageCount(unreadState?.unreadMessageCount),
           permissions: conversationPermissions(booking, user),
         },
       });
@@ -2153,6 +2308,7 @@ function buildApp() {
     const pageRows = candidates.slice(0, limit);
     const chronologicalRows = polling ? pageRows : pageRows.slice().reverse();
     const messages = chronologicalRows.map((row) => mapBookingMessage(row, booking, user));
+    const unreadState = readCursorsAvailable ? await bookingUnreadState(db, booking.id, user.id) : null;
     const pollCursor = polling
       ? pageRows[pageRows.length - 1]?.id || requestedCursor
       : metadata.latest_cursor || MESSAGE_STREAM_START_CURSOR;
@@ -2163,8 +2319,70 @@ function buildApp() {
         hasMore,
         nextCursor: !polling && hasMore ? pageRows[pageRows.length - 1]?.id || null : null,
         pollCursor,
-        messageCount: Number(metadata.message_count || 0),
+        messageCount: unreadState?.messageCount ?? Number(metadata.message_count || 0),
+        ...optionalUnreadMessageCount(unreadState?.unreadMessageCount),
         permissions: conversationPermissions(booking, user),
+      },
+    });
+  });
+
+  app.put(`${API_PREFIX}/bookings/:id/messages/read`, async (c) => {
+    const user = await currentUser(c);
+    await enforceRateLimit(c, `booking-message-read:${user.id}`, 600, 60 * 60);
+    const input = await parseJson(c, bookingMessageReadSchema, 2_000);
+    const db = requireDatabase(c.env);
+    const booking = await bookingForConversation(db, c.req.param("id"), user);
+    if (user.role === "admin") {
+      throw new ApiError(403, "read_cursor_forbidden", "Unread state is available only to conversation participants");
+    }
+    if (!(await hasBookingMessageReadCursors(db))) {
+      c.header("Retry-After", "2");
+      throw new ApiError(503, "unread_state_unavailable", "Unread state is temporarily unavailable");
+    }
+    const target = await db
+      .prepare(
+        `SELECT id, stream_position
+         FROM booking_messages
+         WHERE id = ? AND booking_id = ?
+         LIMIT 1`,
+      )
+      .bind(input.messageId, booking.id)
+      .first();
+    if (!target || target.stream_position === null) {
+      throw new ApiError(422, "invalid_read_cursor", "Message cursor is invalid");
+    }
+
+    await db
+      .prepare(
+        `INSERT INTO booking_message_read_cursors
+           (booking_id, participant_user_id, last_read_message_id, updated_at)
+         VALUES (?, ?, ?, CURRENT_TIMESTAMP)
+         ON CONFLICT (booking_id, participant_user_id) DO UPDATE SET
+           last_read_message_id = excluded.last_read_message_id,
+           updated_at = excluded.updated_at
+         WHERE (
+           SELECT candidate.stream_position
+           FROM booking_messages candidate
+           WHERE candidate.id = excluded.last_read_message_id
+         ) > COALESCE(
+           (
+             SELECT current_message.stream_position
+             FROM booking_messages current_message
+             WHERE current_message.id = booking_message_read_cursors.last_read_message_id
+           ),
+           0
+         )`,
+      )
+      .bind(booking.id, user.id, target.id)
+      .run();
+    const state = await bookingUnreadState(db, booking.id, user.id);
+    return c.json({
+      data: {
+        bookingId: booking.id,
+        readThroughMessageId: state.readThroughMessageId,
+        readThroughSequence: state.readThroughSequence,
+        messageCount: state.messageCount,
+        unreadMessageCount: state.unreadMessageCount,
       },
     });
   });
@@ -2189,7 +2407,11 @@ function buildApp() {
       return c.json(
         {
           data: { ...replay.value, sequence: state.message.sequence },
-          meta: { replayed: true, messageCount: state.messageCount },
+          meta: {
+            replayed: true,
+            messageCount: state.messageCount,
+            ...optionalUnreadMessageCount(state.unreadMessageCount),
+          },
         },
         replay.status,
       );
@@ -2304,7 +2526,11 @@ function buildApp() {
           return c.json(
             {
               data: { ...concurrentReplay.value, sequence: state.message.sequence },
-              meta: { replayed: true, messageCount: state.messageCount },
+              meta: {
+                replayed: true,
+                messageCount: state.messageCount,
+                ...optionalUnreadMessageCount(state.unreadMessageCount),
+              },
             },
             concurrentReplay.status,
           );
@@ -2313,22 +2539,35 @@ function buildApp() {
       throw error;
     }
     const state = await bookingMessageState(db, booking, id, user, streamAvailable);
-    return c.json({ data: state.message, meta: { messageCount: state.messageCount } }, 201);
+    return c.json({
+      data: state.message,
+      meta: {
+        messageCount: state.messageCount,
+        ...optionalUnreadMessageCount(state.unreadMessageCount),
+      },
+    }, 201);
   });
 
   app.get(`${API_PREFIX}/auctions/:id/award`, async (c) => {
     const user = await currentUser(c);
     const auctionId = c.req.param("id");
     if (!/^[0-9a-f-]{36}$/i.test(auctionId)) throw new ApiError(404, "award_not_found", "Award record not found");
-    const row = await requireDatabase(c.env)
+    const db = requireDatabase(c.env);
+    const streamAvailable = await hasBookingMessageStreamPosition(db);
+    const readCursorsAvailable = user.role !== "admin" && await hasBookingMessageReadCursors(db);
+    const unreadSelect = readCursorsAvailable
+      ? `, ${unreadMessageCountSql("booking.id")} AS unread_message_count`
+      : "";
+    const row = await db
       .prepare(
         `SELECT booking.*, vendor.user_id AS vendor_user_id, vendor.status AS vendor_status,
-                (SELECT COUNT(*) FROM booking_messages message WHERE message.booking_id = booking.id) AS message_count
+                ${bookingMessageCountSql("booking.id", streamAvailable)} AS message_count
+                ${unreadSelect}
          FROM bookings booking
          JOIN vendors vendor ON vendor.id = booking.vendor_id
          WHERE booking.auction_id = ? LIMIT 1`,
       )
-      .bind(auctionId)
+      .bind(...(readCursorsAvailable ? [user.id, user.id] : []), auctionId)
       .first();
     if (
       !row

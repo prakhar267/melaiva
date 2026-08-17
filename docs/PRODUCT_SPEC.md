@@ -76,7 +76,7 @@ Verification, marketplace operations, support, disputes, finance, moderation, an
 - Provide cancellation, replacement, refund, dispute, and escalation workflows.
 - Permit reviews only after verified fulfillment.
 
-Current MVP boundary: after an award, the request owner and winning approved vendor can exchange private, text-only coordination messages beside the immutable accepted scope. An open, visible conversation checks incrementally for new records and provides a manual refresh fallback, without claiming unread status or read receipts. Existing history remains readable if partner approval changes, but new messages pause for both parties. Messages do not represent a contract, signature, invoice, booking confirmation, or payment; attachments, notifications, signatures, and payment-provider workflows remain future work.
+Current MVP boundary: after an award, the request owner and winning approved vendor can exchange private, text-only coordination messages beside the immutable accepted scope. Participant-private unread badges update from durable server cursors and clear only after the exact latest rendered message reaches the reader's viewport; the counterparty never sees a read receipt. An open, visible conversation still checks incrementally for new records and provides a manual refresh fallback. Existing history remains readable if partner approval changes, but new messages pause for both parties. Messages do not represent a contract, signature, invoice, booking confirmation, or payment; attachments, notifications, signatures, and payment-provider workflows remain future work.
 
 ### Vendor workspace
 

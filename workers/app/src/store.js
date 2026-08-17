@@ -1,4 +1,4 @@
-const STORE_SCHEMA_VERSION = 6;
+const STORE_SCHEMA_VERSION = 7;
 const MAINTENANCE_INTERVAL_MS = 60 * 60 * 1000;
 
 const STORE_SCHEMA_V1_SQL = `
@@ -499,7 +499,155 @@ ALTER TABLE booking_messages ADD COLUMN stream_position INTEGER;
 ${STORE_SCHEMA_V6_FINALIZE_SQL}
 `;
 
-const STORE_SCHEMA_SQL = `${STORE_SCHEMA_V1_SQL}\n${STORE_SCHEMA_V2_MIGRATION_SQL}\n${STORE_SCHEMA_V3_MIGRATION_SQL}\n${STORE_SCHEMA_V4_MIGRATION_SQL}\n${STORE_SCHEMA_V5_MIGRATION_SQL}\n${STORE_SCHEMA_V6_MIGRATION_SQL}`;
+const STORE_SCHEMA_V7_MIGRATION_SQL = `
+CREATE TABLE IF NOT EXISTS booking_message_read_cursors (
+  booking_id TEXT NOT NULL REFERENCES bookings(id) ON DELETE RESTRICT,
+  participant_user_id TEXT NOT NULL REFERENCES users(id) ON DELETE RESTRICT,
+  last_read_message_id TEXT REFERENCES booking_messages(id) ON DELETE RESTRICT,
+  updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+  PRIMARY KEY (booking_id, participant_user_id)
+);
+
+DROP TRIGGER IF EXISTS booking_message_read_cursor_participant_insert;
+DROP TRIGGER IF EXISTS booking_message_read_cursor_participant_update;
+DROP TRIGGER IF EXISTS booking_message_read_cursor_message_insert;
+DROP TRIGGER IF EXISTS booking_message_read_cursor_message_update;
+DROP TRIGGER IF EXISTS booking_message_read_cursor_identity_update;
+DROP TRIGGER IF EXISTS booking_message_read_cursor_delete;
+DROP TRIGGER IF EXISTS bookings_message_read_cursors_insert;
+
+CREATE TRIGGER booking_message_read_cursor_participant_insert
+BEFORE INSERT ON booking_message_read_cursors
+WHEN NOT EXISTS (
+  SELECT 1
+  FROM bookings booking
+  JOIN vendors vendor ON vendor.id = booking.vendor_id
+  WHERE booking.id = NEW.booking_id
+    AND NEW.participant_user_id IN (booking.couple_user_id, vendor.user_id)
+)
+BEGIN
+  SELECT RAISE(ABORT, 'booking message read cursor owner must be a participant');
+END;
+
+CREATE TRIGGER booking_message_read_cursor_participant_update
+BEFORE UPDATE ON booking_message_read_cursors
+WHEN NOT EXISTS (
+  SELECT 1
+  FROM bookings booking
+  JOIN vendors vendor ON vendor.id = booking.vendor_id
+  WHERE booking.id = NEW.booking_id
+    AND NEW.participant_user_id IN (booking.couple_user_id, vendor.user_id)
+)
+BEGIN
+  SELECT RAISE(ABORT, 'booking message read cursor owner must be a participant');
+END;
+
+CREATE TRIGGER booking_message_read_cursor_message_insert
+BEFORE INSERT ON booking_message_read_cursors
+WHEN NEW.last_read_message_id IS NOT NULL
+  AND NOT EXISTS (
+    SELECT 1
+    FROM booking_messages message
+    WHERE message.id = NEW.last_read_message_id
+      AND message.booking_id = NEW.booking_id
+  )
+BEGIN
+  SELECT RAISE(ABORT, 'booking message read cursor must reference its thread');
+END;
+
+CREATE TRIGGER booking_message_read_cursor_message_update
+BEFORE UPDATE OF last_read_message_id ON booking_message_read_cursors
+WHEN (NEW.last_read_message_id IS NULL AND OLD.last_read_message_id IS NOT NULL)
+  OR (
+    NEW.last_read_message_id IS NOT NULL
+    AND NOT EXISTS (
+      SELECT 1
+      FROM booking_messages candidate
+      WHERE candidate.id = NEW.last_read_message_id
+        AND candidate.booking_id = NEW.booking_id
+    )
+  )
+  OR (
+    OLD.last_read_message_id IS NOT NULL
+    AND (
+      SELECT candidate.stream_position
+      FROM booking_messages candidate
+      WHERE candidate.id = NEW.last_read_message_id
+    ) < (
+      SELECT previous.stream_position
+      FROM booking_messages previous
+      WHERE previous.id = OLD.last_read_message_id
+    )
+  )
+BEGIN
+  SELECT RAISE(ABORT, 'booking message read cursor cannot move backward or leave its thread');
+END;
+
+CREATE TRIGGER booking_message_read_cursor_identity_update
+BEFORE UPDATE OF booking_id, participant_user_id ON booking_message_read_cursors
+BEGIN
+  SELECT RAISE(ABORT, 'booking message read cursor identity is immutable');
+END;
+
+CREATE TRIGGER booking_message_read_cursor_delete
+BEFORE DELETE ON booking_message_read_cursors
+BEGIN
+  SELECT RAISE(ABORT, 'booking message read cursors are retained');
+END;
+
+INSERT INTO booking_message_read_cursors
+  (booking_id, participant_user_id, last_read_message_id, updated_at)
+SELECT booking.id,
+       booking.couple_user_id,
+       (
+         SELECT latest.id
+         FROM booking_messages latest
+         WHERE latest.booking_id = booking.id
+         ORDER BY latest.stream_position DESC
+         LIMIT 1
+       ),
+       CURRENT_TIMESTAMP
+FROM bookings booking
+WHERE true
+ON CONFLICT (booking_id, participant_user_id) DO NOTHING;
+
+INSERT INTO booking_message_read_cursors
+  (booking_id, participant_user_id, last_read_message_id, updated_at)
+SELECT booking.id,
+       vendor.user_id,
+       (
+         SELECT latest.id
+         FROM booking_messages latest
+         WHERE latest.booking_id = booking.id
+         ORDER BY latest.stream_position DESC
+         LIMIT 1
+       ),
+       CURRENT_TIMESTAMP
+FROM bookings booking
+JOIN vendors vendor ON vendor.id = booking.vendor_id
+WHERE vendor.user_id IS NOT NULL
+ON CONFLICT (booking_id, participant_user_id) DO NOTHING;
+
+CREATE TRIGGER bookings_message_read_cursors_insert
+AFTER INSERT ON bookings
+BEGIN
+  INSERT OR IGNORE INTO booking_message_read_cursors
+    (booking_id, participant_user_id, last_read_message_id)
+  VALUES (NEW.id, NEW.couple_user_id, NULL);
+
+  INSERT OR IGNORE INTO booking_message_read_cursors
+    (booking_id, participant_user_id, last_read_message_id)
+  SELECT NEW.id, vendor.user_id, NULL
+  FROM vendors vendor
+  WHERE vendor.id = NEW.vendor_id
+    AND vendor.user_id IS NOT NULL;
+END;
+
+INSERT OR IGNORE INTO _sql_schema_migrations (id) VALUES (7);
+PRAGMA optimize;
+`;
+
+const STORE_SCHEMA_SQL = `${STORE_SCHEMA_V1_SQL}\n${STORE_SCHEMA_V2_MIGRATION_SQL}\n${STORE_SCHEMA_V3_MIGRATION_SQL}\n${STORE_SCHEMA_V4_MIGRATION_SQL}\n${STORE_SCHEMA_V5_MIGRATION_SQL}\n${STORE_SCHEMA_V6_MIGRATION_SQL}\n${STORE_SCHEMA_V7_MIGRATION_SQL}`;
 
 const DEMO_CATALOG_SQL = `
 INSERT OR IGNORE INTO vendors
@@ -581,6 +729,9 @@ export class MelaivaStore {
           this.sql.exec("ALTER TABLE booking_messages ADD COLUMN stream_position INTEGER").toArray();
         }
         this.sql.exec(STORE_SCHEMA_V6_FINALIZE_SQL).toArray();
+      }
+      if (version > 0 && version < 7) {
+        this.sql.exec(STORE_SCHEMA_V7_MIGRATION_SQL).toArray();
       }
       if (env?.ENABLE_DEMO_CATALOG === "true" && env?.ENVIRONMENT !== "production") {
         this.sql.exec(DEMO_CATALOG_SQL).toArray();
@@ -719,6 +870,7 @@ export {
   STORE_SCHEMA_V5_MIGRATION_SQL,
   STORE_SCHEMA_V6_FINALIZE_SQL,
   STORE_SCHEMA_V6_MIGRATION_SQL,
+  STORE_SCHEMA_V7_MIGRATION_SQL,
   STORE_SCHEMA_VERSION,
   executeSql,
 };

@@ -82,6 +82,14 @@ export function evidenceFocusIndexAfterRemoval(itemCount, removedIndex) {
   return Math.min(Math.max(0, Number(removedIndex) || 0), remainingCount - 1);
 }
 
+export function evidenceFocusNeedsScroll(rect, viewportHeight) {
+  const top = Number(rect?.top);
+  const bottom = Number(rect?.bottom);
+  const height = Number(viewportHeight);
+  if (![top, bottom, height].every(Number.isFinite) || height <= 0) return false;
+  return top < 0 || bottom > height;
+}
+
 export function canCompleteVendorEvidence(status, evidenceComplete) {
   return status === "needs_information"
     || (evidenceComplete !== true && ["pending", "rejected"].includes(status));
@@ -294,6 +302,17 @@ export function shouldClearVendorEvidencePrivateDraft({
     || (identityChanged && (evidenceOnly || wasEvidenceOnly))
     || (evidenceOnly && accessResolved && !incomingContext),
   );
+}
+
+export function vendorEvidenceExplicitReloadPlan(accessResult) {
+  const vendorId = normalizeVendorId(accessResult?.context?.vendorId);
+  return {
+    vendorId,
+    shouldPrefill: Boolean(
+      vendorId
+      && ["eligible", "revision"].includes(accessResult?.state),
+    ),
+  };
 }
 
 export function vendorEvidenceContextRefreshDecision({

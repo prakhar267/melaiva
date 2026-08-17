@@ -44,6 +44,7 @@ import {
   buildVendorEvidenceSubmissionPayload,
   canCompleteVendorEvidence,
   evidenceFocusIndexAfterRemoval,
+  evidenceFocusNeedsScroll,
   normalizeInformationRequest,
   normalizeVendorEffectiveStatus,
   normalizeVendorEvidenceContext,
@@ -56,12 +57,16 @@ import {
   vendorEvidenceCompletionEligibility,
   vendorEvidenceConflictState,
   vendorEvidenceContextRefreshDecision,
+  vendorEvidenceExplicitReloadPlan,
   vendorEvidencePreflightIdentityMatches,
   vendorEvidencePreflightMatches,
   vendorEvidenceFieldRequested,
   vendorEvidenceServerFieldErrors,
 } from "../components/vendorOnboarding.js";
-import { checkVendorApplicationEvidenceCompatibility } from "../components/vendorApplicationCompatibility.js";
+import {
+  checkVendorApplicationEvidenceCompatibility,
+  VENDOR_APPLICATION_EVIDENCE_HEADERS,
+} from "../components/vendorApplicationCompatibility.js";
 
 function categoryLabel(value) {
   return categories.find((category) => category.id === value)?.name || value?.replaceAll("_", " ") || "Service";
@@ -653,7 +658,7 @@ async function readVendorEvidenceCompletionAccess({ signal } = {}) {
   };
 }
 
-function EvidenceUrlFields({ id, label, description, values, minimum, maximum, errors, requested = false, onChange, onAdd, onRemove }) {
+function EvidenceUrlFields({ id, label, description, values, minimum, maximum, errors, requested = false, disabled = false, onChange, onAdd, onRemove }) {
   const groupErrorId = `${id}-error`;
   return (
     <div className={`onboarding-evidence-links ${requested ? "is-requested" : ""}`}>
@@ -666,14 +671,14 @@ function EvidenceUrlFields({ id, label, description, values, minimum, maximum, e
           <div className="onboarding-evidence-link" key={`${id}-${index}`}>
             <label className="field">
               <span>{label.replace(/s$/u, "")} {index + 1}{index >= minimum ? <small>Optional</small> : null}</span>
-              <div className="input-wrap"><Link2 size={16} /><input type="url" inputMode="url" value={value} onChange={(event) => onChange(index, event.target.value)} placeholder="https://" maxLength="500" data-evidence-field={id} data-evidence-index={index} data-evidence-focus={`${id}:${index}`} aria-invalid={Boolean(errors[`${id}.${index}`] || errors[id])} aria-describedby={[errors[`${id}.${index}`] ? `${id}-${index}-error` : "", errors[id] ? groupErrorId : ""].filter(Boolean).join(" ") || undefined} required={index < minimum} /></div>
+              <div className="input-wrap"><Link2 size={16} /><input type="url" inputMode="url" value={value} onChange={(event) => onChange(index, event.target.value)} placeholder="https://" maxLength="500" data-evidence-field={id} data-evidence-index={index} data-evidence-focus={`${id}:${index}`} aria-invalid={Boolean(errors[`${id}.${index}`] || errors[id])} aria-describedby={[errors[`${id}.${index}`] ? `${id}-${index}-error` : "", errors[id] ? groupErrorId : ""].filter(Boolean).join(" ") || undefined} required={index < minimum} disabled={disabled} /></div>
               <OnboardingError id={`${id}-${index}-error`}>{errors[`${id}.${index}`]}</OnboardingError>
             </label>
-            {values.length > minimum && <button className="icon-button icon-button--small" type="button" data-evidence-focus={`${id}:remove:${index}`} onClick={() => onRemove(index)} aria-label={`Remove ${label.toLowerCase().replace(/s$/u, "")} ${index + 1}`}><X size={16} /></button>}
+            {values.length > minimum && <button className="icon-button icon-button--small" type="button" data-evidence-focus={`${id}:remove:${index}`} onClick={() => onRemove(index)} aria-label={`Remove ${label.toLowerCase().replace(/s$/u, "")} ${index + 1}`} disabled={disabled}><X size={16} /></button>}
           </div>
         ))}
       </div>
-      {values.length < maximum && <button className="text-button onboarding-evidence-links__add" type="button" data-evidence-add={id} data-evidence-focus={`${id}:add`} onClick={onAdd}><Plus size={14} /> Add another</button>}
+      {values.length < maximum && <button className="text-button onboarding-evidence-links__add" type="button" data-evidence-add={id} data-evidence-focus={`${id}:add`} onClick={onAdd} disabled={disabled}><Plus size={14} /> Add another</button>}
       <OnboardingError id={groupErrorId}>{errors[id]}</OnboardingError>
     </div>
   );
@@ -696,6 +701,7 @@ export function VendorOnboardingPage({ notify, onOpenAuth, authRevision = 0 }) {
   const [submissionUnconfirmed, setSubmissionUnconfirmed] = useState(false);
   const [evidenceAccessRetryKey, setEvidenceAccessRetryKey] = useState(0);
   const [evidenceIdentityPending, setEvidenceIdentityPending] = useState(evidenceOnly);
+  const [evidenceAccessErrorMessage, setEvidenceAccessErrorMessage] = useState("");
   const submissionKeyRef = useRef(null);
   const formRef = useRef(null);
   const formInitializedRef = useRef(false);
@@ -707,11 +713,22 @@ export function VendorOnboardingPage({ notify, onOpenAuth, authRevision = 0 }) {
   const evidenceAuthRevisionRef = useRef(authRevision);
   const submissionGenerationRef = useRef(0);
   const activeMutationRef = useRef(null);
+  const submissionLockRef = useRef(false);
   const evidenceFocusRestoreRef = useRef(null);
+  const evidenceFocusRestoreFrameRef = useRef(null);
+
+  function cancelScheduledEvidenceFocus() {
+    if (evidenceFocusRestoreFrameRef.current !== null) {
+      window.cancelAnimationFrame(evidenceFocusRestoreFrameRef.current);
+      evidenceFocusRestoreFrameRef.current = null;
+    }
+  }
 
   function clearPrivateEvidenceDraft() {
     submissionGenerationRef.current += 1;
     activeMutationRef.current = null;
+    submissionLockRef.current = false;
+    cancelScheduledEvidenceFocus();
     evidenceFocusRestoreRef.current = null;
     submissionKeyRef.current = null;
     formInitializedRef.current = false;
@@ -726,6 +743,7 @@ export function VendorOnboardingPage({ notify, onOpenAuth, authRevision = 0 }) {
     setEvidenceContext(null);
     setEvidenceConflict(null);
     setSubmissionUnconfirmed(false);
+    setEvidenceAccessErrorMessage("");
   }
 
   function captureEvidenceFocus() {
@@ -735,16 +753,33 @@ export function VendorOnboardingPage({ notify, onOpenAuth, authRevision = 0 }) {
     }
   }
 
+  function scheduleEvidenceFocus(focusDescriptor) {
+    cancelScheduledEvidenceFocus();
+    if (!focusDescriptor) return;
+    const focusGeneration = submissionGenerationRef.current;
+    evidenceFocusRestoreFrameRef.current = window.requestAnimationFrame(() => {
+      evidenceFocusRestoreFrameRef.current = null;
+      if (focusGeneration !== submissionGenerationRef.current || !evidenceModeRef.current) return;
+      const controls = [...(formRef.current?.querySelectorAll("[data-evidence-focus]") || [])]
+        .filter((element) => !element.disabled && element.getAttribute("aria-hidden") !== "true");
+      const target = controls.find((element) => element.getAttribute("data-evidence-focus") === focusDescriptor)
+        || controls[0];
+      if (!target) return;
+      target.focus({ preventScroll: true });
+      const viewportHeight = window.visualViewport?.height || window.innerHeight;
+      if (evidenceFocusNeedsScroll(target.getBoundingClientRect(), viewportHeight)) {
+        target.scrollIntoView({ block: "center", inline: "nearest" });
+      }
+    });
+  }
+
   function restoreEvidenceFocus() {
     const focusDescriptor = evidenceFocusRestoreRef.current;
     evidenceFocusRestoreRef.current = null;
-    if (!focusDescriptor) return;
-    window.requestAnimationFrame(() => {
-      const target = [...(formRef.current?.querySelectorAll("[data-evidence-focus]") || [])]
-        .find((element) => element.getAttribute("data-evidence-focus") === focusDescriptor);
-      target?.focus({ preventScroll: true });
-    });
+    scheduleEvidenceFocus(focusDescriptor);
   }
+
+  useEffect(() => () => cancelScheduledEvidenceFocus(), []);
 
   useEffect(() => {
     const controller = new AbortController();
@@ -767,11 +802,13 @@ export function VendorOnboardingPage({ notify, onOpenAuth, authRevision = 0 }) {
       captureEvidenceFocus();
       evidenceReadSequenceRef.current += 1;
       submissionGenerationRef.current += 1;
-      if (activeMutationRef.current) {
+      const mutationInFlight = Boolean(activeMutationRef.current);
+      submissionLockRef.current = mutationInFlight;
+      if (mutationInFlight) {
         setSubmissionUnconfirmed(true);
         setSubmitError("We are rechecking this account before confirming the in-flight submission. The unchanged form and secure submission key are preserved for a safe retry.");
       }
-      setLoading(false);
+      setLoading(mutationInFlight);
       setEvidenceIdentityPending(true);
       setEvidenceAccess("checking");
       setEvidenceAccessRetryKey((value) => value + 1);
@@ -812,6 +849,7 @@ export function VendorOnboardingPage({ notify, onOpenAuth, authRevision = 0 }) {
       return undefined;
     }
     const controller = new AbortController();
+    setEvidenceAccessErrorMessage("");
     setEvidenceIdentityPending(true);
     setEvidenceAccess("checking");
     setEvidenceVendorStatus(null);
@@ -839,6 +877,11 @@ export function VendorOnboardingPage({ notify, onOpenAuth, authRevision = 0 }) {
               }
             }
             setEvidenceIdentityPending(false);
+            return;
+          }
+          if (activeMutationRef.current) {
+            setEvidenceAccess("checking");
+            setEvidenceIdentityPending(true);
             return;
           }
           const refreshDecision = vendorEvidenceContextRefreshDecision({
@@ -890,25 +933,27 @@ export function VendorOnboardingPage({ notify, onOpenAuth, authRevision = 0 }) {
   }, [authRevision, compatibility, evidenceAccessRetryKey, evidenceOnly]);
 
   function markFormChanged() {
+    if (submissionLockRef.current) return false;
     dirtyRef.current = true;
     submissionKeyRef.current = null;
     setSubmissionUnconfirmed(false);
+    return true;
   }
 
   function update(key, value) {
-    markFormChanged();
+    if (!markFormChanged()) return;
     setForm((current) => ({ ...current, [key]: value }));
     setErrors((current) => ({ ...current, [key]: "" }));
     setSubmitError("");
   }
   function updateEvidenceUrl(key, index, value) {
-    markFormChanged();
+    if (!markFormChanged()) return;
     setForm((current) => ({ ...current, [key]: current[key].map((item, itemIndex) => itemIndex === index ? value : item) }));
     setErrors((current) => ({ ...current, [key]: "", [`${key}.${index}`]: "" }));
     setSubmitError("");
   }
   function addEvidenceUrl(key) {
-    markFormChanged();
+    if (!markFormChanged()) return;
     const nextIndex = form[key].length;
     setForm((current) => ({ ...current, [key]: [...current[key], ""] }));
     setErrors((current) => ({ ...current, [key]: "" }));
@@ -918,7 +963,7 @@ export function VendorOnboardingPage({ notify, onOpenAuth, authRevision = 0 }) {
       ?.focus());
   }
   function removeEvidenceUrl(key, index) {
-    markFormChanged();
+    if (!markFormChanged()) return;
     const nextIndex = evidenceFocusIndexAfterRemoval(form[key].length, index);
     setForm((current) => ({ ...current, [key]: current[key].filter((_, itemIndex) => itemIndex !== index) }));
     setErrors((current) => Object.fromEntries(Object.entries(current).filter(([errorKey]) => !errorKey.startsWith(`${key}.`))));
@@ -933,52 +978,34 @@ export function VendorOnboardingPage({ notify, onOpenAuth, authRevision = 0 }) {
 
   async function reloadLatestEvidence() {
     const readSequence = ++evidenceReadSequenceRef.current;
-    const expectedVendorId = loadedVendorIdRef.current;
-    submissionGenerationRef.current += 1;
+    // Discard is an immediate user decision, not a side effect of a later read.
+    // Clear first so focus/auth revalidation cannot cancel the discard intent.
+    clearPrivateEvidenceDraft();
     setEvidenceIdentityPending(true);
+    setEvidenceAccess("checking");
     setLoading(true);
-    setSubmitError("");
     try {
       const result = await readVendorEvidenceCompletionAccess();
       if (readSequence !== evidenceReadSequenceRef.current) return;
-      if (!result.context?.vendorId
-        || (expectedVendorId && result.context.vendorId !== expectedVendorId)) {
-        clearPrivateEvidenceDraft();
-        setEvidenceAccess(result.state);
-        setEvidenceVendorStatus(result.vendorStatus);
-        if (result.context) {
-          evidenceContextRef.current = result.context;
-          setEvidenceContext(result.context);
-          if (["eligible", "revision"].includes(result.state)) {
-            setForm((current) => ({ ...current, ...prefillVendorEvidence(result.context) }));
-            formInitializedRef.current = true;
-            loadedVendorIdRef.current = result.context.vendorId;
-          }
-        }
-        setEvidenceIdentityPending(false);
-        if (result.state === "guest") onOpenAuth();
-        return;
-      }
+      const reloadPlan = vendorEvidenceExplicitReloadPlan(result);
       setEvidenceAccess(result.state);
       setEvidenceVendorStatus(result.vendorStatus);
-      evidenceContextRef.current = result.context;
-      setEvidenceContext(result.context);
-      if (["eligible", "revision"].includes(result.state) && result.context) {
-        loadedVendorIdRef.current = result.context.vendorId;
+      if (result.context) {
+        evidenceContextRef.current = result.context;
+        setEvidenceContext(result.context);
+      }
+      if (reloadPlan.shouldPrefill && result.context) {
+        loadedVendorIdRef.current = reloadPlan.vendorId;
         setForm((current) => ({ ...current, ...prefillVendorEvidence(result.context) }));
         formInitializedRef.current = true;
-        dirtyRef.current = false;
-        submissionKeyRef.current = null;
-        setSubmissionUnconfirmed(false);
-        setEvidenceConflict(null);
-        setErrors({});
       }
       setEvidenceIdentityPending(false);
+      if (result.state === "guest") onOpenAuth();
     } catch (error) {
       if (readSequence === evidenceReadSequenceRef.current) {
         setEvidenceAccess("error");
         setEvidenceIdentityPending(false);
-        setSubmitError(error.message || "The latest evidence request could not be loaded. Your edits remain hidden in this tab until the account can be verified.");
+        setEvidenceAccessErrorMessage("The latest evidence request could not be loaded. The entries you discarded remain cleared; retry the account check to load the current record.");
       }
     } finally {
       if (readSequence === evidenceReadSequenceRef.current) setLoading(false);
@@ -987,6 +1014,7 @@ export function VendorOnboardingPage({ notify, onOpenAuth, authRevision = 0 }) {
 
   async function submit(event) {
     event.preventDefault();
+    if (submissionLockRef.current) return;
     const submissionGeneration = submissionGenerationRef.current;
     const submissionIsCurrent = () => submissionGenerationRef.current === submissionGeneration;
     const retryingUnconfirmedSubmission = submissionUnconfirmed;
@@ -1012,7 +1040,6 @@ export function VendorOnboardingPage({ notify, onOpenAuth, authRevision = 0 }) {
       window.requestAnimationFrame(() => formRef.current?.querySelector('[aria-invalid="true"]')?.focus());
       return;
     }
-    setLoading(true); setSubmitError(""); setErrors({});
     const evidence = buildVendorEvidence(form);
     const applicationPayload = {
       businessName: form.businessName.trim(),
@@ -1033,10 +1060,12 @@ export function VendorOnboardingPage({ notify, onOpenAuth, authRevision = 0 }) {
     const expectedContext = evidenceContext;
     const payload = evidenceOnly ? buildVendorEvidenceSubmissionPayload(form, expectedContext) : applicationPayload;
     if (evidenceOnly && !payload) {
-      setLoading(false);
       setSubmitError("The application version needed for a safe update is unavailable. Refresh the latest evidence request before submitting.");
       return;
     }
+    if (evidenceOnly) captureEvidenceFocus();
+    submissionLockRef.current = true;
+    setLoading(true); setSubmitError(""); setErrors({});
     let submissionStarted = false;
     let compatibilityConfirmed = false;
     let mutationToken = null;
@@ -1081,7 +1110,6 @@ export function VendorOnboardingPage({ notify, onOpenAuth, authRevision = 0 }) {
       setEvidenceIdentityPending(false);
       return latest;
     };
-    if (evidenceOnly) captureEvidenceFocus();
     try {
       const compatible = await checkVendorApplicationEvidenceCompatibility();
       if (!submissionIsCurrent()) return;
@@ -1110,7 +1138,7 @@ export function VendorOnboardingPage({ notify, onOpenAuth, authRevision = 0 }) {
           setEvidenceVendorStatus(accessResult.vendorStatus);
           setEvidenceConflict({ kind: "application_changed", latest: accessResult });
           setSubmitError("The application or information request changed before submission. Your edits are preserved and nothing was submitted.");
-          window.requestAnimationFrame(() => formRef.current?.querySelector('[data-evidence-focus="load-latest"]')?.focus({ preventScroll: true }));
+          scheduleEvidenceFocus("load-latest");
           return;
         }
       }
@@ -1120,7 +1148,7 @@ export function VendorOnboardingPage({ notify, onOpenAuth, authRevision = 0 }) {
       mutationToken = {};
       activeMutationRef.current = mutationToken;
       if (evidenceOnly) setEvidenceIdentityPending(true);
-      const response = await fetch(evidenceOnly ? "/api/v1/vendors/onboarding/evidence" : "/api/v1/vendors/onboarding", { method: evidenceOnly ? "PUT" : "POST", headers: { "Content-Type": "application/json", "Idempotency-Key": submissionKey }, credentials: "include", body: JSON.stringify(payload) });
+      const response = await fetch(evidenceOnly ? "/api/v1/vendors/onboarding/evidence" : "/api/v1/vendors/onboarding", { method: evidenceOnly ? "PUT" : "POST", headers: { "Content-Type": "application/json", "Idempotency-Key": submissionKey, ...(evidenceOnly ? VENDOR_APPLICATION_EVIDENCE_HEADERS : {}) }, credentials: "include", body: JSON.stringify(payload) });
       if (!submissionIsCurrent()) return;
       if (evidenceOnly) {
         postDispatchAccess = await verifyPostDispatchEvidenceIdentity();
@@ -1167,11 +1195,16 @@ export function VendorOnboardingPage({ notify, onOpenAuth, authRevision = 0 }) {
           setSubmitError("The application could not be prepared. Your entries remain in this form and nothing was submitted.");
         }
       } else if (requestError.code === "SIGN_IN") setSubmitError(requestError.message);
+      else if (evidenceOnly && requestError.code === "client_upgrade_required") {
+        setCompatibility("upgrade");
+        setSubmissionUnconfirmed(false);
+        setSubmitError(requestError.message);
+      }
       else if (evidenceOnly && vendorEvidenceConflictState(requestError)) {
         setEvidenceConflict({ kind: vendorEvidenceConflictState(requestError), latest: postDispatchAccess });
         setSubmissionUnconfirmed(false);
         setSubmitError("The application changed while you were submitting. Your edits are preserved; load the latest application version before trying again.");
-        window.requestAnimationFrame(() => formRef.current?.querySelector('[data-evidence-focus="load-latest"]')?.focus({ preventScroll: true }));
+        scheduleEvidenceFocus("load-latest");
       } else if (evidenceOnly && Object.keys(vendorEvidenceServerFieldErrors(requestError.details)).length) {
         const serverErrors = vendorEvidenceServerFieldErrors(requestError.details);
         setErrors(serverErrors);
@@ -1192,8 +1225,21 @@ export function VendorOnboardingPage({ notify, onOpenAuth, authRevision = 0 }) {
         if (evidenceOnly) restoreEvidenceFocus();
       }
     } finally {
-      if (activeMutationRef.current === mutationToken) activeMutationRef.current = null;
-      if (submissionIsCurrent()) setLoading(false);
+      const mutationSettled = Boolean(mutationToken) && activeMutationRef.current === mutationToken;
+      if (mutationSettled) {
+        activeMutationRef.current = null;
+        submissionLockRef.current = false;
+      }
+      if (!submissionIsCurrent() && evidenceOnly && mutationSettled) {
+        setLoading(false);
+        setEvidenceIdentityPending(true);
+        setEvidenceAccess("checking");
+        setEvidenceAccessRetryKey((value) => value + 1);
+      }
+      if (submissionIsCurrent()) {
+        submissionLockRef.current = false;
+        setLoading(false);
+      }
     }
   }
 
@@ -1214,14 +1260,14 @@ export function VendorOnboardingPage({ notify, onOpenAuth, authRevision = 0 }) {
   if (evidenceOnly && evidenceAccess === "guest") return <OnboardingGate icon={LockKeyhole} eyebrow="Private application record" title="Sign in to complete application evidence" message="Evidence can be attached only to your own pending or declined partner application. Private evidence from an unverified session is cleared and nothing was submitted."><button className="button button--primary" type="button" onClick={onOpenAuth}>Sign in</button><Link className="button button--outline" to="/vendor">Return to vendor workspace</Link></OnboardingGate>;
   if (evidenceOnly && evidenceAccess === "no_application") return <OnboardingGate icon={Store} eyebrow="No partner application found" title="Start a partner application first" message="This account has no vendor application that can receive an evidence snapshot."><Link className="button button--primary" to="/vendor/onboarding">Start application</Link><Link className="button button--outline" to="/vendor">Return to vendor workspace</Link></OnboardingGate>;
   if (evidenceOnly && evidenceAccess === "status_unavailable") return <OnboardingGate icon={ShieldAlert} eyebrow="Evidence update unavailable" title="This application cannot add evidence in its current state" message={`Evidence updates are available for an incomplete application or an open information request. This application is ${evidenceVendorStatus || "in an unknown review state"}; private entries are hidden whenever its identity or review state cannot be verified, and nothing was submitted.`}><Link className="button button--primary" to="/vendor">Open vendor workspace</Link></OnboardingGate>;
-  if (evidenceOnly && evidenceAccess === "error") return <OnboardingGate icon={CircleAlert} eyebrow="Eligibility check unavailable" title="This application could not be checked" message={submissionUnconfirmed ? "The earlier submission remains unconfirmed. Its unchanged private entries and secure submission key stay hidden in this tab until this account can be verified for a safe retry." : "No evidence was submitted. Private entries remain hidden in this tab while the read-only account check is unavailable."}><button className="button button--primary" type="button" onClick={() => setEvidenceAccessRetryKey((value) => value + 1)}><RefreshCw size={16} /> Try again</button><Link className="button button--outline" to="/vendor">Return to vendor workspace</Link></OnboardingGate>;
+  if (evidenceOnly && evidenceAccess === "error") return <OnboardingGate icon={CircleAlert} eyebrow="Eligibility check unavailable" title="This application could not be checked" message={evidenceAccessErrorMessage || (submissionUnconfirmed ? "The earlier submission remains unconfirmed. Its unchanged private entries and secure submission key stay hidden in this tab until this account can be verified for a safe retry." : "No evidence was submitted. Private entries remain hidden in this tab while the read-only account check is unavailable.")}><button className="button button--primary" type="button" onClick={() => setEvidenceAccessRetryKey((value) => value + 1)}><RefreshCw size={16} /> Try again</button><Link className="button button--outline" to="/vendor">Return to vendor workspace</Link></OnboardingGate>;
   if (success) return <div className="onboarding-page page-surface"><div className="shell"><OnboardingSuccess evidenceOnly={evidenceOnly} success={success} /></div></div>;
   if (evidenceOnly && evidenceAccess === "complete") return <OnboardingGate icon={FileCheck2} eyebrow="Evidence already submitted" title="No evidence update is currently open" message="Your latest structured evidence is already with the partner team. Another revision can be submitted only when the partner team opens a specific information request."><Link className="button button--primary" to="/vendor">Check application status</Link></OnboardingGate>;
   return (
     <div className="onboarding-page page-surface">
       <OnboardingHero evidenceOnly={evidenceOnly} revisionMode={revisionMode} />
       <section className="shell onboarding-layout">
-        <form className="onboarding-form" onSubmit={submit} noValidate ref={formRef}>
+        <form className="onboarding-form" onSubmit={submit} noValidate ref={formRef} aria-busy={loading}>
           {compatibility !== "ready" && (
             <div className={`onboarding-compatibility onboarding-compatibility--${compatibility}`} role={compatibility === "checking" ? "status" : "alert"} aria-live="polite">
               {compatibility === "checking" ? <LoaderCircle className="spin-icon" size={18} /> : <ShieldAlert size={18} />}
@@ -1250,36 +1296,36 @@ export function VendorOnboardingPage({ notify, onOpenAuth, authRevision = 0 }) {
           {!evidenceOnly && <section className="onboarding-form__section" aria-labelledby="onboarding-business-heading">
             <div className="onboarding-form__heading"><span><Store size={20} /></span><div><h2 id="onboarding-business-heading">Introduce your business</h2><p>Every field without an “optional” label is required for partner review.</p></div></div>
             <div className="form-grid">
-              <label className="field"><span>Business name</span><input value={form.businessName} onChange={(event) => update("businessName", event.target.value)} placeholder="The Wedding Journal" maxLength="140" aria-invalid={Boolean(errors.businessName)} aria-describedby={errors.businessName ? "businessName-error" : undefined} required /><OnboardingError id="businessName-error">{errors.businessName}</OnboardingError></label>
-              <label className="field"><span>Registered or proprietor name</span><input value={form.legalName} onChange={(event) => update("legalName", event.target.value)} placeholder="Journal Studios Private Limited" maxLength="180" aria-invalid={Boolean(errors.legalName)} aria-describedby={errors.legalName ? "legalName-error" : undefined} required /><OnboardingError id="legalName-error">{errors.legalName}</OnboardingError></label>
-              <label className="field"><span>Primary service</span><div className="input-wrap input-wrap--select"><select value={form.category} onChange={(event) => update("category", event.target.value)} aria-invalid={Boolean(errors.category)} aria-describedby={errors.category ? "category-error" : undefined} required><option value="">Choose a category</option>{categories.map((category) => <option value={category.id} key={category.id}>{category.name}</option>)}</select><ChevronDown size={15} /></div><OnboardingError id="category-error">{errors.category}</OnboardingError></label>
-              <label className="field"><span>Home city</span><div className="input-wrap input-wrap--select"><select value={form.city} onChange={(event) => update("city", event.target.value)} aria-invalid={Boolean(errors.city)} aria-describedby={errors.city ? "city-error" : undefined} required><option value="">Choose a city</option>{cities.map((city) => <option key={city}>{city}</option>)}</select><ChevronDown size={15} /></div><OnboardingError id="city-error">{errors.city}</OnboardingError></label>
-              <label className="field field--span-2"><span>Service areas</span><input value={form.serviceAreas} onChange={(event) => update("serviceAreas", event.target.value)} placeholder="Delhi NCR, Jaipur, Chandigarh" aria-invalid={Boolean(errors.serviceAreas)} aria-describedby={errors.serviceAreas ? "serviceAreas-hint serviceAreas-error" : "serviceAreas-hint"} required /><small className="field-hint" id="serviceAreas-hint">Separate cities with commas.</small><OnboardingError id="serviceAreas-error">{errors.serviceAreas}</OnboardingError></label>
-              <label className="field"><span>Typical project from</span><div className="input-wrap"><IndianRupee size={16} /><input type="number" min="1000" step="1" value={form.minBudget} onChange={(event) => update("minBudget", event.target.value)} aria-invalid={Boolean(errors.minBudget)} aria-describedby={errors.minBudget ? "minBudget-error" : undefined} required /></div><OnboardingError id="minBudget-error">{errors.minBudget}</OnboardingError></label>
-              <label className="field"><span>Typical project up to</span><div className="input-wrap"><IndianRupee size={16} /><input type="number" min="1000" step="1" value={form.maxBudget} onChange={(event) => update("maxBudget", event.target.value)} aria-invalid={Boolean(errors.maxBudget)} aria-describedby={errors.maxBudget ? "maxBudget-error" : undefined} required /></div><OnboardingError id="maxBudget-error">{errors.maxBudget}</OnboardingError></label>
-              <label className="field field--span-2"><span>About your approach</span><textarea rows="6" minLength="80" maxLength="3000" value={form.description} onChange={(event) => update("description", event.target.value)} placeholder="Describe your point of view, strongest services, team and the celebrations you do best…" aria-invalid={Boolean(errors.description)} aria-describedby={errors.description ? "description-error" : undefined} required /><div className="field-counter"><OnboardingError id="description-error">{errors.description}</OnboardingError><span>{form.description.length} / 3,000</span></div></label>
-              <label className="field"><span>Contact number</span><input type="tel" value={form.phone} onChange={(event) => update("phone", event.target.value)} placeholder="+91 98765 43210" maxLength="24" aria-invalid={Boolean(errors.phone)} aria-describedby={errors.phone ? "phone-error" : undefined} required /><OnboardingError id="phone-error">{errors.phone}</OnboardingError></label>
-              <label className="field"><span>Website <small>Optional</small></span><input type="url" value={form.websiteUrl} onChange={(event) => update("websiteUrl", event.target.value)} placeholder="https://yourstudio.com" maxLength="300" aria-invalid={Boolean(errors.websiteUrl)} aria-describedby={errors.websiteUrl ? "websiteUrl-error" : undefined} /><OnboardingError id="websiteUrl-error">{errors.websiteUrl}</OnboardingError></label>
-              <label className="field field--span-2"><span>Instagram handle <small>Optional</small></span><input value={form.instagramHandle} onChange={(event) => update("instagramHandle", event.target.value)} placeholder="@yourstudio" maxLength="31" aria-invalid={Boolean(errors.instagramHandle)} aria-describedby={errors.instagramHandle ? "instagramHandle-error" : undefined} /><OnboardingError id="instagramHandle-error">{errors.instagramHandle}</OnboardingError></label>
+              <label className="field"><span>Business name</span><input value={form.businessName} onChange={(event) => update("businessName", event.target.value)} placeholder="The Wedding Journal" maxLength="140" aria-invalid={Boolean(errors.businessName)} aria-describedby={errors.businessName ? "businessName-error" : undefined} required disabled={loading} /><OnboardingError id="businessName-error">{errors.businessName}</OnboardingError></label>
+              <label className="field"><span>Registered or proprietor name</span><input value={form.legalName} onChange={(event) => update("legalName", event.target.value)} placeholder="Journal Studios Private Limited" maxLength="180" aria-invalid={Boolean(errors.legalName)} aria-describedby={errors.legalName ? "legalName-error" : undefined} required disabled={loading} /><OnboardingError id="legalName-error">{errors.legalName}</OnboardingError></label>
+              <label className="field"><span>Primary service</span><div className="input-wrap input-wrap--select"><select value={form.category} onChange={(event) => update("category", event.target.value)} aria-invalid={Boolean(errors.category)} aria-describedby={errors.category ? "category-error" : undefined} required disabled={loading}><option value="">Choose a category</option>{categories.map((category) => <option value={category.id} key={category.id}>{category.name}</option>)}</select><ChevronDown size={15} /></div><OnboardingError id="category-error">{errors.category}</OnboardingError></label>
+              <label className="field"><span>Home city</span><div className="input-wrap input-wrap--select"><select value={form.city} onChange={(event) => update("city", event.target.value)} aria-invalid={Boolean(errors.city)} aria-describedby={errors.city ? "city-error" : undefined} required disabled={loading}><option value="">Choose a city</option>{cities.map((city) => <option key={city}>{city}</option>)}</select><ChevronDown size={15} /></div><OnboardingError id="city-error">{errors.city}</OnboardingError></label>
+              <label className="field field--span-2"><span>Service areas</span><input value={form.serviceAreas} onChange={(event) => update("serviceAreas", event.target.value)} placeholder="Delhi NCR, Jaipur, Chandigarh" aria-invalid={Boolean(errors.serviceAreas)} aria-describedby={errors.serviceAreas ? "serviceAreas-hint serviceAreas-error" : "serviceAreas-hint"} required disabled={loading} /><small className="field-hint" id="serviceAreas-hint">Separate cities with commas.</small><OnboardingError id="serviceAreas-error">{errors.serviceAreas}</OnboardingError></label>
+              <label className="field"><span>Typical project from</span><div className="input-wrap"><IndianRupee size={16} /><input type="number" min="1000" step="1" value={form.minBudget} onChange={(event) => update("minBudget", event.target.value)} aria-invalid={Boolean(errors.minBudget)} aria-describedby={errors.minBudget ? "minBudget-error" : undefined} required disabled={loading} /></div><OnboardingError id="minBudget-error">{errors.minBudget}</OnboardingError></label>
+              <label className="field"><span>Typical project up to</span><div className="input-wrap"><IndianRupee size={16} /><input type="number" min="1000" step="1" value={form.maxBudget} onChange={(event) => update("maxBudget", event.target.value)} aria-invalid={Boolean(errors.maxBudget)} aria-describedby={errors.maxBudget ? "maxBudget-error" : undefined} required disabled={loading} /></div><OnboardingError id="maxBudget-error">{errors.maxBudget}</OnboardingError></label>
+              <label className="field field--span-2"><span>About your approach</span><textarea rows="6" minLength="80" maxLength="3000" value={form.description} onChange={(event) => update("description", event.target.value)} placeholder="Describe your point of view, strongest services, team and the celebrations you do best…" aria-invalid={Boolean(errors.description)} aria-describedby={errors.description ? "description-error" : undefined} required disabled={loading} /><div className="field-counter"><OnboardingError id="description-error">{errors.description}</OnboardingError><span>{form.description.length} / 3,000</span></div></label>
+              <label className="field"><span>Contact number</span><input type="tel" value={form.phone} onChange={(event) => update("phone", event.target.value)} placeholder="+91 98765 43210" maxLength="24" aria-invalid={Boolean(errors.phone)} aria-describedby={errors.phone ? "phone-error" : undefined} required disabled={loading} /><OnboardingError id="phone-error">{errors.phone}</OnboardingError></label>
+              <label className="field"><span>Website <small>Optional</small></span><input type="url" value={form.websiteUrl} onChange={(event) => update("websiteUrl", event.target.value)} placeholder="https://yourstudio.com" maxLength="300" aria-invalid={Boolean(errors.websiteUrl)} aria-describedby={errors.websiteUrl ? "websiteUrl-error" : undefined} disabled={loading} /><OnboardingError id="websiteUrl-error">{errors.websiteUrl}</OnboardingError></label>
+              <label className="field field--span-2"><span>Instagram handle <small>Optional</small></span><input value={form.instagramHandle} onChange={(event) => update("instagramHandle", event.target.value)} placeholder="@yourstudio" maxLength="31" aria-invalid={Boolean(errors.instagramHandle)} aria-describedby={errors.instagramHandle ? "instagramHandle-error" : undefined} disabled={loading} /><OnboardingError id="instagramHandle-error">{errors.instagramHandle}</OnboardingError></label>
             </div>
           </section>}
 
           <section className="onboarding-form__section onboarding-form__section--evidence" aria-labelledby="onboarding-evidence-heading">
             <div className="onboarding-form__heading"><span><FileCheck2 size={20} /></span><div><h2 id="onboarding-evidence-heading">{revisionMode ? `Evidence revision ${nextEvidenceRevision}` : evidenceOnly ? "Complete review evidence" : "Evidence for partner review"}</h2><p>We store each complete submission as an immutable application snapshot. Staff open links manually; Melaiva does not copy or embed their contents.</p></div></div>
-            <EvidenceUrlFields id="portfolioUrls" label="Portfolio links" description="Link directly to representative work that you are authorised to share." values={form.portfolioUrls} minimum={1} maximum={5} errors={errors} requested={vendorEvidenceFieldRequested("portfolio", informationRequest)} onChange={(index, value) => updateEvidenceUrl("portfolioUrls", index, value)} onAdd={() => addEvidenceUrl("portfolioUrls")} onRemove={(index) => removeEvidenceUrl("portfolioUrls", index)} />
-            <EvidenceUrlFields id="referenceUrls" label="Public review or reference links" description="Use a public client review, published testimonial or business listing—not private contact details." values={form.referenceUrls} minimum={1} maximum={3} errors={errors} requested={vendorEvidenceFieldRequested("references", informationRequest)} onChange={(index, value) => updateEvidenceUrl("referenceUrls", index, value)} onAdd={() => addEvidenceUrl("referenceUrls")} onRemove={(index) => removeEvidenceUrl("referenceUrls", index)} />
+            <EvidenceUrlFields id="portfolioUrls" label="Portfolio links" description="Link directly to representative work that you are authorised to share." values={form.portfolioUrls} minimum={1} maximum={5} errors={errors} requested={vendorEvidenceFieldRequested("portfolio", informationRequest)} disabled={loading} onChange={(index, value) => updateEvidenceUrl("portfolioUrls", index, value)} onAdd={() => addEvidenceUrl("portfolioUrls")} onRemove={(index) => removeEvidenceUrl("portfolioUrls", index)} />
+            <EvidenceUrlFields id="referenceUrls" label="Public review or reference links" description="Use a public client review, published testimonial or business listing—not private contact details." values={form.referenceUrls} minimum={1} maximum={3} errors={errors} requested={vendorEvidenceFieldRequested("references", informationRequest)} disabled={loading} onChange={(index, value) => updateEvidenceUrl("referenceUrls", index, value)} onAdd={() => addEvidenceUrl("referenceUrls")} onRemove={(index) => removeEvidenceUrl("referenceUrls", index)} />
             <div className={`form-grid onboarding-registration ${vendorEvidenceFieldRequested("registration", informationRequest) ? "is-requested" : ""}`}>
               {vendorEvidenceFieldRequested("registration", informationRequest) && <div className="onboarding-requested-heading field--span-2"><Landmark size={15} /><strong>Business-registration update requested</strong></div>}
-              <label className="field"><span>Business registration</span><div className="input-wrap input-wrap--select"><Landmark size={16} /><select value={form.registrationType} onChange={(event) => { update("registrationType", event.target.value); update("registrationReference", ""); }} data-evidence-focus="registration-type" aria-invalid={Boolean(errors.registrationType)} aria-describedby={errors.registrationType ? "registrationType-error" : undefined} required><option value="">Choose available evidence</option>{VENDOR_REGISTRATION_OPTIONS.map((option) => <option value={option.id} key={option.id}>{option.label}</option>)}</select><ChevronDown size={15} /></div><OnboardingError id="registrationType-error">{errors.registrationType}</OnboardingError></label>
+              <label className="field"><span>Business registration</span><div className="input-wrap input-wrap--select"><Landmark size={16} /><select value={form.registrationType} onChange={(event) => { update("registrationType", event.target.value); update("registrationReference", ""); }} data-evidence-focus="registration-type" aria-invalid={Boolean(errors.registrationType)} aria-describedby={errors.registrationType ? "registrationType-error" : undefined} required disabled={loading}><option value="">Choose available evidence</option>{VENDOR_REGISTRATION_OPTIONS.map((option) => <option value={option.id} key={option.id}>{option.label}</option>)}</select><ChevronDown size={15} /></div><OnboardingError id="registrationType-error">{errors.registrationType}</OnboardingError></label>
               {form.registrationType && form.registrationType !== "not_registered" ? (
-                <label className="field"><span>Registration reference</span><input value={form.registrationReference} onChange={(event) => update("registrationReference", event.target.value.toUpperCase())} placeholder={form.registrationType === "udyam" ? "UDYAM-RJ-12-1234567" : form.registrationType === "cin" ? "L12345RJ2020PLC123456" : "27AAPFU0939F1ZV"} maxLength="24" autoCapitalize="characters" autoComplete="off" data-evidence-focus="registration-reference" aria-invalid={Boolean(errors.registrationReference)} aria-describedby={errors.registrationReference ? "registrationReference-error" : undefined} required /><OnboardingError id="registrationReference-error">{errors.registrationReference}</OnboardingError></label>
+                <label className="field"><span>Registration reference</span><input value={form.registrationReference} onChange={(event) => update("registrationReference", event.target.value.toUpperCase())} placeholder={form.registrationType === "udyam" ? "UDYAM-RJ-12-1234567" : form.registrationType === "cin" ? "L12345RJ2020PLC123456" : "27AAPFU0939F1ZV"} maxLength="24" autoCapitalize="characters" autoComplete="off" data-evidence-focus="registration-reference" aria-invalid={Boolean(errors.registrationReference)} aria-describedby={errors.registrationReference ? "registrationReference-error" : undefined} required disabled={loading} /><OnboardingError id="registrationReference-error">{errors.registrationReference}</OnboardingError></label>
               ) : form.registrationType === "not_registered" ? (
                 <div className="onboarding-registration__declaration" role="note"><CircleAlert size={17} /><p><strong>Declaration only</strong><span>No government business-registration record will be supplied. The partner team must complete suitable alternative checks before approval.</span></p></div>
               ) : null}
               <p className="onboarding-registration__guard field--span-2"><ShieldAlert size={16} /><span>Do not enter Aadhaar, PAN, passport, voter ID, driving-licence, bank-account or payment-card details. This form accepts only the selected public business-registration reference.</span></p>
             </div>
             <label className="onboarding-evidence-attestation">
-              <input type="checkbox" checked={form.attested} onChange={(event) => update("attested", event.target.checked)} data-evidence-focus="attestation" aria-invalid={Boolean(errors.attested)} aria-describedby={errors.attested ? "attested-error" : undefined} required />
+              <input type="checkbox" checked={form.attested} onChange={(event) => update("attested", event.target.checked)} data-evidence-focus="attestation" aria-invalid={Boolean(errors.attested)} aria-describedby={errors.attested ? "attested-error" : undefined} required disabled={loading} />
               <span><Check size={14} /></span>
               <strong>I confirm these links are public, accurate, safe for authorised staff to open, and mine to submit for partner review.</strong>
             </label>

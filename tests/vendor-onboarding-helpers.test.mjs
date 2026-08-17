@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import { readFileSync } from "node:fs";
 import test from "node:test";
 
 import {
@@ -6,6 +7,7 @@ import {
   buildVendorEvidenceSubmissionPayload,
   canCompleteVendorEvidence,
   evidenceFocusIndexAfterRemoval,
+  evidenceFocusNeedsScroll,
   normalizeVendorEvidenceContext,
   prefillVendorEvidence,
   registrationReferenceError,
@@ -17,21 +19,25 @@ import {
   vendorEvidenceConflictState,
   vendorEvidenceContextRefreshDecision,
   vendorEvidenceContextsMatch,
+  vendorEvidenceExplicitReloadPlan,
   vendorEvidencePreflightIdentityMatches,
   vendorEvidencePreflightMatches,
 } from "../src/components/vendorOnboarding.js";
 import {
   supportsAdminVendorSummaryContract,
   supportsVendorApplicationEvidence,
+  VENDOR_APPLICATION_EVIDENCE_HEADERS,
 } from "../src/components/vendorApplicationCompatibility.js";
 
 test("vendor evidence compatibility fails closed across mixed Worker versions", () => {
-  assert.equal(supportsVendorApplicationEvidence({ data: { vendorApplicationEvidenceRevision: 4 } }), true);
+  assert.equal(supportsVendorApplicationEvidence({ data: { vendorApplicationEvidenceRevision: 5 } }), true);
   assert.equal(supportsVendorApplicationEvidence({ data: {} }), false);
-  assert.equal(supportsVendorApplicationEvidence({ data: { vendorApplicationEvidenceRevision: "4" } }), false);
+  assert.equal(supportsVendorApplicationEvidence({ data: { vendorApplicationEvidenceRevision: "5" } }), false);
+  assert.equal(supportsVendorApplicationEvidence({ data: { vendorApplicationEvidenceRevision: 4 } }), false);
   assert.equal(supportsVendorApplicationEvidence({ data: { vendorApplicationEvidenceRevision: 3 } }), false);
   assert.equal(supportsVendorApplicationEvidence({ data: { vendorApplicationEvidenceRevision: 2 } }), false);
   assert.equal(supportsVendorApplicationEvidence({ data: { vendorApplicationEvidenceRevision: 1 } }), false);
+  assert.deepEqual(VENDOR_APPLICATION_EVIDENCE_HEADERS, { "X-Melaiva-Vendor-Evidence": "5" });
 
   const summaryPayload = { meta: { contract: "vendor-summary-v2" } };
   assert.equal(supportsAdminVendorSummaryContract(summaryPayload, "2"), true);
@@ -42,6 +48,31 @@ test("vendor evidence compatibility fails closed across mixed Worker versions", 
     meta: { total: 1 },
   };
   assert.equal(supportsAdminVendorSummaryContract(legacyFullDetailPayload, null), false);
+});
+
+test("evidence form locks captured submissions and restores visible focus safely", () => {
+  assert.equal(evidenceFocusNeedsScroll({ top: 0, bottom: 40 }, 800), false);
+  assert.equal(evidenceFocusNeedsScroll({ top: -1, bottom: 39 }, 800), true);
+  assert.equal(evidenceFocusNeedsScroll({ top: 780, bottom: 820 }, 800), true);
+  assert.equal(evidenceFocusNeedsScroll(null, 800), false);
+
+  const source = readFileSync(new URL("../src/pages/VendorPage.jsx", import.meta.url), "utf8");
+  assert.match(source, /if \(evidenceOnly\) captureEvidenceFocus\(\);[\s\S]*submissionLockRef\.current = true;[\s\S]*setLoading\(true\)/u);
+  assert.match(source, /if \(submissionLockRef\.current\) return false;/u);
+  assert.match(source, /async function submit\(event\) \{\s*event\.preventDefault\(\);\s*if \(submissionLockRef\.current\) return;\s*const submissionGeneration/u);
+  assert.match(source, /VENDOR_APPLICATION_EVIDENCE_HEADERS/u);
+  assert.match(source, /disabled=\{loading\}/u);
+  assert.match(source, /const mutationInFlight = Boolean\(activeMutationRef\.current\);/u);
+  assert.match(source, /if \(activeMutationRef\.current\) \{[\s\S]*setEvidenceIdentityPending\(true\);[\s\S]*return;/u);
+  assert.match(source, /!submissionIsCurrent\(\) && evidenceOnly && mutationSettled/u);
+  assert.match(source, /mutationSettled\) \{[\s\S]*setLoading\(false\);[\s\S]*setEvidenceIdentityPending\(true\)/u);
+  assert.match(source, /setEvidenceAccessRetryKey\(\(value\) => value \+ 1\)/u);
+  assert.match(source, /cancelAnimationFrame\(evidenceFocusRestoreFrameRef\.current\)/u);
+  assert.match(source, /focusGeneration !== submissionGenerationRef\.current/u);
+  assert.match(source, /evidenceFocusNeedsScroll\(target\.getBoundingClientRect\(\), viewportHeight\)/u);
+  assert.match(source, /target\.scrollIntoView\(\{ block: "center", inline: "nearest" \}\)/u);
+  assert.match(source, /async function reloadLatestEvidence\(\) \{[\s\S]*clearPrivateEvidenceDraft\(\);[\s\S]*await readVendorEvidenceCompletionAccess\(\)/u);
+  assert.match(source, /evidenceAccessErrorMessage \|\| \(submissionUnconfirmed/u);
 });
 
 test("vendor evidence requires distinct public portfolio and reference links", () => {
@@ -455,6 +486,52 @@ test("account transitions clear private evidence before another onboarding flow 
   }), false);
 });
 
+test("explicit reload discards a dirty draft even when the application became terminal", () => {
+  const completeContext = {
+    vendorId: "vendor-1",
+    effectiveStatus: "pending",
+    reviewRevision: 7,
+    evidenceRevision: 2,
+    informationRequestRevision: 2,
+  };
+  assert.deepEqual(vendorEvidenceExplicitReloadPlan({
+    state: "complete",
+    context: completeContext,
+  }), {
+    vendorId: "vendor-1",
+    shouldPrefill: false,
+  });
+  assert.deepEqual(vendorEvidenceExplicitReloadPlan({
+    state: "status_unavailable",
+    context: { ...completeContext, effectiveStatus: "approved" },
+  }), {
+    vendorId: "vendor-1",
+    shouldPrefill: false,
+  });
+
+  const nextRequestContext = {
+    ...completeContext,
+    effectiveStatus: "needs_information",
+    reviewRevision: 8,
+    informationRequestRevision: 3,
+    currentInformationRequest: { revision: 3 },
+  };
+  assert.deepEqual(vendorEvidenceContextRefreshDecision({
+    currentContext: completeContext,
+    incomingContext: nextRequestContext,
+    dirty: false,
+    formInitialized: false,
+  }), {
+    accountChanged: false,
+    shouldResetForm: true,
+    conflict: false,
+  });
+  assert.equal(vendorEvidenceExplicitReloadPlan({
+    state: "revision",
+    context: nextRequestContext,
+  }).shouldPrefill, true);
+});
+
 test("ambiguous retries revalidate exact vendor identity before replaying", () => {
   assert.equal(shouldPreflightVendorEvidenceSubmission({ evidenceOnly: true, submissionUnconfirmed: false }), true);
   assert.equal(shouldPreflightVendorEvidenceSubmission({ evidenceOnly: true, submissionUnconfirmed: true }), true);
@@ -495,4 +572,19 @@ test("ambiguous retries revalidate exact vendor identity before replaying", () =
     expectedContext,
     accessResult: { state: "revision", context: { ...expectedContext, reviewRevision: 7 } },
   }), false);
+
+  for (const mutationStatus of [403, 404, 409]) {
+    assert.equal(vendorEvidencePreflightIdentityMatches(expectedContext, {
+      mutationStatus,
+      context: null,
+    }), false);
+    assert.equal(vendorEvidencePreflightIdentityMatches(expectedContext, {
+      mutationStatus,
+      context: { ...expectedContext, vendorId: "vendor-2" },
+    }), false);
+    assert.equal(vendorEvidencePreflightIdentityMatches(expectedContext, {
+      mutationStatus,
+      context: { ...expectedContext },
+    }), true);
+  }
 });

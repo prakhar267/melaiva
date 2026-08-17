@@ -114,8 +114,13 @@ class SqliteD1 {
 function requestJson(app, env, path, { body, cookie, headers = {}, method = body ? "POST" : "GET" } = {}) {
   const hasSummaryMarker = Object.keys(headers)
     .some((name) => name.toLowerCase() === "x-melaiva-admin-vendor-summary");
+  const hasEvidenceMarker = Object.keys(headers)
+    .some((name) => name.toLowerCase() === "x-melaiva-vendor-evidence");
   const summaryHeaders = method === "GET" && /^\/admin\/vendors(?:\?|$)/u.test(path) && !hasSummaryMarker
     ? { "x-melaiva-admin-vendor-summary": "2" }
+    : {};
+  const evidenceHeaders = method === "PUT" && path === "/vendors/onboarding/evidence" && !hasEvidenceMarker
+    ? { "x-melaiva-vendor-evidence": "5" }
     : {};
   return app.request(
     `https://api.example.test/api/v1${path}`,
@@ -125,6 +130,7 @@ function requestJson(app, env, path, { body, cookie, headers = {}, method = body
         ...(body ? { "content-type": "application/json" } : {}),
         ...(cookie ? { cookie } : {}),
         ...summaryHeaders,
+        ...evidenceHeaders,
         ...headers,
       },
       ...(body ? { body: JSON.stringify(body) } : {}),
@@ -1805,7 +1811,7 @@ test("v0.10 onboarding stays additive while required evidence and admin review r
   const app = buildApp();
   const config = await requestJson(app, env, "/auth/config");
   assert.equal(config.status, 200);
-  assert.equal((await config.json()).data.vendorApplicationEvidenceRevision, 4);
+  assert.equal((await config.json()).data.vendorApplicationEvidenceRevision, 5);
 
   const owner = await register(app, env, {
     name: "Old Client Vendor Owner",
@@ -1900,23 +1906,40 @@ test("v0.10 onboarding stays additive while required evidence and admin review r
   assert.equal((await blockedApproval.json()).error.code, "vendor_evidence_required");
   assert.equal(db.sqlite.prepare("SELECT COUNT(*) AS count FROM audit_events WHERE entity_id = ?").get(createdData.id).count, 0);
 
+  const evidenceCompletionBody = {
+    expectedVendorId: createdData.id,
+    expectedStatus: "pending",
+    expectedRevision: 0,
+    expectedEvidenceRevision: 0,
+    expectedInformationRequestRevision: 0,
+    evidence: {
+      portfolioUrls: ["https://old-client-portfolio.example.com/work"],
+      referenceUrls: ["https://old-client-reviews.example.com/vendor"],
+      registrationType: "not_registered",
+      attested: true,
+    },
+  };
+  for (const [marker, key] of [["", "missing"], ["4", "stale"]]) {
+    const incompatibleCompletion = await requestJson(app, env, "/vendors/onboarding/evidence", {
+      method: "PUT",
+      cookie: owner.cookie,
+      headers: {
+        "idempotency-key": `old-client-evidence-${key}-capability-0001`,
+        "x-melaiva-vendor-evidence": marker,
+      },
+      body: evidenceCompletionBody,
+    });
+    assert.equal(incompatibleCompletion.status, 426, await incompatibleCompletion.clone().text());
+    assert.equal((await incompatibleCompletion.json()).error.code, "client_upgrade_required");
+  }
+  assert.equal(db.sqlite.prepare("SELECT COUNT(*) AS count FROM vendor_application_evidence").get().count, 0);
+  assert.equal(db.sqlite.prepare("SELECT COUNT(*) AS count FROM idempotency_keys WHERE scope = 'vendor-onboarding-evidence'").get().count, 0);
+
   const completion = await requestJson(app, env, "/vendors/onboarding/evidence", {
     method: "PUT",
     cookie: owner.cookie,
     headers: { "idempotency-key": "old-client-evidence-completion-0001" },
-    body: {
-      expectedVendorId: createdData.id,
-      expectedStatus: "pending",
-      expectedRevision: 0,
-      expectedEvidenceRevision: 0,
-      expectedInformationRequestRevision: 0,
-      evidence: {
-        portfolioUrls: ["https://old-client-portfolio.example.com/work"],
-        referenceUrls: ["https://old-client-reviews.example.com/vendor"],
-        registrationType: "not_registered",
-        attested: true,
-      },
-    },
+    body: evidenceCompletionBody,
   });
   assert.equal(completion.status, 201, await completion.clone().text());
   const approved = await requestJson(app, env, `/admin/vendors/${createdData.id}`, {

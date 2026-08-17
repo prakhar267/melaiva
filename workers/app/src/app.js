@@ -449,6 +449,8 @@ const auctionStatusSchema = z
 
 const VENDOR_STATUSES = Object.freeze(["pending", "approved", "rejected", "suspended"]);
 const ADMIN_VENDOR_STATUSES = Object.freeze([...VENDOR_STATUSES, "needs_information"]);
+const VENDOR_APPLICATION_EVIDENCE_REVISION = 5;
+const VENDOR_APPLICATION_EVIDENCE_HEADER = "X-Melaiva-Vendor-Evidence";
 const ADMIN_VENDOR_SUMMARY_CONTRACT = "vendor-summary-v2";
 const ADMIN_VENDOR_SUMMARY_HEADER = "X-Melaiva-Admin-Vendor-Summary";
 const VENDOR_EVIDENCE_REQUIRED_TRIGGERS = Object.freeze([
@@ -2129,7 +2131,7 @@ function buildApp() {
       c.header("Access-Control-Allow-Methods", "GET, HEAD, POST, PUT, PATCH, DELETE, OPTIONS");
       c.header(
         "Access-Control-Allow-Headers",
-        "Content-Type, X-Requested-With, X-Turnstile-Token, Idempotency-Key, X-Melaiva-Admin-Vendor-Summary",
+        `Content-Type, X-Requested-With, X-Turnstile-Token, Idempotency-Key, ${VENDOR_APPLICATION_EVIDENCE_HEADER}, X-Melaiva-Admin-Vendor-Summary`,
       );
       c.header("Access-Control-Max-Age", "86400");
       return c.body(null, 204);
@@ -2181,7 +2183,7 @@ function buildApp() {
         iterations: CLIENT_PASSWORD_ITERATIONS,
         outputBits: 256,
         encoding: "base64url-no-padding",
-        vendorApplicationEvidenceRevision: 4,
+        vendorApplicationEvidenceRevision: VENDOR_APPLICATION_EVIDENCE_REVISION,
       },
     }),
   );
@@ -3626,6 +3628,9 @@ function buildApp() {
     const user = await currentUser(c);
     if (user.role === "admin") {
       throw new ApiError(403, "role_not_allowed", "Administrator accounts cannot submit vendor evidence");
+    }
+    if (c.req.header(VENDOR_APPLICATION_EVIDENCE_HEADER) !== String(VENDOR_APPLICATION_EVIDENCE_REVISION)) {
+      throw new ApiError(426, "client_upgrade_required", "Refresh Melaiva before submitting vendor evidence");
     }
     const requestKey = idempotencyKey(c, { required: true });
     const input = await parseJson(c, vendorEvidenceCompletionSchema);

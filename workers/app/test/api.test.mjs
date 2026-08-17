@@ -338,6 +338,7 @@ test("CORS preflight reflects only configured origins and supports credentials",
   assert.equal(response.status, 204);
   assert.equal(response.headers.get("access-control-allow-origin"), "https://app.example.test");
   assert.equal(response.headers.get("access-control-allow-credentials"), "true");
+  assert.match(response.headers.get("access-control-allow-headers"), /X-Melaiva-Vendor-Evidence/u);
   assert.match(response.headers.get("vary"), /Origin/);
 });
 

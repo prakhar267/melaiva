@@ -1,7 +1,11 @@
 import { readApiResponse } from "../api.js";
 
-export const VENDOR_APPLICATION_EVIDENCE_REVISION = 4;
+export const VENDOR_APPLICATION_EVIDENCE_REVISION = 5;
 export const ADMIN_VENDOR_SUMMARY_CONTRACT = "vendor-summary-v2";
+
+export const VENDOR_APPLICATION_EVIDENCE_HEADERS = Object.freeze({
+  "X-Melaiva-Vendor-Evidence": String(VENDOR_APPLICATION_EVIDENCE_REVISION),
+});
 
 export const ADMIN_VENDOR_SUMMARY_HEADERS = Object.freeze({
   "X-Melaiva-Admin-Vendor-Summary": "2",

@@ -53,7 +53,7 @@ Important non-secret variables in `wrangler.toml`:
 
 ## Deployment
 
-From `app/`, run the frontend build and API tests. From this directory, run `npm ci`, `npm run check`, and `npm exec wrangler -- deploy --dry-run` before `npm run deploy`.
+From `app/`, run the frontend build and API tests. From this directory, run `npm ci`, `npm run check`, and `./node_modules/.bin/wrangler deploy --env="" --dry-run` to validate the production bundle without uploading it. There is intentionally no package-level production deploy shortcut: release only from a clean checkout of the exact merged `main` SHA using the staging soak, zero-traffic candidate smoke, owned cutover, default-traffic verification, tag compare-and-swap, and rollback procedure in the root release documentation.
 
 Wrangler provisions the SQLite Durable Object class through the `v1` `new_sqlite_classes` migration and uploads `../../dist/client` as Static Assets. The schema is initialized/versioned inside `src/store.js` using `_sql_schema_migrations`; `PRAGMA user_version` is intentionally not used because Durable Objects do not support it.
 

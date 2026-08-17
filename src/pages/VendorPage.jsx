@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import { Link } from "react-router-dom";
 import {
   ArrowLeft,
@@ -34,6 +34,7 @@ import {
 import { categories, cities, formatCurrency, opportunities as exampleOpportunities } from "../data.js";
 import { isServiceUnavailable, readApiResponse } from "../api.js";
 import { BookingMessages } from "../components/BookingMessages.jsx";
+import { targetScrollLeftForControl } from "../components/bookingMessages.js";
 
 function categoryLabel(value) {
   return categories.find((category) => category.id === value)?.name || value?.replaceAll("_", " ") || "Service";
@@ -118,6 +119,8 @@ function createAddOn() {
 }
 
 function VendorWorkspaceNav({ active, setActive, opportunityCount, offerCount, awardCount, conversationCount, restricted = false }) {
+  const navRef = useRef(null);
+  const buttonRefs = useRef(new Map());
   const allItems = [
     ["opportunities", BriefcaseBusiness, "Opportunities", opportunityCount],
     ["offers", FileText, "My offers", offerCount],
@@ -126,10 +129,45 @@ function VendorWorkspaceNav({ active, setActive, opportunityCount, offerCount, a
     ["profile", Store, "Business profile"],
   ];
   const items = restricted ? allItems.filter(([id]) => ["awards", "messages"].includes(id)) : allItems;
+  useEffect(() => {
+    let frame = null;
+    const reducedMotion = window.matchMedia?.("(prefers-reduced-motion: reduce)")?.matches;
+
+    function revealActive(behavior = "auto") {
+      const nav = navRef.current;
+      const button = buttonRefs.current.get(active);
+      if (!nav || !button) return;
+      const navRect = nav.getBoundingClientRect();
+      const buttonRect = button.getBoundingClientRect();
+      const left = targetScrollLeftForControl({
+        scrollLeft: nav.scrollLeft,
+        clientWidth: nav.clientWidth,
+        itemOffsetLeft: nav.scrollLeft + buttonRect.left - navRect.left,
+        itemOffsetWidth: buttonRect.width,
+        maxScrollLeft: nav.scrollWidth - nav.clientWidth,
+      });
+      if (Math.abs(left - nav.scrollLeft) < 1) return;
+      nav.scrollTo({ left, behavior });
+    }
+
+    function scheduleReveal() {
+      window.cancelAnimationFrame(frame);
+      frame = window.requestAnimationFrame(() => revealActive("auto"));
+    }
+
+    revealActive(reducedMotion ? "auto" : "smooth");
+    window.addEventListener("resize", scheduleReveal);
+    document.fonts?.addEventListener?.("loadingdone", scheduleReveal);
+    return () => {
+      window.cancelAnimationFrame(frame);
+      window.removeEventListener("resize", scheduleReveal);
+      document.fonts?.removeEventListener?.("loadingdone", scheduleReveal);
+    };
+  }, [active, awardCount, conversationCount, offerCount, opportunityCount, restricted]);
   return (
-    <nav className="vendor-workspace-nav" aria-label="Vendor workspace">
+    <nav className="vendor-workspace-nav" aria-label="Vendor workspace" ref={navRef}>
       {items.map(([id, Icon, label, count]) => (
-        <button className={active === id ? "is-active" : ""} type="button" key={id} onClick={() => setActive(id)} aria-pressed={active === id}>
+        <button ref={(node) => { if (node) buttonRefs.current.set(id, node); else buttonRefs.current.delete(id); }} className={active === id ? "is-active" : ""} type="button" key={id} onClick={() => setActive(id)} aria-pressed={active === id}>
           <Icon size={17} />{label}{Number(count) > 0 && <span>{count}</span>}
         </button>
       ))}
@@ -348,6 +386,8 @@ export function VendorPage({ notify, onOpenAuth, authRevision = 0 }) {
   const [awardsRefreshKey, setAwardsRefreshKey] = useState(0);
   const [refreshKey, setRefreshKey] = useState(0);
   const [messageBookingId, setMessageBookingId] = useState(null);
+  const [messageFocusRequest, setMessageFocusRequest] = useState(null);
+  const messageFocusSequence = useRef(0);
 
   useEffect(() => {
     const controller = new AbortController();
@@ -450,8 +490,8 @@ export function VendorPage({ notify, onOpenAuth, authRevision = 0 }) {
         <VendorWorkspaceNav active={active} setActive={setActive} opportunityCount={visibleOpportunities.length} offerCount={mode === "demo" ? 0 : offers.length} awardCount={mode === "demo" ? 0 : awards.length} conversationCount={mode === "demo" ? 0 : awards.length} restricted={restricted} />
         {!restricted && active === "opportunities" && <div className="vendor-tab-panel"><div className="vendor-panel-heading"><div><h2>{mode === "demo" ? "Example opportunities" : "Open opportunities"}</h2><p>{mode === "demo" ? "Static examples for evaluating the workflow." : "Private briefs available to your approved business."}</p></div></div>{visibleOpportunities.length ? <div className="opportunity-list">{visibleOpportunities.map((opportunity) => <OpportunityCard opportunity={opportunity} notify={notify} onOpenAuth={onOpenAuth} onSubmitted={() => setRefreshKey((value) => value + 1)} key={opportunity.id} />)}</div> : <div className="vendor-empty"><span><BriefcaseBusiness size={28} /></span><h2>No suitable live briefs right now</h2><p>New approved requests will appear here when they match your partner account.</p></div>}</div>}
         {!restricted && active === "offers" && <VendorOffers offers={mode === "demo" ? [] : offers} demo={mode === "demo"} />}
-        {active === "awards" && <VendorAwards awards={mode === "demo" ? [] : awards} demo={mode === "demo"} loading={awardsLoading} error={awardsError} onRetry={() => setAwardsRefreshKey((value) => value + 1)} onMessage={(bookingId) => { setMessageBookingId(bookingId); setActive("messages"); }} />}
-        {active === "messages" && (["live", "restricted"].includes(mode) ? <BookingMessages audience="vendor" preferredBookingId={messageBookingId} onViewScope={() => setActive("awards")} emptyActionLabel={restricted ? "View award handoffs" : "View opportunities"} onEmptyAction={() => setActive(restricted ? "awards" : "opportunities")} /> : <VendorEmpty type="messages" />)}
+        {active === "awards" && <VendorAwards awards={mode === "demo" ? [] : awards} demo={mode === "demo"} loading={awardsLoading} error={awardsError} onRetry={() => setAwardsRefreshKey((value) => value + 1)} onMessage={(bookingId) => { setMessageBookingId(bookingId); messageFocusSequence.current += 1; setMessageFocusRequest(messageFocusSequence.current); setActive("messages"); }} />}
+        {active === "messages" && (["live", "restricted"].includes(mode) ? <BookingMessages audience="vendor" preferredBookingId={messageBookingId} focusRequest={messageFocusRequest} onFocusRequestHandled={() => setMessageFocusRequest(null)} onViewScope={() => setActive("awards")} emptyActionLabel={restricted ? "View award handoffs" : "View opportunities"} onEmptyAction={() => setActive(restricted ? "awards" : "opportunities")} /> : <VendorEmpty type="messages" />)}
         {!restricted && active === "profile" && <VendorEmpty type="profile" />}
       </div>
     </div>

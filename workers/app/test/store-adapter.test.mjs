@@ -10,6 +10,8 @@ import {
   STORE_SCHEMA_V3_MIGRATION_SQL,
   STORE_SCHEMA_V4_MIGRATION_SQL,
   STORE_SCHEMA_V5_MIGRATION_SQL,
+  STORE_SCHEMA_V6_FINALIZE_SQL,
+  STORE_SCHEMA_V6_MIGRATION_SQL,
   STORE_SCHEMA_VERSION,
   createDurableDatabase,
   executeSql,
@@ -534,6 +536,183 @@ test("schema v5 adds restart-safe booking messages without mutating existing awa
   );
 });
 
+test("schema v6 backfills stable per-booking message positions and enforces stream identity", () => {
+  const sqlite = createV3AwardDatabase();
+  const seeded = seedAcceptedAward(sqlite, "message-stream", { auditCreatedAt: "2027-10-01T04:05:06.000Z" });
+  sqlite.exec(STORE_SCHEMA_V4_MIGRATION_SQL);
+  sqlite.exec(STORE_SCHEMA_V5_MIGRATION_SQL);
+  const booking = sqlite.prepare("SELECT id FROM bookings WHERE accepted_bid_id = ?").get(seeded.bidId);
+
+  const insert = sqlite.prepare(
+    `INSERT INTO booking_messages (id, booking_id, sender_user_id, body, created_at)
+     VALUES (?, ?, 'migration-couple', ?, ?)`,
+  );
+  insert.run("stream-z", booking.id, "A tied message whose identifier sorts last.", "2027-10-03T10:00:00.000Z");
+  insert.run("stream-a", booking.id, "A tied message whose identifier sorts first.", "2027-10-03T10:00:00.000Z");
+  insert.run("stream-backdated", booking.id, "A message with an earlier retained timestamp.", "2027-09-01T10:00:00.000Z");
+  const before = sqlite
+    .prepare("SELECT id, booking_id, sender_user_id, body, created_at FROM booking_messages ORDER BY id")
+    .all();
+
+  sqlite.exec(STORE_SCHEMA_V6_MIGRATION_SQL);
+  sqlite.exec(STORE_SCHEMA_V6_FINALIZE_SQL);
+
+  assert.equal(sqlite.prepare("SELECT MAX(id) AS version FROM _sql_schema_migrations").get().version, 6);
+  assert.deepEqual(
+    sqlite.prepare("SELECT id, booking_id, sender_user_id, body, created_at FROM booking_messages ORDER BY id").all(),
+    before,
+  );
+  assert.deepEqual(
+    sqlite
+      .prepare("SELECT id, stream_position FROM booking_messages WHERE booking_id = ? ORDER BY stream_position")
+      .all(booking.id)
+      .map((row) => ({ ...row })),
+    [
+      { id: "stream-z", stream_position: 1 },
+      { id: "stream-a", stream_position: 2 },
+      { id: "stream-backdated", stream_position: 3 },
+    ],
+  );
+  assert.ok(
+    sqlite
+      .prepare("PRAGMA index_list(booking_messages)")
+      .all()
+      .some((index) => index.name === "idx_booking_messages_stream" && index.unique === 1),
+  );
+  sqlite
+    .prepare(
+      `INSERT INTO booking_messages (id, booking_id, sender_user_id, body, created_at)
+       SELECT ?, booking.id, ?, ?, ?
+       FROM bookings booking
+       JOIN vendors vendor ON vendor.id = booking.vendor_id
+       WHERE booking.id = ?
+         AND vendor.status = 'approved'
+         AND (booking.couple_user_id = ? OR vendor.user_id = ?)`,
+    )
+    .run(
+      "stream-legacy",
+      "migration-couple",
+      "A rolling-deploy legacy insert receives its stream position.",
+      "2027-10-04T10:00:00.000Z",
+      booking.id,
+      "migration-couple",
+      "migration-couple",
+    );
+  assert.equal(
+    sqlite.prepare("SELECT stream_position FROM booking_messages WHERE id = 'stream-legacy'").get().stream_position,
+    4,
+  );
+  assert.deepEqual(
+    {
+      ...sqlite
+        .prepare(
+          `SELECT COUNT(*) AS row_count, COALESCE(MAX(stream_position), 0) AS position_count
+           FROM booking_messages WHERE booking_id = ?`,
+        )
+        .get(booking.id),
+    },
+    { row_count: 4, position_count: 4 },
+  );
+  assert.match(
+    sqlite
+      .prepare(
+        `EXPLAIN QUERY PLAN
+         SELECT stream_position FROM booking_messages
+         WHERE booking_id = ? ORDER BY stream_position DESC LIMIT 1`,
+      )
+      .all(booking.id)
+      .map((row) => row.detail)
+      .join("\n"),
+    /idx_booking_messages_stream/,
+  );
+  assert.throws(
+    () => sqlite
+      .prepare(
+        `INSERT INTO booking_messages
+         (id, booking_id, sender_user_id, body, created_at, stream_position)
+         VALUES ('stream-gap', ?, 'migration-couple', 'A non-contiguous position must fail.',
+                 '2027-10-04T10:00:00.000Z', 6)`,
+      )
+      .run(booking.id),
+    /booking message stream position must be the next position/,
+  );
+  assert.throws(
+    () => sqlite
+      .prepare(
+        `INSERT INTO booking_messages
+         (id, booking_id, sender_user_id, body, created_at, stream_position)
+         VALUES ('stream-invalid', ?, 'migration-couple', 'An explicit invalid position must fail.',
+                 '2027-10-04T10:00:00.000Z', 0)`,
+      )
+      .run(booking.id),
+    /booking message stream position must be a positive integer/,
+  );
+  sqlite
+    .prepare(
+      `INSERT INTO booking_messages
+       (id, booking_id, sender_user_id, body, created_at, stream_position)
+       VALUES ('stream-next', ?, 'migration-couple', 'A valid next position is accepted.',
+               '2027-10-04T10:00:00.000Z', 5)`,
+    )
+    .run(booking.id);
+  assert.throws(
+    () => sqlite.prepare("UPDATE booking_messages SET stream_position = 6 WHERE id = 'stream-next'").run(),
+    /booking message stream position is immutable/,
+  );
+  assert.throws(
+    () => sqlite.prepare("DELETE FROM booking_messages WHERE id = 'stream-next'").run(),
+    /booking message stream records are immutable/,
+  );
+});
+
+test("schema v6 initialization resumes after the stream column was already added", async () => {
+  const sqlite = createV3AwardDatabase();
+  const seeded = seedAcceptedAward(sqlite, "partial-stream", { auditCreatedAt: "2027-10-01T04:05:06.000Z" });
+  sqlite.exec(STORE_SCHEMA_V4_MIGRATION_SQL);
+  sqlite.exec(STORE_SCHEMA_V5_MIGRATION_SQL);
+  const booking = sqlite.prepare("SELECT id FROM bookings WHERE accepted_bid_id = ?").get(seeded.bidId);
+  sqlite
+    .prepare(
+      `INSERT INTO booking_messages (id, booking_id, sender_user_id, body, created_at)
+       VALUES ('partial-stream-message', ?, 'migration-couple', 'Retain this message across migration restart.',
+               '2027-10-03T10:00:00.000Z')`,
+    )
+    .run(booking.id);
+  sqlite.exec("ALTER TABLE booking_messages ADD COLUMN stream_position INTEGER");
+
+  const sql = {
+    exec(statement, ...args) {
+      const normalized = statement.trim().toUpperCase();
+      if (args.length > 0 || normalized.startsWith("SELECT") || normalized.startsWith("PRAGMA")) {
+        const rows = sqlite.prepare(statement).all(...args);
+        return { toArray: () => rows };
+      }
+      sqlite.exec(statement);
+      return { toArray: () => [] };
+    },
+  };
+  let initialized;
+  const ctx = {
+    storage: {
+      sql,
+      async getAlarm() { return 1; },
+      async setAlarm() {},
+    },
+    blockConcurrencyWhile(callback) {
+      initialized = callback();
+    },
+  };
+
+  new MelaivaStore(ctx, { ENVIRONMENT: "production" });
+  await initialized;
+
+  assert.equal(sqlite.prepare("SELECT MAX(id) AS version FROM _sql_schema_migrations").get().version, 6);
+  assert.equal(
+    sqlite.prepare("SELECT stream_position FROM booking_messages WHERE id = 'partial-stream-message'").get().stream_position,
+    1,
+  );
+});
+
 test("schema initialization resumes from an already-added v3 column through the latest migration", async () => {
   const sqlite = new DatabaseSync(":memory:");
   sqlite.exec(`CREATE TABLE _sql_schema_migrations (
@@ -587,5 +766,7 @@ test("schema initialization resumes from an already-added v3 column through the 
     assert.ok(columns.has(name), `missing resumed bids.${name}`);
   }
   assert.ok(sqlite.prepare("PRAGMA table_info(bookings)").all().some((column) => column.name === "accepted_scope_json"));
-  assert.ok(sqlite.prepare("PRAGMA table_info(booking_messages)").all().some((column) => column.name === "sender_user_id"));
+  const messageColumns = new Set(sqlite.prepare("PRAGMA table_info(booking_messages)").all().map((column) => column.name));
+  assert.ok(messageColumns.has("sender_user_id"));
+  assert.ok(messageColumns.has("stream_position"));
 });

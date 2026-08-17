@@ -1,6 +1,6 @@
 {
   "name": "melaiva",
-  "version": "0.6.0",
+  "version": "0.7.0",
   "private": true,
   "type": "module",
   "scripts": {
@@ -9,7 +9,7 @@
     "preview": "vite preview",
     "smoke:readiness": "node scripts/readiness-smoke.mjs",
     "smoke:production": "node scripts/production-smoke.mjs",
-    "test:sites": "node --test tests/sites-worker.test.mjs",
+    "test:sites": "node --test tests/*.test.mjs",
     "test:api": "node --test workers/app/test/*.test.mjs",
     "check:api": "node --check workers/app/src/index.js && node --check workers/app/src/app.js && node --check workers/app/src/store.js"
   },

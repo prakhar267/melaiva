@@ -12,10 +12,12 @@ import {
   STORE_SCHEMA_V4_MIGRATION_SQL,
   STORE_SCHEMA_V5_MIGRATION_SQL,
   STORE_SCHEMA_V6_MIGRATION_SQL,
+  STORE_SCHEMA_V7_MIGRATION_SQL,
 } from "../src/store.js";
 
 const SESSION_SECRET = "booking-message-test-secret-with-at-least-thirty-two-characters";
 const STORE_SCHEMA_V5_SQL = `${STORE_SCHEMA_V1_SQL}\n${STORE_SCHEMA_V2_MIGRATION_SQL}\n${STORE_SCHEMA_V3_MIGRATION_SQL}\n${STORE_SCHEMA_V4_MIGRATION_SQL}\n${STORE_SCHEMA_V5_MIGRATION_SQL}`;
+const STORE_SCHEMA_V6_SQL = `${STORE_SCHEMA_V5_SQL}\n${STORE_SCHEMA_V6_MIGRATION_SQL}`;
 
 class SqliteStatement {
   constructor(database, sql, args = []) {
@@ -222,6 +224,14 @@ function postMessage(fixture, actor, bookingId, key, body) {
   });
 }
 
+function markMessageRead(fixture, actor, bookingId, messageId) {
+  return requestJson(fixture.app, fixture.env, `/bookings/${bookingId}/messages/read`, {
+    cookie: actor?.cookie,
+    method: "PUT",
+    body: { messageId },
+  });
+}
+
 function insertStoredMessage(db, { id, bookingId, senderUserId, body, createdAt }) {
   return db.sqlite
     .prepare(
@@ -345,6 +355,311 @@ test("booking conversations authorize only the owner, winning vendor, and read-o
   assert.equal(ownerPausedWrite.status, 403, await ownerPausedWrite.clone().text());
   assert.equal(await responseErrorCode(ownerPausedWrite), "messaging_paused");
   assert.deepEqual(ownerPausedPayload.data.map((message) => message.id), ["message-before-suspension"]);
+});
+
+test("participant-local unread cursors count only counterparty messages and advance monotonically", async () => {
+  const fixture = await createFixture();
+  const { app, env, db, owner, approvedVendor, pausedVendor, outsider, admin, approved, paused } = fixture;
+  const messages = [
+    ["unread-owner-1", owner.user.id, "An owner message is unread only for the partner."],
+    ["unread-vendor-1", approvedVendor.user.id, "The first partner reply is unread only for the owner."],
+    ["unread-vendor-2", approvedVendor.user.id, "The second partner reply remains independently countable."],
+    ["unread-owner-2", owner.user.id, "A later owner message must not inflate the owner's badge."],
+  ];
+  for (const [id, senderUserId, body] of messages) {
+    insertStoredMessage(db, {
+      id,
+      bookingId: approved.bookingId,
+      senderUserId,
+      body,
+      createdAt: "2027-10-03T10:00:00.000Z",
+    });
+  }
+
+  const ownerBookings = await requestJson(app, env, "/bookings", { cookie: owner.cookie });
+  const ownerBooking = (await ownerBookings.json()).data.find((booking) => booking.id === approved.bookingId);
+  assert.equal(ownerBooking.messageCount, 4);
+  assert.equal(ownerBooking.unreadMessageCount, 2);
+  assert.equal(Object.hasOwn(ownerBooking, "readThroughMessageId"), false);
+  const vendorBookings = await requestJson(app, env, "/bookings", { cookie: approvedVendor.cookie });
+  const vendorBooking = (await vendorBookings.json()).data.find((booking) => booking.id === approved.bookingId);
+  assert.equal(vendorBooking.unreadMessageCount, 2);
+
+  const ownerSummary = await requestJson(app, env, "/bookings/message-summary?limit=50", { cookie: owner.cookie });
+  assert.equal(ownerSummary.status, 200, await ownerSummary.clone().text());
+  assert.deepEqual(
+    (await ownerSummary.json()).data.find((booking) => booking.id === approved.bookingId),
+    { id: approved.bookingId, audienceRole: "owner", messageCount: 4, unreadMessageCount: 2 },
+  );
+  const anonymousSummary = await requestJson(app, env, "/bookings/message-summary?limit=50");
+  assert.equal(anonymousSummary.status, 401);
+  const firstSummaryPage = await requestJson(app, env, "/bookings/message-summary?page=1&limit=1", {
+    cookie: owner.cookie,
+  });
+  const firstSummaryPayload = await firstSummaryPage.json();
+  assert.deepEqual(firstSummaryPayload.meta, { page: 1, limit: 1, hasMore: true });
+  const secondSummaryPage = await requestJson(app, env, "/bookings/message-summary?page=2&limit=1", {
+    cookie: owner.cookie,
+  });
+  const secondSummaryPayload = await secondSummaryPage.json();
+  assert.deepEqual(secondSummaryPayload.meta, { page: 2, limit: 1, hasMore: false });
+  assert.deepEqual(
+    new Set([...firstSummaryPayload.data, ...secondSummaryPayload.data].map((booking) => booking.id)),
+    new Set([approved.bookingId, paused.bookingId]),
+  );
+  const vendorSummary = await requestJson(app, env, "/bookings/message-summary?limit=50", {
+    cookie: approvedVendor.cookie,
+  });
+  assert.deepEqual(
+    (await vendorSummary.json()).data.find((booking) => booking.id === approved.bookingId),
+    { id: approved.bookingId, audienceRole: "vendor", messageCount: 4, unreadMessageCount: 2 },
+  );
+
+  const ownerMessages = await requestJson(app, env, `/bookings/${approved.bookingId}/messages`, { cookie: owner.cookie });
+  assert.equal((await ownerMessages.json()).meta.unreadMessageCount, 2);
+  const vendorMessages = await requestJson(app, env, `/bookings/${approved.bookingId}/messages`, {
+    cookie: approvedVendor.cookie,
+  });
+  assert.equal((await vendorMessages.json()).meta.unreadMessageCount, 2);
+  const adminMessages = await requestJson(app, env, `/bookings/${approved.bookingId}/messages`, { cookie: admin.cookie });
+  assert.equal(Object.hasOwn((await adminMessages.json()).meta, "unreadMessageCount"), false);
+  const adminSummary = await requestJson(app, env, "/bookings/message-summary?limit=50", { cookie: admin.cookie });
+  assert.equal(Object.hasOwn((await adminSummary.json()).data[0], "unreadMessageCount"), false);
+  const ownerAward = await requestJson(app, env, `/auctions/${approved.auctionId}/award`, { cookie: owner.cookie });
+  assert.equal((await ownerAward.json()).data.unreadMessageCount, 2);
+
+  const firstAdvance = await markMessageRead(fixture, owner, approved.bookingId, "unread-vendor-1");
+  assert.equal(firstAdvance.status, 200, await firstAdvance.clone().text());
+  assert.deepEqual((await firstAdvance.json()).data, {
+    bookingId: approved.bookingId,
+    readThroughMessageId: "unread-vendor-1",
+    readThroughSequence: 2,
+    messageCount: 4,
+    unreadMessageCount: 1,
+  });
+  const staleAdvance = await markMessageRead(fixture, owner, approved.bookingId, "unread-owner-1");
+  assert.equal(staleAdvance.status, 200, await staleAdvance.clone().text());
+  assert.deepEqual((await staleAdvance.json()).data, {
+    bookingId: approved.bookingId,
+    readThroughMessageId: "unread-vendor-1",
+    readThroughSequence: 2,
+    messageCount: 4,
+    unreadMessageCount: 1,
+  });
+
+  const olderSnapshot = await markMessageRead(fixture, owner, approved.bookingId, "unread-owner-2");
+  const olderState = (await olderSnapshot.json()).data;
+  assert.deepEqual(olderState, {
+    bookingId: approved.bookingId,
+    readThroughMessageId: "unread-owner-2",
+    readThroughSequence: 4,
+    messageCount: 4,
+    unreadMessageCount: 0,
+  });
+  insertStoredMessage(db, {
+    id: "unread-vendor-3",
+    bookingId: approved.bookingId,
+    senderUserId: approvedVendor.user.id,
+    body: "A new partner message arrives while an older acknowledgement response is delayed.",
+    createdAt: "2027-09-01T10:00:00.000Z",
+  });
+  const newerSnapshot = await markMessageRead(fixture, owner, approved.bookingId, "unread-vendor-2");
+  const newerState = (await newerSnapshot.json()).data;
+  assert.deepEqual(newerState, {
+    bookingId: approved.bookingId,
+    readThroughMessageId: "unread-owner-2",
+    readThroughSequence: 4,
+    messageCount: 5,
+    unreadMessageCount: 1,
+  });
+  assert.ok(newerState.messageCount > olderState.messageCount, "clients can reject the delayed older unread snapshot");
+
+  const ownerCaughtUp = await markMessageRead(fixture, owner, approved.bookingId, "unread-vendor-3");
+  assert.equal((await ownerCaughtUp.json()).data.unreadMessageCount, 0);
+  const vendorThroughOwnMessage = await markMessageRead(fixture, approvedVendor, approved.bookingId, "unread-vendor-2");
+  assert.deepEqual((await vendorThroughOwnMessage.json()).data, {
+    bookingId: approved.bookingId,
+    readThroughMessageId: "unread-vendor-2",
+    readThroughSequence: 3,
+    messageCount: 5,
+    unreadMessageCount: 1,
+  });
+  const vendorCaughtUp = await markMessageRead(fixture, approvedVendor, approved.bookingId, "unread-owner-2");
+  assert.equal((await vendorCaughtUp.json()).data.unreadMessageCount, 0);
+
+  const sent = await postMessage(fixture, owner, approved.bookingId, "unread-owner-send-0001", {
+    body: "My own newly sent message must not recreate my unread count.",
+  });
+  assert.equal(sent.status, 201, await sent.clone().text());
+  const sentPayload = await sent.json();
+  assert.equal(sentPayload.meta.messageCount, 6);
+  assert.equal(sentPayload.meta.unreadMessageCount, 0);
+  const replay = await postMessage(fixture, owner, approved.bookingId, "unread-owner-send-0001", {
+    body: "My own newly sent message must not recreate my unread count.",
+  });
+  assert.equal((await replay.json()).meta.unreadMessageCount, 0);
+  const vendorAfterOwnerSend = await requestJson(app, env, `/bookings/${approved.bookingId}/messages`, {
+    cookie: approvedVendor.cookie,
+  });
+  assert.equal((await vendorAfterOwnerSend.json()).meta.unreadMessageCount, 1);
+
+  insertStoredMessage(db, {
+    id: "paused-vendor-unread",
+    bookingId: paused.bookingId,
+    senderUserId: pausedVendor.user.id,
+    body: "Suspension pauses sending but does not prevent the owner acknowledging retained history.",
+    createdAt: "2027-10-04T10:00:00.000Z",
+  });
+  const pausedRead = await markMessageRead(fixture, owner, paused.bookingId, "paused-vendor-unread");
+  assert.equal(pausedRead.status, 200, await pausedRead.clone().text());
+  assert.equal((await pausedRead.json()).data.unreadMessageCount, 0);
+
+  const anonymousRead = await markMessageRead(fixture, null, approved.bookingId, "unread-vendor-3");
+  assert.equal(anonymousRead.status, 401);
+  const outsiderRead = await markMessageRead(fixture, outsider, approved.bookingId, "unread-vendor-3");
+  assert.equal(outsiderRead.status, 404);
+  assert.equal(await responseErrorCode(outsiderRead), "conversation_not_found");
+  const adminRead = await markMessageRead(fixture, admin, approved.bookingId, "unread-vendor-3");
+  assert.equal(adminRead.status, 403);
+  assert.equal(await responseErrorCode(adminRead), "read_cursor_forbidden");
+  const crossThreadRead = await markMessageRead(fixture, owner, approved.bookingId, "paused-vendor-unread");
+  assert.equal(crossThreadRead.status, 422);
+  assert.equal(await responseErrorCode(crossThreadRead), "invalid_read_cursor");
+  const missingRead = await markMessageRead(fixture, owner, approved.bookingId, "missing-read-cursor");
+  assert.equal(missingRead.status, 422);
+  assert.equal(await responseErrorCode(missingRead), "invalid_read_cursor");
+  const malformedRead = await markMessageRead(fixture, owner, approved.bookingId, "not/a/safe/cursor");
+  assert.equal(malformedRead.status, 422);
+  assert.equal(
+    db.sqlite.prepare("SELECT COUNT(*) AS count FROM booking_message_read_cursors WHERE participant_user_id = ?").get(admin.user.id).count,
+    0,
+  );
+});
+
+test("schema-v7 Worker omits unread state safely against v6 and baselines when migration arrives", async () => {
+  const fixture = await createFixture({ schemaSql: STORE_SCHEMA_V6_SQL });
+  const { app, env, db, owner, approvedVendor, approved } = fixture;
+  const sent = await postMessage(fixture, owner, approved.bookingId, "v6-unread-skew-0001", {
+    body: "This message is written while the Durable Object still exposes schema v6.",
+  });
+  assert.equal(sent.status, 201, await sent.clone().text());
+  const sentPayload = await sent.json();
+  assert.equal(Object.hasOwn(sentPayload.meta, "unreadMessageCount"), false);
+
+  const legacyBookings = await requestJson(app, env, "/bookings", { cookie: owner.cookie });
+  const legacyBooking = (await legacyBookings.json()).data.find((booking) => booking.id === approved.bookingId);
+  assert.equal(Object.hasOwn(legacyBooking, "unreadMessageCount"), false);
+  const legacySummary = await requestJson(app, env, "/bookings/message-summary?limit=50", { cookie: owner.cookie });
+  const legacySummaryItem = (await legacySummary.json()).data.find((booking) => booking.id === approved.bookingId);
+  assert.deepEqual(legacySummaryItem, {
+    id: approved.bookingId,
+    audienceRole: "owner",
+    messageCount: 1,
+  });
+  const legacyMessages = await requestJson(app, env, `/bookings/${approved.bookingId}/messages`, { cookie: owner.cookie });
+  assert.equal(Object.hasOwn((await legacyMessages.json()).meta, "unreadMessageCount"), false);
+  const unavailableRead = await markMessageRead(fixture, owner, approved.bookingId, sentPayload.data.id);
+  assert.equal(unavailableRead.status, 503, await unavailableRead.clone().text());
+  assert.equal(await responseErrorCode(unavailableRead), "unread_state_unavailable");
+  assert.equal(unavailableRead.headers.get("retry-after"), "2");
+
+  const firstV7Trigger = STORE_SCHEMA_V7_MIGRATION_SQL.indexOf("DROP TRIGGER IF EXISTS");
+  assert.ok(firstV7Trigger > 0);
+  db.sqlite.exec(STORE_SCHEMA_V7_MIGRATION_SQL.slice(0, firstV7Trigger));
+  const partialSummary = await requestJson(app, env, "/bookings/message-summary?limit=50", { cookie: owner.cookie });
+  const partialSummaryItem = (await partialSummary.json()).data.find((booking) => booking.id === approved.bookingId);
+  assert.equal(Object.hasOwn(partialSummaryItem, "unreadMessageCount"), false);
+  const partialRead = await markMessageRead(fixture, owner, approved.bookingId, sentPayload.data.id);
+  assert.equal(partialRead.status, 503, await partialRead.clone().text());
+  assert.equal(await responseErrorCode(partialRead), "unread_state_unavailable");
+
+  db.sqlite.exec(STORE_SCHEMA_V7_MIGRATION_SQL);
+  const baselinedOwner = await requestJson(app, env, "/bookings", { cookie: owner.cookie });
+  assert.equal(
+    (await baselinedOwner.json()).data.find((booking) => booking.id === approved.bookingId).unreadMessageCount,
+    0,
+  );
+  const baselinedVendor = await requestJson(app, env, "/bookings", { cookie: approvedVendor.cookie });
+  assert.equal(
+    (await baselinedVendor.json()).data.find((booking) => booking.id === approved.bookingId).unreadMessageCount,
+    0,
+  );
+  insertStoredMessage(db, {
+    id: "v7-after-baseline",
+    bookingId: approved.bookingId,
+    senderUserId: approvedVendor.user.id,
+    body: "A counterparty message after the exact baseline becomes unread.",
+    createdAt: "2027-01-01T00:00:00.000Z",
+  });
+  const ownerAfterMessage = await requestJson(app, env, "/bookings", { cookie: owner.cookie });
+  assert.equal(
+    (await ownerAfterMessage.json()).data.find((booking) => booking.id === approved.bookingId).unreadMessageCount,
+    1,
+  );
+
+  db.sqlite.exec(STORE_SCHEMA_V7_MIGRATION_SQL);
+  const ownerAfterReplay = await requestJson(app, env, "/bookings", { cookie: owner.cookie });
+  assert.equal(
+    (await ownerAfterReplay.json()).data.find((booking) => booking.id === approved.bookingId).unreadMessageCount,
+    1,
+    "a replayed migration must not reset an existing participant cursor to the newer head",
+  );
+});
+
+test("schema-v7 booking cursor trigger preserves the v6 award batch changes chain", async () => {
+  const fixture = await createFixture();
+  const { app, env, db, owner, approved } = fixture;
+  const auctionId = "33333333-3333-4333-8333-333333333333";
+  const bidId = "v6-shaped-award-bid";
+  db.sqlite
+    .prepare(
+      `INSERT INTO auctions
+       (id, couple_user_id, title, event_type, event_date, city, guest_count, budget_min,
+        budget_max, currency, categories_json, requirements, status, bidding_ends_at)
+       VALUES (?, ?, 'Trigger-compatible award', 'wedding', '2028-02-10', 'Jaipur', 120,
+               150000, 350000, 'INR', '["photography"]',
+               'Verify that additive cursor inserts do not disturb the existing award transaction.',
+               'closed', '2027-12-01T12:00:00.000Z')`,
+    )
+    .run(auctionId, owner.user.id);
+  db.sqlite
+    .prepare(
+      `INSERT INTO bids
+       (id, auction_id, vendor_id, amount, currency, proposal, deliverables_json,
+        exclusions_json, gst_included, gst_rate, travel_policy, travel_fee, add_ons_json,
+        cancellation_terms, delivery_plan, structured_terms_provided, status)
+       VALUES (?, ?, ?, 225000, 'INR',
+               'A complete accepted proposal retained for old award-writer compatibility.',
+               '["Photography coverage","Edited gallery"]', '[]', 1, 18, 'included', 0, '[]',
+               'Cancellation follows the written booking schedule agreed by both parties.',
+               'The completed gallery will be delivered within twelve weeks.', 1, 'submitted')`,
+    )
+    .run(bidId, auctionId, approved.vendorId);
+
+  const accepted = await requestJson(app, env, `/auctions/${auctionId}/bids/${bidId}`, {
+    cookie: owner.cookie,
+    method: "PATCH",
+    headers: { "idempotency-key": "v6-shaped-award-0001" },
+    body: { action: "accept" },
+  });
+  assert.equal(accepted.status, 200, await accepted.clone().text());
+  const acceptedData = (await accepted.json()).data;
+  assert.equal(acceptedData.status, "accepted");
+  assert.equal(acceptedData.auctionStatus, "awarded");
+  assert.equal(
+    db.sqlite.prepare("SELECT status FROM auctions WHERE id = ?").get(auctionId).status,
+    "awarded",
+  );
+  assert.equal(
+    db.sqlite.prepare("SELECT COUNT(*) AS count FROM bookings WHERE id = ?").get(acceptedData.awardId).count,
+    1,
+  );
+  assert.equal(
+    db.sqlite
+      .prepare("SELECT COUNT(*) AS count FROM booking_message_read_cursors WHERE booking_id = ?")
+      .get(acceptedData.awardId).count,
+    2,
+  );
 });
 
 test("message writes validate input, replay atomically, isolate scopes, and enforce rate limits", async () => {

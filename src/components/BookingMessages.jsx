@@ -17,11 +17,22 @@ import { formatCurrency } from "../data.js";
 import {
   BOOKING_MESSAGE_POLL_INTERVAL_MS,
   bookingMessagePollDelay,
+  clearBookingUnreadState,
+  formatUnreadMessageCount,
+  isBookingMessageEndVisible,
   mergeBookingMessages,
+  mergeBookingThreadMetadata,
+  mergeBookingThreads,
+  nextBookingThreadHydrationAttempt,
   nextBookingMessageAnnouncement,
+  optionalUnreadMessageCount,
+  shouldAcknowledgeRenderedMessages,
   shouldScrollToLatest,
   shouldStickToLatest,
 } from "./bookingMessages.js";
+
+const BOOKING_THREAD_PAGE_LIMIT = 50;
+const BOOKING_THREAD_MAX_PAGES = 100;
 
 function formatDate(value) {
   if (!value) return "Date to be confirmed";
@@ -86,7 +97,9 @@ export function BookingMessages({
   onViewScope,
   emptyActionLabel,
   onEmptyAction,
+  inbox,
 }) {
+  const inboxThreads = Array.isArray(inbox?.threads) ? inbox.threads : [];
   const [threads, setThreads] = useState([]);
   const [threadsLoading, setThreadsLoading] = useState(true);
   const [threadsError, setThreadsError] = useState("");
@@ -110,17 +123,33 @@ export function BookingMessages({
   const selectedBookingIdRef = useRef(selectedBookingId);
   const earlierRequestRef = useRef(null);
   const latestRequestRef = useRef(null);
+  const readRequestRef = useRef(null);
+  const readRetryTimerRef = useRef(null);
+  const readFailuresRef = useRef(new Map());
+  const acknowledgedMessagesRef = useRef(new Map());
   const messagesRef = useRef(messages);
+  const messagesLoadingRef = useRef(messagesLoading);
+  const threadsRef = useRef(threads);
+  const threadsLoadingRef = useRef(threadsLoading);
+  const selectedThreadRef = useRef(null);
+  const unreadSupportedRef = useRef(inbox?.unreadSupported !== false);
   const pollCursorRef = useRef(null);
   const pollingStoppedRef = useRef(false);
   const historyRef = useRef(null);
+  const historyEndRef = useRef(null);
+  const latestMessageVisibleRef = useRef(false);
   const scrollModeRef = useRef(null);
   const headingRef = useRef(null);
   const composerRef = useRef(null);
   const appliedFocusRequestRef = useRef(null);
   const appliedPreferredRef = useRef(null);
+  const missingThreadHydrationRef = useRef(null);
   selectedBookingIdRef.current = selectedBookingId;
   messagesRef.current = messages;
+  messagesLoadingRef.current = messagesLoading;
+  threadsRef.current = threads;
+  threadsLoadingRef.current = threadsLoading;
+  unreadSupportedRef.current = inbox?.unreadSupported !== false;
 
   const draft = selectedBookingId ? drafts[selectedBookingId] || "" : "";
   const sendError = selectedBookingId ? sendErrors[selectedBookingId] || "" : "";
@@ -135,12 +164,25 @@ export function BookingMessages({
     setRefreshAnnouncement((current) => nextBookingMessageAnnouncement(current, ""));
   }
 
-  function updateThreadMessageCount(bookingId, value) {
-    const count = Number(value);
-    if (!Number.isFinite(count) || count < 0) return;
-    setThreads((current) => current.map((award) => award.id === bookingId
-      ? { ...award, messageCount: Math.max(Number(award.messageCount || 0), count) }
-      : award));
+  function updateThreadMetadata(bookingId, metadata = {}) {
+    setThreads((current) => current.map((thread) => thread.id === bookingId
+      ? mergeBookingThreadMetadata(thread, metadata)
+      : thread));
+    inbox?.updateThread?.(bookingId, metadata);
+  }
+
+  function applyMessageMetadata(bookingId, metadata = {}) {
+    const next = {};
+    const messageCount = Number(metadata?.messageCount);
+    const hasMessageCount = Number.isSafeInteger(messageCount) && messageCount >= 0;
+    if (hasMessageCount) next.messageCount = messageCount;
+    const unreadMessageCount = optionalUnreadMessageCount(metadata?.unreadMessageCount);
+    if (hasMessageCount && unreadSupportedRef.current && unreadMessageCount !== null) next.unreadMessageCount = unreadMessageCount;
+    const readThroughSequence = Number(metadata?.readThroughSequence);
+    if (hasMessageCount && unreadSupportedRef.current && Number.isSafeInteger(readThroughSequence) && readThroughSequence >= 0) {
+      next.readThroughSequence = readThroughSequence;
+    }
+    if (Object.keys(next).length) updateThreadMetadata(bookingId, next);
   }
 
   async function fetchMessagePage(bookingId, { after = null, cursor = null, signal } = {}) {
@@ -219,7 +261,7 @@ export function BookingMessages({
       if (finalMeta.pollCursor !== undefined && finalMeta.pollCursor !== null) {
         pollCursorRef.current = finalMeta.pollCursor;
       }
-      updateThreadMessageCount(bookingId, finalMeta.messageCount);
+      applyMessageMetadata(bookingId, finalMeta);
       setPermissions(finalMeta.permissions || { canSend: false, pausedReason: "Messaging is unavailable." });
       setMessagesError("");
       pollingStoppedRef.current = false;
@@ -273,6 +315,103 @@ export function BookingMessages({
     setMessagesRefreshing(false);
   }
 
+  function clearReadRetry() {
+    if (readRetryTimerRef.current === null) return;
+    window.clearTimeout(readRetryTimerRef.current);
+    readRetryTimerRef.current = null;
+  }
+
+  function scheduleReadRetry(bookingId, retryAfter = null) {
+    if (selectedBookingIdRef.current !== bookingId) return;
+    const failures = (readFailuresRef.current.get(bookingId) || 0) + 1;
+    readFailuresRef.current.set(bookingId, failures);
+    clearReadRetry();
+    readRetryTimerRef.current = window.setTimeout(() => {
+      readRetryTimerRef.current = null;
+      if (selectedBookingIdRef.current === bookingId) acknowledgeLatestRendered();
+    }, bookingMessagePollDelay({ consecutiveFailures: failures, retryAfter }));
+  }
+
+  function acknowledgeLatestRendered() {
+    const bookingId = selectedBookingIdRef.current;
+    const thread = selectedThreadRef.current;
+    const latestMessage = messagesRef.current[messagesRef.current.length - 1];
+    const unreadMessageCount = optionalUnreadMessageCount(thread?.unreadMessageCount);
+    const eligible = shouldAcknowledgeRenderedMessages({
+      hasUnreadState: unreadSupportedRef.current && unreadMessageCount !== null,
+      unreadMessageCount,
+      messageId: latestMessage?.id,
+      latestMessageVisible: latestMessageVisibleRef.current,
+      documentVisible: document.visibilityState === "visible",
+      windowFocused: typeof document.hasFocus === "function" && document.hasFocus(),
+      loading: messagesLoadingRef.current || threadsLoadingRef.current,
+    });
+    if (!bookingId || !eligible || navigator.onLine === false) return Promise.resolve({ ok: false, skipped: true });
+    if (acknowledgedMessagesRef.current.get(bookingId) === latestMessage.id) {
+      return Promise.resolve({ ok: true, duplicate: true });
+    }
+
+    const activeRequest = readRequestRef.current;
+    if (activeRequest?.bookingId === bookingId && activeRequest.messageId === latestMessage.id) {
+      return activeRequest.promise;
+    }
+    activeRequest?.controller.abort();
+    clearReadRetry();
+
+    const controller = new AbortController();
+    const request = { bookingId, messageId: latestMessage.id, controller, promise: null };
+    request.promise = (async () => {
+      const response = await fetch(`/api/v1/bookings/${bookingId}/messages/read`, {
+        method: "PUT",
+        headers: { "Content-Type": "application/json" },
+        credentials: "include",
+        signal: controller.signal,
+        body: JSON.stringify({ messageId: latestMessage.id }),
+      });
+      const retryAfter = response.headers.get("Retry-After");
+      let payload;
+      try {
+        payload = await readApiResponse(response, "Read state could not be saved.");
+      } catch (error) {
+        error.retryAfter = retryAfter;
+        throw error;
+      }
+      if (controller.signal.aborted || selectedBookingIdRef.current !== bookingId) {
+        return { ok: false, cancelled: true };
+      }
+      const data = payload?.data || {};
+      const messageCount = Number(data.messageCount);
+      const readThroughSequence = Number(data.readThroughSequence);
+      const nextUnreadMessageCount = optionalUnreadMessageCount(data.unreadMessageCount);
+      if (
+        data.bookingId !== bookingId
+        || !Number.isSafeInteger(messageCount)
+        || messageCount < 0
+        || !Number.isSafeInteger(readThroughSequence)
+        || readThroughSequence < 0
+        || nextUnreadMessageCount === null
+      ) {
+        throw new Error("Read state response was incomplete.");
+      }
+      applyMessageMetadata(bookingId, data);
+      acknowledgedMessagesRef.current.set(bookingId, latestMessage.id);
+      readFailuresRef.current.delete(bookingId);
+      return { ok: true };
+    })().catch((error) => {
+      if (error?.name === "AbortError" || controller.signal.aborted || selectedBookingIdRef.current !== bookingId) {
+        return { ok: false, cancelled: true };
+      }
+      const status = Number(error?.status || 0);
+      const retryable = status === 0 || status === 408 || status === 425 || status === 429 || status >= 500;
+      if (retryable) scheduleReadRetry(bookingId, error?.retryAfter || null);
+      return { ok: false, retryable };
+    }).finally(() => {
+      if (readRequestRef.current === request) readRequestRef.current = null;
+    });
+    readRequestRef.current = request;
+    return request.promise;
+  }
+
   function jumpToLatest() {
     const history = historyRef.current;
     if (!history) return;
@@ -285,33 +424,109 @@ export function BookingMessages({
   useEffect(() => {
     const controller = new AbortController();
     async function loadThreads() {
-      setThreadsLoading(true);
+      const showLoadingState = threadsRef.current.length === 0;
+      if (showLoadingState) {
+        threadsLoadingRef.current = true;
+        setThreadsLoading(true);
+      }
       setThreadsError("");
       try {
-        const response = await fetch("/api/v1/bookings?limit=50", { credentials: "include", signal: controller.signal });
-        const payload = await readApiResponse(response, "Awarded conversations could not be loaded.");
-        const nextThreads = (Array.isArray(payload.data) ? payload.data : [])
-          .filter((award) => award.audienceRole === audience || award.audienceRole === "admin");
+        const nextThreads = [];
+        let page = 1;
+        while (page <= BOOKING_THREAD_MAX_PAGES) {
+          const response = await fetch(`/api/v1/bookings?page=${page}&limit=${BOOKING_THREAD_PAGE_LIMIT}`, {
+            credentials: "include",
+            signal: controller.signal,
+          });
+          const payload = await readApiResponse(response, "Awarded conversations could not be loaded.");
+          if (!Array.isArray(payload?.data)) throw new Error("Awarded conversations could not be loaded.");
+          const reportedPage = Number(payload.meta?.page);
+          if (!Number.isSafeInteger(reportedPage) || reportedPage !== page || typeof payload.meta?.hasMore !== "boolean") {
+            throw new Error("Awarded conversation pagination was incomplete.");
+          }
+          nextThreads.push(...payload.data.filter((award) => (
+            award.audienceRole === audience || award.audienceRole === "admin"
+          )));
+          if (!payload.meta.hasMore) break;
+          if (page === BOOKING_THREAD_MAX_PAGES) {
+            throw new Error("Awarded conversations exceeded the safe page limit.");
+          }
+          page += 1;
+        }
         if (controller.signal.aborted) return;
-        setThreads(nextThreads);
-        const current = selectedBookingIdRef.current;
-        const nextSelection = preferredBookingId && nextThreads.some((award) => award.id === preferredBookingId)
-          ? preferredBookingId
-          : nextThreads.some((award) => award.id === current) ? current : nextThreads[0]?.id || null;
-        if (nextSelection !== current) selectBooking(nextSelection);
+        const summariesById = new Map(inboxThreads.map((thread) => [thread.id, thread]));
+        setThreads((current) => {
+          const next = mergeBookingThreads(current, nextThreads).map((thread) => (
+            summariesById.has(thread.id)
+              ? mergeBookingThreadMetadata(thread, summariesById.get(thread.id))
+              : thread
+          ));
+          threadsRef.current = next;
+          return next;
+        });
       } catch (error) {
         if (error?.name === "AbortError" || controller.signal.aborted) return;
-        setThreads([]);
-        setThreadsError(error.message || "Awarded conversations could not be loaded.");
+        if (!threadsRef.current.length) {
+          setThreadsError(error.message || "Awarded conversations could not be loaded.");
+        }
       } finally {
-        if (!controller.signal.aborted) setThreadsLoading(false);
+        if (!controller.signal.aborted) {
+          threadsLoadingRef.current = false;
+          setThreadsLoading(false);
+        }
       }
     }
     loadThreads();
     return () => controller.abort();
-  }, [audience, preferredBookingId, threadsRefreshKey]);
+  }, [audience, threadsRefreshKey]);
 
   useEffect(() => {
+    if (!inbox || inbox.loading || inbox.error) return;
+    const summariesById = new Map(inboxThreads.map((thread) => [thread.id, thread]));
+    if (inbox.unreadSupported === false) {
+      setThreads((current) => {
+        const readable = Number(inbox.summaryGeneration) > 0
+          ? current
+            .filter((thread) => summariesById.has(thread.id))
+            .map((thread) => mergeBookingThreadMetadata(thread, summariesById.get(thread.id)))
+          : current;
+        const next = clearBookingUnreadState(readable);
+        threadsRef.current = next;
+        return next;
+      });
+      readRequestRef.current?.controller.abort();
+      readRequestRef.current = null;
+      clearReadRetry();
+      return;
+    }
+    setThreads((current) => {
+      const next = current
+        .filter((thread) => summariesById.has(thread.id))
+        .map((thread) => mergeBookingThreadMetadata(thread, summariesById.get(thread.id)));
+      threadsRef.current = next;
+      return next;
+    });
+  }, [inbox, inbox?.error, inbox?.loading, inbox?.summaryGeneration, inbox?.unreadSupported, inboxThreads]);
+
+  useEffect(() => {
+    if (!inbox || inbox.loading || inbox.error || threadsLoading) return;
+    const hydratedIds = new Set(threads.map((thread) => thread.id));
+    const missingIds = inboxThreads
+      .map((thread) => thread.id)
+      .filter((id) => id && !hydratedIds.has(id));
+    const hydration = nextBookingThreadHydrationAttempt({
+      missingIds,
+      summaryGeneration: inbox.summaryGeneration,
+      previous: missingThreadHydrationRef.current,
+    });
+    missingThreadHydrationRef.current = hydration.attempt;
+    if (!hydration.shouldHydrate) return;
+    setThreadsRefreshKey((value) => value + 1);
+  }, [inbox, inbox?.error, inbox?.loading, inbox?.summaryGeneration, inboxThreads, threads, threadsLoading]);
+
+  useEffect(() => {
+    if (threadsLoading) return;
+    const current = selectedBookingIdRef.current;
     if (
       preferredBookingId
       && appliedPreferredRef.current !== preferredBookingId
@@ -319,19 +534,29 @@ export function BookingMessages({
     ) {
       selectBooking(preferredBookingId);
       appliedPreferredRef.current = preferredBookingId;
+      return;
     }
-  }, [preferredBookingId, threads]);
+    if (threads.some((award) => award.id === current)) return;
+    selectBooking(threads[0]?.id || null);
+  }, [preferredBookingId, threads, threadsLoading]);
 
   const selectedThread = useMemo(
     () => threads.find((award) => award.id === selectedBookingId) || null,
     [selectedBookingId, threads],
   );
+  selectedThreadRef.current = selectedThread;
   const details = useMemo(() => threadDetails(selectedThread, audience), [audience, selectedThread]);
 
   useEffect(() => {
+    if (threadsLoading) return undefined;
+    if (selectedBookingId && !selectedThread) return undefined;
     if (!selectedBookingId) {
       latestRequestRef.current?.controller.abort();
       latestRequestRef.current = null;
+      readRequestRef.current?.controller.abort();
+      readRequestRef.current = null;
+      clearReadRetry();
+      latestMessageVisibleRef.current = false;
       messagesRef.current = [];
       pollCursorRef.current = null;
       pollingStoppedRef.current = false;
@@ -351,6 +576,7 @@ export function BookingMessages({
     setMessagesError("");
     resetRefreshAnnouncement();
     setNewMessageCount(0);
+    messagesLoadingRef.current = true;
     setMessagesLoading(true);
     async function loadMessages() {
       const result = await refreshLatest(bookingId, { initial: true });
@@ -362,6 +588,7 @@ export function BookingMessages({
         setPermissions({ canSend: false, pausedReason: null });
         setNextCursor(null);
       }
+      messagesLoadingRef.current = false;
       setMessagesLoading(false);
     }
     loadMessages();
@@ -372,7 +599,7 @@ export function BookingMessages({
         latestRequestRef.current = null;
       }
     };
-  }, [selectedBookingId]);
+  }, [selectedBookingId, selectedThread?.id, threadsLoading]);
 
   useEffect(() => {
     const bookingId = selectedBookingId;
@@ -410,6 +637,7 @@ export function BookingMessages({
     function resume() {
       if (disposed || document.visibilityState !== "visible" || navigator.onLine === false) return;
       window.clearTimeout(timer);
+      acknowledgeLatestRendered();
       run();
     }
 
@@ -441,6 +669,31 @@ export function BookingMessages({
   }, [messages, messagesLoading, selectedBookingId, threadsLoading]);
 
   useEffect(() => {
+    latestMessageVisibleRef.current = false;
+    const end = historyEndRef.current;
+    if (!end || messagesLoading || threadsLoading || !messages.length || !("IntersectionObserver" in window)) {
+      return undefined;
+    }
+    const observer = new window.IntersectionObserver((entries) => {
+      const entry = entries.find((candidate) => candidate.target === end);
+      const endVisible = isBookingMessageEndVisible(entry);
+      latestMessageVisibleRef.current = endVisible;
+      if (endVisible) acknowledgeLatestRendered();
+    }, { root: null, threshold: 0.5 });
+    observer.observe(end);
+    return () => {
+      latestMessageVisibleRef.current = false;
+      observer.disconnect();
+    };
+  }, [messages, messagesLoading, selectedBookingId, threadsLoading]);
+
+  useEffect(() => {
+    if (messagesLoading || threadsLoading || !messages.length) return undefined;
+    const frame = window.requestAnimationFrame(() => acknowledgeLatestRendered());
+    return () => window.cancelAnimationFrame(frame);
+  }, [messages, messagesLoading, selectedThread?.unreadMessageCount, threadsLoading]);
+
+  useEffect(() => {
     if (!focusRequest || appliedFocusRequestRef.current === focusRequest || messagesLoading || threadsLoading || !selectedBookingId) return undefined;
     const frame = window.requestAnimationFrame(() => {
       if (appliedFocusRequestRef.current === focusRequest) return;
@@ -460,6 +713,9 @@ export function BookingMessages({
     earlierRequestRef.current?.abort();
     latestRequestRef.current?.controller.abort();
     latestRequestRef.current = null;
+    readRequestRef.current?.controller.abort();
+    readRequestRef.current = null;
+    clearReadRetry();
   }, []);
 
   async function loadEarlier() {
@@ -481,7 +737,7 @@ export function BookingMessages({
       messagesRef.current = merged;
       setMessages(merged);
       setNextCursor(payload.meta?.nextCursor || null);
-      updateThreadMessageCount(bookingId, payload.meta?.messageCount);
+      applyMessageMetadata(bookingId, payload.meta);
       setPermissions(payload.meta?.permissions || { canSend: false, pausedReason: "Messaging is unavailable." });
     } catch (error) {
       if (error?.name === "AbortError" || controller.signal.aborted || selectedBookingIdRef.current !== bookingId) return;
@@ -496,13 +752,18 @@ export function BookingMessages({
     if (bookingId === selectedBookingIdRef.current) return;
     earlierRequestRef.current?.abort();
     latestRequestRef.current?.controller.abort();
+    readRequestRef.current?.controller.abort();
+    clearReadRetry();
     earlierRequestRef.current = null;
     latestRequestRef.current = null;
+    readRequestRef.current = null;
+    latestMessageVisibleRef.current = false;
     messagesRef.current = [];
     pollCursorRef.current = null;
     pollingStoppedRef.current = false;
     setLoadingEarlier(false);
-    setMessagesLoading(true);
+    messagesLoadingRef.current = Boolean(bookingId);
+    setMessagesLoading(Boolean(bookingId));
     setMessages([]);
     setMessagesError("");
     setMessagesRefreshing(false);
@@ -553,7 +814,7 @@ export function BookingMessages({
         scrollModeRef.current = { type: "latest" };
         setMessages(merged);
       }
-      if (sent?.id) updateThreadMessageCount(bookingId, payload.meta?.messageCount);
+      if (sent?.id) applyMessageMetadata(bookingId, payload.meta);
       setDrafts((current) => { const next = { ...current }; delete next[bookingId]; return next; });
       sendAttemptsRef.current.delete(bookingId);
       setSendNotices((current) => ({ ...current, [bookingId]: "Message sent." }));
@@ -598,10 +859,24 @@ export function BookingMessages({
           {threads.map((award) => {
             const thread = threadDetails(award, audience);
             const count = Number(award.messageCount || 0);
+            const unreadMessageCount = optionalUnreadMessageCount(award.unreadMessageCount);
+            const hasUnreadMessages = inbox?.unreadSupported !== false && unreadMessageCount !== null && unreadMessageCount > 0;
             return (
-              <button type="button" className={award.id === selectedBookingId ? "is-active" : ""} aria-pressed={award.id === selectedBookingId} onClick={() => selectBooking(award.id)} key={award.id}>
+              <button type="button" className={`${award.id === selectedBookingId ? "is-active" : ""}${hasUnreadMessages ? " has-unread" : ""}`.trim()} aria-pressed={award.id === selectedBookingId} onClick={() => selectBooking(award.id)} key={award.id}>
                 <span className="booking-thread__icon"><MessageSquareText size={17} /></span>
-                <span className="booking-thread__copy"><strong>{thread.request.title || thread.service}</strong><small>{thread.counterparty} · {thread.service}</small><em>{count} message{count === 1 ? "" : "s"}</em></span>
+                <span className="booking-thread__copy">
+                  <strong>{thread.request.title || thread.service}</strong>
+                  <small>{thread.counterparty} · {thread.service}</small>
+                  <span className="booking-thread__message-meta">
+                    <em>{count} message{count === 1 ? "" : "s"}</em>
+                    {hasUnreadMessages && (
+                      <>
+                        <span className="booking-thread__unread" aria-hidden="true">{formatUnreadMessageCount(unreadMessageCount)} unread</span>
+                        <span className="sr-only">{unreadMessageCount} unread message{unreadMessageCount === 1 ? "" : "s"}</span>
+                      </>
+                    )}
+                  </span>
+                </span>
                 <span className="status-pill status-pill--direct"><span /> Contract pending</span>
               </button>
             );
@@ -643,6 +918,7 @@ export function BookingMessages({
                     <p>{message.body}</p>
                   </article>
                 ))}
+                {messages.length > 0 && <span className="booking-message-history__end" ref={historyEndRef} aria-hidden="true" />}
               </>
             )}
           </div>

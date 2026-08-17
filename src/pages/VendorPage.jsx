@@ -34,7 +34,8 @@ import {
 import { categories, cities, formatCurrency, opportunities as exampleOpportunities } from "../data.js";
 import { isServiceUnavailable, readApiResponse } from "../api.js";
 import { BookingMessages } from "../components/BookingMessages.jsx";
-import { targetScrollLeftForControl } from "../components/bookingMessages.js";
+import { formatUnreadMessageCount, targetScrollLeftForControl } from "../components/bookingMessages.js";
+import { useBookingInbox } from "../components/useBookingInbox.js";
 
 function categoryLabel(value) {
   return categories.find((category) => category.id === value)?.name || value?.replaceAll("_", " ") || "Service";
@@ -118,14 +119,14 @@ function createAddOn() {
   };
 }
 
-function VendorWorkspaceNav({ active, setActive, opportunityCount, offerCount, awardCount, conversationCount, restricted = false }) {
+function VendorWorkspaceNav({ active, setActive, opportunityCount, offerCount, awardCount, unreadMessageCount, restricted = false }) {
   const navRef = useRef(null);
   const buttonRefs = useRef(new Map());
   const allItems = [
     ["opportunities", BriefcaseBusiness, "Opportunities", opportunityCount],
     ["offers", FileText, "My offers", offerCount],
     ["awards", Handshake, "Award handoffs", awardCount],
-    ["messages", MessageSquareText, "Messages", conversationCount],
+    ["messages", MessageSquareText, "Messages", unreadMessageCount],
     ["profile", Store, "Business profile"],
   ];
   const items = restricted ? allItems.filter(([id]) => ["awards", "messages"].includes(id)) : allItems;
@@ -163,14 +164,18 @@ function VendorWorkspaceNav({ active, setActive, opportunityCount, offerCount, a
       window.removeEventListener("resize", scheduleReveal);
       document.fonts?.removeEventListener?.("loadingdone", scheduleReveal);
     };
-  }, [active, awardCount, conversationCount, offerCount, opportunityCount, restricted]);
+  }, [active, awardCount, offerCount, opportunityCount, restricted, unreadMessageCount]);
   return (
     <nav className="vendor-workspace-nav" aria-label="Vendor workspace" ref={navRef}>
-      {items.map(([id, Icon, label, count]) => (
-        <button ref={(node) => { if (node) buttonRefs.current.set(id, node); else buttonRefs.current.delete(id); }} className={active === id ? "is-active" : ""} type="button" key={id} onClick={() => setActive(id)} aria-pressed={active === id}>
-          <Icon size={17} />{label}{Number(count) > 0 && <span>{count}</span>}
-        </button>
-      ))}
+      {items.map(([id, Icon, label, badge]) => {
+        const count = Number(badge);
+        const isUnreadBadge = id === "messages";
+        return (
+          <button ref={(node) => { if (node) buttonRefs.current.set(id, node); else buttonRefs.current.delete(id); }} className={active === id ? "is-active" : ""} type="button" key={id} onClick={() => setActive(id)} aria-pressed={active === id} aria-label={isUnreadBadge && count > 0 ? `${label}, ${count} unread message${count === 1 ? "" : "s"}` : undefined}>
+            <Icon size={17} />{label}{count > 0 && <span className={isUnreadBadge ? "workspace-unread-badge" : ""} aria-hidden={isUnreadBadge || undefined}>{isUnreadBadge ? formatUnreadMessageCount(count) : count}</span>}
+          </button>
+        );
+      })}
     </nav>
   );
 }
@@ -387,6 +392,7 @@ export function VendorPage({ notify, onOpenAuth, authRevision = 0 }) {
   const [refreshKey, setRefreshKey] = useState(0);
   const [messageBookingId, setMessageBookingId] = useState(null);
   const [messageFocusRequest, setMessageFocusRequest] = useState(null);
+  const bookingInbox = useBookingInbox({ audience: "vendor", enabled: ["live", "restricted"].includes(mode) });
   const messageFocusSequence = useRef(0);
 
   useEffect(() => {
@@ -487,11 +493,11 @@ export function VendorPage({ notify, onOpenAuth, authRevision = 0 }) {
         {restricted
           ? <div className="demo-catalog-note vendor-preview-note" role="status"><ShieldCheck size={16} /><p><strong>Account access is restricted.</strong> New opportunities and new messages are paused. Prior award records and conversation history remain available for reference; contact Melaiva support for help.</p></div>
           : <><div className="vendor-welcome"><div><div className="eyebrow">{mode === "demo" ? "Partner workspace preview" : "Partner workspace"}</div><h1>Good opportunities, clearly briefed.</h1><p>{mode === "demo" ? "Explore a clearly labelled example without changing live marketplace data." : "Focus on celebrations that fit your dates, services and working range."}</p></div>{mode === "demo" && <div className="vendor-demo-note"><ShieldCheck size={16} /><span>Example workspace data</span></div>}</div><div className="vendor-metrics"><div><span className="card-icon"><BriefcaseBusiness size={18} /></span><p><small>{mode === "demo" ? "Example matches" : "Open opportunities"}</small><strong>{visibleOpportunities.length}</strong><em>{mode === "demo" ? "Preview" : "Live"}</em></p></div><div><span className="card-icon card-icon--teal"><FileCheck2 size={18} /></span><p><small>Offers under review</small><strong>{mode === "demo" ? "—" : underReview}</strong><em>{mode === "demo" ? "No live data" : "Live"}</em></p></div><div><span className="card-icon card-icon--marigold"><TrendingUp size={18} /></span><p><small>Profile status</small><strong>{mode === "demo" ? "Preview" : "Approved"}</strong><em>{mode === "demo" ? "Example" : "Verified"}</em></p></div><div><span className="card-icon card-icon--rose"><Star size={18} /></span><p><small>Review quality</small><strong>—</strong><em>No rating yet</em></p></div></div></>}
-        <VendorWorkspaceNav active={active} setActive={setActive} opportunityCount={visibleOpportunities.length} offerCount={mode === "demo" ? 0 : offers.length} awardCount={mode === "demo" ? 0 : awards.length} conversationCount={mode === "demo" ? 0 : awards.length} restricted={restricted} />
+        <VendorWorkspaceNav active={active} setActive={setActive} opportunityCount={visibleOpportunities.length} offerCount={mode === "demo" ? 0 : offers.length} awardCount={mode === "demo" ? 0 : awards.length} unreadMessageCount={mode === "demo" ? 0 : bookingInbox.unreadMessageCount} restricted={restricted} />
         {!restricted && active === "opportunities" && <div className="vendor-tab-panel"><div className="vendor-panel-heading"><div><h2>{mode === "demo" ? "Example opportunities" : "Open opportunities"}</h2><p>{mode === "demo" ? "Static examples for evaluating the workflow." : "Private briefs available to your approved business."}</p></div></div>{visibleOpportunities.length ? <div className="opportunity-list">{visibleOpportunities.map((opportunity) => <OpportunityCard opportunity={opportunity} notify={notify} onOpenAuth={onOpenAuth} onSubmitted={() => setRefreshKey((value) => value + 1)} key={opportunity.id} />)}</div> : <div className="vendor-empty"><span><BriefcaseBusiness size={28} /></span><h2>No suitable live briefs right now</h2><p>New approved requests will appear here when they match your partner account.</p></div>}</div>}
         {!restricted && active === "offers" && <VendorOffers offers={mode === "demo" ? [] : offers} demo={mode === "demo"} />}
         {active === "awards" && <VendorAwards awards={mode === "demo" ? [] : awards} demo={mode === "demo"} loading={awardsLoading} error={awardsError} onRetry={() => setAwardsRefreshKey((value) => value + 1)} onMessage={(bookingId) => { setMessageBookingId(bookingId); messageFocusSequence.current += 1; setMessageFocusRequest(messageFocusSequence.current); setActive("messages"); }} />}
-        {active === "messages" && (["live", "restricted"].includes(mode) ? <BookingMessages audience="vendor" preferredBookingId={messageBookingId} focusRequest={messageFocusRequest} onFocusRequestHandled={() => setMessageFocusRequest(null)} onViewScope={() => setActive("awards")} emptyActionLabel={restricted ? "View award handoffs" : "View opportunities"} onEmptyAction={() => setActive(restricted ? "awards" : "opportunities")} /> : <VendorEmpty type="messages" />)}
+        {active === "messages" && (["live", "restricted"].includes(mode) ? <BookingMessages audience="vendor" preferredBookingId={messageBookingId} focusRequest={messageFocusRequest} onFocusRequestHandled={() => setMessageFocusRequest(null)} onViewScope={() => setActive("awards")} emptyActionLabel={restricted ? "View award handoffs" : "View opportunities"} onEmptyAction={() => setActive(restricted ? "awards" : "opportunities")} inbox={bookingInbox} /> : <VendorEmpty type="messages" />)}
         {!restricted && active === "profile" && <VendorEmpty type="profile" />}
       </div>
     </div>

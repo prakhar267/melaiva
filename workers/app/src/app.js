@@ -2181,7 +2181,7 @@ function buildApp() {
         iterations: CLIENT_PASSWORD_ITERATIONS,
         outputBits: 256,
         encoding: "base64url-no-padding",
-        vendorApplicationEvidenceRevision: 3,
+        vendorApplicationEvidenceRevision: 4,
       },
     }),
   );

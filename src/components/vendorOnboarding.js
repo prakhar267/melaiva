@@ -34,6 +34,11 @@ const EVIDENCE_URL_NORMALIZED_MAX_LENGTH = 300;
 const INSTAGRAM_HANDLE_PATTERN = /^@?[A-Za-z0-9._]{1,30}$/u;
 const VENDOR_EFFECTIVE_STATUSES = new Set(["pending", "approved", "rejected", "suspended", "needs_information"]);
 const INFORMATION_REQUEST_FIELDS = new Set(["portfolio", "references", "registration"]);
+const VENDOR_ID_PATTERN = /^[A-Za-z0-9][A-Za-z0-9_-]{0,127}$/u;
+
+function normalizeVendorId(value) {
+  return typeof value === "string" && VENDOR_ID_PATTERN.test(value) ? value : "";
+}
 
 function normalizedUniqueUrls(values) {
   return values.map((value) => normalizePublicWebsiteUrl(value)).filter(Boolean);
@@ -185,7 +190,7 @@ export function normalizeVendorEvidenceContext(payload) {
     && (!evidence || evidence.revision === evidenceRevision);
   const currentInformationRequest = normalizeInformationRequest(value.currentInformationRequest);
   return {
-    vendorId: typeof value.vendorId === "string" ? value.vendorId : typeof value.id === "string" ? value.id : "",
+    vendorId: normalizeVendorId(typeof value.vendorId === "string" ? value.vendorId : value.id),
     status: normalizeVendorEffectiveStatus(value.status),
     effectiveStatus,
     reviewRevision: Number.isInteger(reviewRevision) && reviewRevision >= 0 ? reviewRevision : null,
@@ -213,9 +218,10 @@ export function prefillVendorEvidence(context) {
 }
 
 export function buildVendorEvidenceSubmissionPayload(evidence, context) {
+  const vendorId = normalizeVendorId(context?.vendorId);
   if (
     !context
-    || !context.vendorId
+    || !vendorId
     || !["pending", "rejected", "needs_information"].includes(context.effectiveStatus)
     || !Number.isInteger(context.reviewRevision)
     || !Number.isInteger(context.informationRequestRevision)
@@ -234,7 +240,7 @@ export function buildVendorEvidenceSubmissionPayload(evidence, context) {
   }
   return {
     evidence: buildVendorEvidence(evidence),
-    expectedVendorId: context.vendorId,
+    expectedVendorId: vendorId,
     expectedStatus: context.effectiveStatus,
     expectedRevision: context.reviewRevision,
     expectedEvidenceRevision: Number.isInteger(context.evidenceRevision) ? context.evidenceRevision : 0,
@@ -248,7 +254,8 @@ export function shouldPreflightVendorEvidenceSubmission({ evidenceOnly }) {
 
 export function vendorEvidenceContextsMatch(expected, current) {
   if (!expected || !current) return false;
-  return expected.vendorId === current.vendorId
+  return Boolean(normalizeVendorId(expected.vendorId))
+    && normalizeVendorId(expected.vendorId) === normalizeVendorId(current.vendorId)
     && expected.effectiveStatus === current.effectiveStatus
     && expected.reviewRevision === current.reviewRevision
     && expected.evidenceRevision === current.evidenceRevision
@@ -257,9 +264,10 @@ export function vendorEvidenceContextsMatch(expected, current) {
 }
 
 export function vendorEvidencePreflightIdentityMatches(expectedContext, accessResult) {
+  const expectedVendorId = normalizeVendorId(expectedContext?.vendorId);
   return Boolean(
-    expectedContext?.vendorId
-    && accessResult?.context?.vendorId === expectedContext.vendorId,
+    expectedVendorId
+    && normalizeVendorId(accessResult?.context?.vendorId) === expectedVendorId,
   );
 }
 
@@ -276,13 +284,13 @@ export function vendorEvidencePreflightMatches({
 
 export function shouldClearVendorEvidencePrivateDraft({
   evidenceOnly = false,
-  wasEvidenceOnly = false,
+  wasEvidenceOnly = evidenceOnly,
   identityChanged = false,
   accessResolved = false,
   incomingContext,
 } = {}) {
   return Boolean(
-    (wasEvidenceOnly && !evidenceOnly)
+    (wasEvidenceOnly !== evidenceOnly)
     || (identityChanged && (evidenceOnly || wasEvidenceOnly))
     || (evidenceOnly && accessResolved && !incomingContext),
   );

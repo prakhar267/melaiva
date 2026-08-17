@@ -1,6 +1,6 @@
 import { readApiResponse } from "../api.js";
 
-export const VENDOR_APPLICATION_EVIDENCE_REVISION = 3;
+export const VENDOR_APPLICATION_EVIDENCE_REVISION = 4;
 export const ADMIN_VENDOR_SUMMARY_CONTRACT = "vendor-summary-v2";
 
 export const ADMIN_VENDOR_SUMMARY_HEADERS = Object.freeze({

@@ -26,9 +26,10 @@ import {
 } from "../src/components/vendorApplicationCompatibility.js";
 
 test("vendor evidence compatibility fails closed across mixed Worker versions", () => {
-  assert.equal(supportsVendorApplicationEvidence({ data: { vendorApplicationEvidenceRevision: 3 } }), true);
+  assert.equal(supportsVendorApplicationEvidence({ data: { vendorApplicationEvidenceRevision: 4 } }), true);
   assert.equal(supportsVendorApplicationEvidence({ data: {} }), false);
-  assert.equal(supportsVendorApplicationEvidence({ data: { vendorApplicationEvidenceRevision: "3" } }), false);
+  assert.equal(supportsVendorApplicationEvidence({ data: { vendorApplicationEvidenceRevision: "4" } }), false);
+  assert.equal(supportsVendorApplicationEvidence({ data: { vendorApplicationEvidenceRevision: 3 } }), false);
   assert.equal(supportsVendorApplicationEvidence({ data: { vendorApplicationEvidenceRevision: 2 } }), false);
   assert.equal(supportsVendorApplicationEvidence({ data: { vendorApplicationEvidenceRevision: 1 } }), false);
 
@@ -436,6 +437,10 @@ test("account transitions clear private evidence before another onboarding flow 
   }), true);
   assert.equal(shouldClearVendorEvidencePrivateDraft({
     evidenceOnly: true,
+    wasEvidenceOnly: false,
+  }), true);
+  assert.equal(shouldClearVendorEvidencePrivateDraft({
+    evidenceOnly: true,
     identityChanged: true,
     incomingContext: { vendorId: "vendor-2" },
   }), true);
@@ -467,6 +472,15 @@ test("ambiguous retries revalidate exact vendor identity before replaying", () =
   assert.equal(vendorEvidencePreflightIdentityMatches(expectedContext, {
     context: { ...expectedContext, vendorId: "vendor-2" },
   }), false);
+  assert.equal(vendorEvidencePreflightIdentityMatches(
+    { ...expectedContext, vendorId: "   " },
+    { context: { ...expectedContext, vendorId: "   " } },
+  ), false);
+  assert.equal(vendorEvidencePreflightIdentityMatches(
+    { ...expectedContext, vendorId: `vendor-${"x".repeat(128)}` },
+    { context: { ...expectedContext, vendorId: `vendor-${"x".repeat(128)}` } },
+  ), false);
+  assert.equal(normalizeVendorEvidenceContext({ vendorId: " vendor-1 " }).vendorId, "");
   assert.equal(vendorEvidencePreflightMatches({
     expectedContext,
     accessResult: { state: "complete", context: { ...expectedContext, reviewRevision: 7 } },

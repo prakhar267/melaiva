@@ -1,5 +1,5 @@
 import { useEffect, useMemo, useRef, useState } from "react";
-import { Link, useSearchParams } from "react-router-dom";
+import { Link, useLocation, useNavigate, useSearchParams } from "react-router-dom";
 import {
   ArrowLeft,
   ArrowRight,
@@ -9,6 +9,7 @@ import {
   ChevronDown,
   BadgeIndianRupee,
   CircleAlert,
+  ClipboardCheck,
   Clock3,
   FileCheck2,
   MapPin,
@@ -21,6 +22,7 @@ import {
 } from "lucide-react";
 import { categories, cities, formatCurrency } from "../data.js";
 import { createIdempotencyKey, isServiceUnavailable, readApiResponse } from "../api.js";
+import { plannerHandoffToRequestPrefill, readPlannerRequestHandoff } from "../components/plannerHandoff.js";
 
 const eventTypes = ["Wedding", "Engagement", "Reception", "Anniversary", "Family celebration", "Other"];
 
@@ -105,6 +107,22 @@ function PreferredVendorContext({ resolution, vendorSlug, onContinueWithout, onR
   );
 }
 
+function PlannerHandoffContext({ handoff, onRemove }) {
+  if (!handoff) return null;
+  const eventCount = handoff.ceremonies.length;
+  return (
+    <div className="planner-handoff-context" role="status" aria-live="polite">
+      <span className="planner-handoff-context__icon"><ClipboardCheck size={20} /></span>
+      <div className="planner-handoff-context__copy">
+        <small>Started from your blueprint</small>
+        <strong>{handoff.city} · {handoff.guestCount.toLocaleString("en-IN")} guests · {eventCount} event{eventCount === 1 ? "" : "s"}</strong>
+        <span>Your date, destination and planning notes are ready to review. Choose one service and set its separate budget before publishing.</span>
+      </div>
+      <button className="text-button" type="button" onClick={onRemove}>Dismiss blueprint note</button>
+    </div>
+  );
+}
+
 function CelebrationStep({ data, update, errors, selectedVendor }) {
   const cityOptions = [...new Set([...cities, data.city, selectedVendor?.city].filter(Boolean))];
   return (
@@ -112,7 +130,7 @@ function CelebrationStep({ data, update, errors, selectedVendor }) {
       <div className="wizard-panel__heading"><span>01</span><div><div className="eyebrow">The essentials</div><h2>Tell us about the celebration</h2><p>Approximate details are enough to find the right first matches.</p></div></div>
       <div className="form-grid">
         <label className="field field--span-2"><span>Give this request a name</span><input value={data.title} onChange={(event) => update("title", event.target.value)} placeholder="Aarav & Meera — Jaipur celebration" /><FieldError>{errors.title}</FieldError></label>
-        <label className="field"><span>Celebration type</span><div className="input-wrap input-wrap--select"><select value={data.eventType} onChange={(event) => update("eventType", event.target.value)}>{eventTypes.map((type) => <option key={type}>{type}</option>)}</select><ChevronDown size={15} /></div></label>
+        <label className="field"><span>Celebration type</span><div className="input-wrap input-wrap--select"><select value={data.eventType} onChange={(event) => update("eventType", event.target.value)}><option value="">Choose a celebration type</option>{eventTypes.map((type) => <option key={type}>{type}</option>)}</select><ChevronDown size={15} /></div><FieldError>{errors.eventType}</FieldError></label>
         <label className="field"><span>Primary date</span><div className="input-wrap"><CalendarDays size={17} /><input type="date" value={data.eventDate} onChange={(event) => update("eventDate", event.target.value)} /></div><FieldError>{errors.eventDate}</FieldError></label>
         <label className="field"><span>City or destination</span><div className="input-wrap input-wrap--select"><MapPin size={17} /><select value={data.city} onChange={(event) => update("city", event.target.value)}><option value="">Choose a city</option>{cityOptions.map((city) => <option key={city}>{city}</option>)}</select><ChevronDown size={15} /></div><FieldError>{errors.city}</FieldError></label>
         <label className="field"><span>Estimated guests</span><div className="input-wrap"><Users size={17} /><input type="number" min="20" max="5000" inputMode="numeric" value={data.guestCount} onChange={(event) => update("guestCount", event.target.value)} /></div><FieldError>{errors.guestCount}</FieldError></label>
@@ -190,6 +208,8 @@ function SuccessState({ result }) {
 }
 
 export function RequestPage({ notify, onOpenAuth }) {
+  const location = useLocation();
+  const navigate = useNavigate();
   const [params] = useSearchParams();
   const categoryParam = params.get("category");
   const vendorParam = params.get("vendor");
@@ -202,6 +222,9 @@ export function RequestPage({ notify, onOpenAuth }) {
     const date = new Date(Date.now() + 180 * 24 * 60 * 60 * 1000);
     return new Date(date.getTime() - date.getTimezoneOffset() * 60000).toISOString().slice(0, 10);
   }, []);
+  const initialPlannerHandoff = useMemo(() => readPlannerRequestHandoff(location.state), [location.state]);
+  const plannerPrefill = useMemo(() => plannerHandoffToRequestPrefill(initialPlannerHandoff), [initialPlannerHandoff]);
+  const plannerHandoffSignature = useMemo(() => initialPlannerHandoff ? JSON.stringify(initialPlannerHandoff) : "", [initialPlannerHandoff]);
   const [step, setStep] = useState(1);
   const [errors, setErrors] = useState({});
   const [submitting, setSubmitting] = useState(false);
@@ -210,7 +233,14 @@ export function RequestPage({ notify, onOpenAuth }) {
   const [dismissedVendorParam, setDismissedVendorParam] = useState(null);
   const [vendorRetryKey, setVendorRetryKey] = useState(0);
   const [vendorResolution, setVendorResolution] = useState(() => ({ status: vendorParam ? "loading" : "none", vendor: null, message: "" }));
+  const [activePlannerHandoff, setActivePlannerHandoff] = useState(initialPlannerHandoff);
   const touchedFields = useRef({ city: false, categories: false });
+  const requestHeadingRef = useRef(null);
+  const plannerFocusAppliedRef = useRef(false);
+  const lastLocationKeyRef = useRef(location.key);
+  const appliedHandoffSignatureRef = useRef(plannerHandoffSignature);
+  const focusAfterDismissRef = useRef(false);
+  const [handoffAnnouncement, setHandoffAnnouncement] = useState("");
   const [data, setData] = useState({
     title: "",
     eventType: "Wedding",
@@ -222,7 +252,34 @@ export function RequestPage({ notify, onOpenAuth }) {
     budgetMax: "500000",
     biddingEndsAt: defaultEnd,
     requirements: "",
+    ...(plannerPrefill || {}),
   });
+
+  useEffect(() => {
+    if (activePlannerHandoff && !plannerFocusAppliedRef.current) {
+      plannerFocusAppliedRef.current = true;
+      requestHeadingRef.current?.focus({ preventScroll: true });
+      return;
+    }
+    if (!activePlannerHandoff && focusAfterDismissRef.current) {
+      focusAfterDismissRef.current = false;
+      requestHeadingRef.current?.focus({ preventScroll: true });
+    }
+  }, [activePlannerHandoff]);
+
+  useEffect(() => {
+    if (lastLocationKeyRef.current === location.key) return;
+    lastLocationKeyRef.current = location.key;
+    setActivePlannerHandoff(initialPlannerHandoff);
+    if (!plannerPrefill) return;
+    plannerFocusAppliedRef.current = false;
+    setHandoffAnnouncement("");
+    if (appliedHandoffSignatureRef.current === plannerHandoffSignature) return;
+    appliedHandoffSignatureRef.current = plannerHandoffSignature;
+    touchedFields.current.city = false;
+    setData((current) => ({ ...current, ...plannerPrefill }));
+    setErrors((current) => ({ ...current, eventDate: "", city: "", guestCount: "", requirements: "" }));
+  }, [initialPlannerHandoff, location.key, plannerHandoffSignature, plannerPrefill]);
 
   useEffect(() => {
     if (!vendorParam) {
@@ -284,6 +341,13 @@ export function RequestPage({ notify, onOpenAuth }) {
   const selectedVendor = resolvedVendor && !vendorMismatch ? resolvedVendor : null;
   const vendorBlocking = Boolean(vendorParam) && (["loading", "unavailable"].includes(vendorResolution.status) || Boolean(vendorMismatch));
 
+  function removePlannerHandoff() {
+    focusAfterDismissRef.current = true;
+    setActivePlannerHandoff(null);
+    setHandoffAnnouncement("Blueprint note dismissed. The imported values remain in this draft for you to review or edit.");
+    navigate({ pathname: location.pathname, search: location.search }, { replace: true, state: null });
+  }
+
   function update(key, value) {
     if (key === "requirements" && value.length > 1500) return;
     if (key === "city") touchedFields.current.city = true;
@@ -299,6 +363,7 @@ export function RequestPage({ notify, onOpenAuth }) {
     const next = {};
     if (targetStep === 1) {
       if (data.title.trim().length < 5) next.title = "Add a request name of at least 5 characters.";
+      if (!data.eventType) next.eventType = "Choose the celebration type.";
       if (!data.eventDate) next.eventDate = "Choose an approximate date.";
       else if (new Date(`${data.eventDate}T23:59:59`).getTime() <= Date.now()) next.eventDate = "Choose a future celebration date.";
       if (!data.city) next.city = "Choose a city.";
@@ -356,10 +421,11 @@ export function RequestPage({ notify, onOpenAuth }) {
 
   return (
     <div className="request-page page-surface">
-      <section className="request-header"><div className="shell"><div><div className="eyebrow">Sealed offer request</div><h1>One good brief. Better conversations.</h1></div><p>Share the context once, then compare thoughtful offers without exposing your details or anyone else’s price.</p></div></section>
+      <section className="request-header"><div className="shell"><div><div className="eyebrow">Sealed offer request</div><h1 ref={requestHeadingRef} tabIndex={-1}>One good brief. Better conversations.</h1><span className="sr-only" role="status" aria-live="polite">{handoffAnnouncement}</span></div><p>Share the context once, then compare thoughtful offers without exposing your details or anyone else’s price.</p></div></section>
       <div className="shell request-layout">
         <div className="wizard-card">
           <Stepper step={step} />
+          <PlannerHandoffContext handoff={activePlannerHandoff} onRemove={removePlannerHandoff} />
           <PreferredVendorContext
             resolution={displayedVendorResolution}
             vendorSlug={vendorParam}

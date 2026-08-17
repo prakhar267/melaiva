@@ -56,6 +56,7 @@ Verification, marketplace operations, support, disputes, finance, moderation, an
 - Create a multi-event brief with date flexibility, venue status, style, rituals, dietary/accessibility needs, logistics, timing, and uploads.
 - Invite collaborators and keep drafts/revisions.
 - Use AI to structure natural language, find missing constraints, and suggest a transparent budget allocation.
+- Carry the customer’s bounded date, destination, guest estimate, event choices, style, priorities, and constraints into an editable request draft without copying AI-generated prose or treating the overall celebration budget as a service budget.
 
 ### Competitive quotation
 

@@ -45,6 +45,7 @@
 - [ ] Core Web Vitals and bundle budgets pass on a mid-tier mobile network/device.
 - [ ] No chat/help UI covers a primary control at any breakpoint.
 - [ ] Search, structured brief, AI fallback, auction submission, comparison, vendor onboarding, and dashboards render without client exceptions.
+- [ ] Planner-to-request handoff preserves only reviewed user-entered facts, rejects malformed or stale navigation state, leaves service and service budget explicit, and lets provenance be dismissed without erasing draft edits or changing direct request links.
 - [ ] Award conversations pass owner/winner/admin/outsider authorization, idempotent retry, suspension pause, long-text wrapping, and 390 px composer checks without exposing customer contact details.
 
 ## Launch decision

@@ -40,7 +40,7 @@ This shape is intentional for the free launch tier: it preserves relational cons
 
 - Identity: registration, client-derived password verifiers, server peppering, session issuance/revocation, role authorization.
 - Catalog: public vendor discovery with honest empty/example states.
-- Planning: deterministic brief rules plus optional Gemini planning.
+- Planning: deterministic brief rules plus optional Gemini planning. A versioned, 24-hour browser navigation handoff can carry validated user-entered planning facts into the request builder; the receiving route revalidates every field and never carries generated prose, the overall budget, a service choice, or service-specific prices.
 - Requests: private structured briefs, optional explicit preferred-partner invitations, and date-bounded auctions.
 - Offers: vendor bids and customer shortlist/reject/accept decisions.
 - Awards: immutable accepted-scope handoffs plus private text coordination for the couple and winning vendor; attachments, contracts, signatures, invoices, notifications, and payments are deliberately out of scope.

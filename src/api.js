@@ -51,8 +51,15 @@ export function isServiceUnavailable(error) {
   return error instanceof TypeError || Boolean(error?.unavailable) || Number(error?.status || 0) >= 500;
 }
 
-export function createIdempotencyKey(prefix = "melaiva") {
-  const randomPart = globalThis.crypto?.randomUUID?.()
-    || `${Date.now()}-${Math.random().toString(36).slice(2)}`;
+export function createIdempotencyKey(prefix = "melaiva", cryptoProvider = globalThis.crypto) {
+  const uuid = cryptoProvider?.randomUUID?.();
+  if (uuid) return `${prefix}-${uuid}`;
+  if (!cryptoProvider?.getRandomValues) {
+    throw new Error("Secure random generation is unavailable in this browser.");
+  }
+
+  const bytes = new Uint8Array(16);
+  cryptoProvider.getRandomValues(bytes);
+  const randomPart = Array.from(bytes, (byte) => byte.toString(16).padStart(2, "0")).join("");
   return `${prefix}-${randomPart}`;
 }

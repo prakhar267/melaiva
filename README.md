@@ -8,10 +8,10 @@ The launch build is a single Cloudflare Worker: it serves the React application,
 
 ## What is implemented
 
-- Responsive customer marketplace and vendor discovery
+- Responsive customer marketplace and vendor discovery, with an honest zero-inventory path that preserves service, city, date, and guest context into the request builder
 - A versioned, expiring planner-to-request handoff that carries only validated user-entered celebration facts into an editable brief; generated plan prose and the overall celebration budget stay out of service-specific requests
-- Four-step, single-service private request builder with sealed offer workflow and explicit preferred-partner invitations
-- Customer dashboard backed by the signed-in user's requests, with a private sealed state and an explicit close-and-reveal decision
+- Four-step, single-service private request builder with live approved-partner coverage, sealed offer workflow, explicit preferred-partner invitations, and account-bound exact-payload retry after an ambiguous publish result
+- Customer dashboard backed by the signed-in user's requests, with current eligible-partner coverage, a private sealed state, and an explicit close-and-reveal decision
 - Evidence-backed vendor onboarding with canonical public work/reference links, narrow business-registration disclosures, explicit applicant attestation, retry-safe submission, a completion path for legacy applications, and append-only corrected snapshots when an operator requests specific information
 - A private operator-only vendor review queue with `vendor-summary-v2` data-minimized list reads, selected-record detail loading, a derived `needs_information` overlay, explicit request/approve/reject/suspend/restore actions, separate private rationale and applicant-visible request copy, exact revision preconditions, evidence acknowledgement, retry-safe decisions, and immutable history
 - Vendor opportunity feed and normalized offer submission covering inclusions, exclusions, GST, travel, priced add-ons, delivery, cancellation, and validity
@@ -24,6 +24,8 @@ The launch build is a single Cloudflare Worker: it serves the React application,
 - Isolated staging configuration, Git-provenanced releases, CodeQL merge protection, and read-only production readiness monitoring
 
 Post-award messages are coordination records, not contracts, signatures, invoices, booking confirmations, or payment evidence. Unread state is private to each participant and never shown to the counterparty as a receipt. Attachments, email notifications, signatures, and payments are not implemented.
+
+Partner coverage is a point-in-time count of currently approved vendors with an active account whose category and service area exactly match the brief, excluding a vendor account that owns the request. It is not an availability check or response promise. Requests with zero current coverage remain open and visible in the customer dashboard; counts stop when the response window ends. Melaiva does not send coverage, email, or push notifications, so the product tells customers to check the dashboard before the offer window closes.
 
 Marketplace approval records an internal operating decision after review of applicant-supplied evidence; public surfaces call it “Marketplace reviewed.” It is not a government identity check, legal certification, KYC result, or guarantee of vendor performance. A “not registered” disclosure remains declaration-only and requires suitable alternate checks before approval. An information request does not rewrite or delete prior evidence: the applicant may append one complete replacement snapshot only against the exact active request, status, review revision, and evidence revision they loaded. Requesting information is an in-product workflow and does not send email, SMS, push, or another notification. Staff access remains an out-of-band role assignment and must be protected with Cloudflare Access/MFA before it is delegated beyond the founder.
 

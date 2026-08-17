@@ -14,6 +14,13 @@ function parsePositiveInteger(value, name) {
   return parsed;
 }
 
+function releaseIncludesRequestCoverage(version) {
+  const match = /^(\d+)\.(\d+)\.(\d+)(?:-|$)/u.exec(String(version || ""));
+  if (!match) throw new Error("Health response did not include a valid application version.");
+  const [, major, minor] = match.map(Number);
+  return major > 0 || minor >= 13;
+}
+
 const expectedRevisionInput = (process.env.MELAIVA_SMOKE_EXPECTED_EVIDENCE_REVISION || "").trim();
 const minimumRevisionInput = (process.env.MELAIVA_SMOKE_MINIMUM_EVIDENCE_REVISION || "").trim();
 if (expectedRevisionInput && minimumRevisionInput) {
@@ -97,6 +104,21 @@ if (!Array.isArray(catalog?.data) || catalog?.meta?.source !== "database") {
   throw new Error("Catalog readiness response is not backed by the database.");
 }
 
+const coverageRequired = releaseIncludesRequestCoverage(health.data.version);
+if (coverageRequired) {
+  const coverageResponse = await request("/api/v1/catalog/coverage?category=photography&city=Jaipur");
+  const coverage = JSON.parse(coverageResponse.body);
+  if (
+    coverage?.data?.category !== "photography"
+    || coverage?.data?.city !== "Jaipur"
+    || !Number.isSafeInteger(coverage?.data?.eligibleVendorCount)
+    || coverage.data.eligibleVendorCount < 0
+    || coverage?.meta?.definition !== "approved_category_city"
+  ) {
+    throw new Error("Request coverage readiness response did not satisfy the approved category/city contract.");
+  }
+}
+
 const home = await request("/", { accept: "text/html" });
 if (!home.response.headers.get("content-type")?.includes("text/html") || !home.body.includes("id=\"root\"")) {
   throw new Error("Home page did not return the production application shell.");
@@ -117,6 +139,7 @@ console.log(JSON.stringify({
     authentication: health.data.authentication,
     vendorApplicationEvidence: `revision-${evidenceRevision}`,
     catalog: "ok",
+    requestCoverage: coverageRequired ? "ok" : "not-required-for-version",
     applicationShell: "ok",
   },
 }));

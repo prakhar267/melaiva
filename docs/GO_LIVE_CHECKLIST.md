@@ -38,6 +38,7 @@
 - [ ] External synthetics cover homepage, health, catalog, authentication, request submission, vendor offer, and AI fallback.
 - [ ] Alerting covers error rate, quota/CPU, Durable Object storage/alarm freshness, and AI errors/cost.
 - [ ] The release has soaked in staging, passed a zero-traffic version-override smoke, and completed an atomic 100% production cutover. Do not use a non-zero percentage split on `workers.dev` until whole-session affinity also covers initial HTML and hashed assets.
+- [ ] While hosted production promotion is disabled, each release uses the authenticated local release procedure from the exact merged SHA and records staging soak, candidate/version IDs, deployment predecessors, tag compare-and-swap, rollback ownership, and final default production traffic smoke evidence. Do not treat the validation-only hosted workflow as deployment evidence or enable hosted mutation until its system-tools finalizer and downstream reconciler have passed executable race tests.
 
 ## Experience and quality
 

@@ -1942,6 +1942,18 @@ test("v0.10 onboarding stays additive while required evidence and admin review r
     body: evidenceCompletionBody,
   });
   assert.equal(completion.status, 201, await completion.clone().text());
+  const unmarkedReplay = await requestJson(app, env, "/vendors/onboarding/evidence", {
+    method: "PUT",
+    cookie: owner.cookie,
+    headers: {
+      "idempotency-key": "old-client-evidence-completion-0001",
+      "x-melaiva-vendor-evidence": "",
+    },
+    body: evidenceCompletionBody,
+  });
+  assert.equal(unmarkedReplay.status, 201, await unmarkedReplay.clone().text());
+  assert.equal((await unmarkedReplay.json()).meta.replayed, true);
+  assert.equal(db.sqlite.prepare("SELECT COUNT(*) AS count FROM vendor_application_evidence").get().count, 1);
   const approved = await requestJson(app, env, `/admin/vendors/${createdData.id}`, {
     method: "PATCH",
     cookie: admin.cookie,

@@ -84,6 +84,9 @@ jobs:
           MINIMUM_STAGING_SOAK_MINUTES: ${{ inputs.minimum_staging_soak_minutes }}
         run: |
           [[ "${MINIMUM_STAGING_SOAK_MINUTES}" =~ ^(0|[1-9][0-9]*)$ ]]
+          soak_minutes="$((10#${MINIMUM_STAGING_SOAK_MINUTES}))"
+          test "${soak_minutes}" -ge 15
+          test "${soak_minutes}" -le 1440
           deployments_json="$(npx wrangler deployments list --env staging --json)"
           active_deployment="$(jq -cer 'sort_by(.created_on) | last' <<< "${deployments_json}")"
           active_version_id="$(jq -er '
@@ -100,7 +103,7 @@ jobs:
           created_on="$(jq -er '.created_on' <<< "${active_deployment}")"
           created_epoch="$(date -u -d "${created_on}" +%s)"
           current_epoch="$(date -u +%s)"
-          minimum_seconds="$((10#${MINIMUM_STAGING_SOAK_MINUTES} * 60))"
+          minimum_seconds="$((soak_minutes * 60))"
           test "$((current_epoch - created_epoch))" -ge "${minimum_seconds}"
 
       - name: Verify exact staging readiness

@@ -9,6 +9,7 @@ import {
   normalizeVendorEvidenceContext,
   prefillVendorEvidence,
   registrationReferenceError,
+  shouldClearVendorEvidencePrivateDraft,
   shouldPreflightVendorEvidenceSubmission,
   validateVendorApplication,
   validateVendorEvidence,
@@ -16,6 +17,8 @@ import {
   vendorEvidenceConflictState,
   vendorEvidenceContextRefreshDecision,
   vendorEvidenceContextsMatch,
+  vendorEvidencePreflightIdentityMatches,
+  vendorEvidencePreflightMatches,
 } from "../src/components/vendorOnboarding.js";
 import {
   supportsAdminVendorSummaryContract,
@@ -23,9 +26,10 @@ import {
 } from "../src/components/vendorApplicationCompatibility.js";
 
 test("vendor evidence compatibility fails closed across mixed Worker versions", () => {
-  assert.equal(supportsVendorApplicationEvidence({ data: { vendorApplicationEvidenceRevision: 2 } }), true);
+  assert.equal(supportsVendorApplicationEvidence({ data: { vendorApplicationEvidenceRevision: 3 } }), true);
   assert.equal(supportsVendorApplicationEvidence({ data: {} }), false);
-  assert.equal(supportsVendorApplicationEvidence({ data: { vendorApplicationEvidenceRevision: "2" } }), false);
+  assert.equal(supportsVendorApplicationEvidence({ data: { vendorApplicationEvidenceRevision: "3" } }), false);
+  assert.equal(supportsVendorApplicationEvidence({ data: { vendorApplicationEvidenceRevision: 2 } }), false);
   assert.equal(supportsVendorApplicationEvidence({ data: { vendorApplicationEvidenceRevision: 1 } }), false);
 
   const summaryPayload = { meta: { contract: "vendor-summary-v2" } };
@@ -278,6 +282,7 @@ test("evidence revision payload includes every optimistic concurrency counter", 
       registrationType: "not_registered",
       attested: true,
     },
+    expectedVendorId: "vendor-1",
     expectedStatus: "needs_information",
     expectedRevision: 8,
     expectedEvidenceRevision: 2,
@@ -419,8 +424,61 @@ test("dirty evidence drafts never inherit newer concurrency counters silently", 
   });
 });
 
-test("ambiguous unchanged retries bypass only the stale preflight and preserve server CAS", () => {
+test("account transitions clear private evidence before another onboarding flow can render it", () => {
+  assert.equal(shouldClearVendorEvidencePrivateDraft({
+    evidenceOnly: true,
+    accessResolved: true,
+    incomingContext: null,
+  }), true);
+  assert.equal(shouldClearVendorEvidencePrivateDraft({
+    evidenceOnly: false,
+    wasEvidenceOnly: true,
+  }), true);
+  assert.equal(shouldClearVendorEvidencePrivateDraft({
+    evidenceOnly: true,
+    identityChanged: true,
+    incomingContext: { vendorId: "vendor-2" },
+  }), true);
+  assert.equal(shouldClearVendorEvidencePrivateDraft({
+    evidenceOnly: false,
+    identityChanged: true,
+  }), false);
+  assert.equal(shouldClearVendorEvidencePrivateDraft({
+    evidenceOnly: true,
+    accessResolved: true,
+    incomingContext: { vendorId: "vendor-1" },
+  }), false);
+});
+
+test("ambiguous retries revalidate exact vendor identity before replaying", () => {
   assert.equal(shouldPreflightVendorEvidenceSubmission({ evidenceOnly: true, submissionUnconfirmed: false }), true);
-  assert.equal(shouldPreflightVendorEvidenceSubmission({ evidenceOnly: true, submissionUnconfirmed: true }), false);
+  assert.equal(shouldPreflightVendorEvidenceSubmission({ evidenceOnly: true, submissionUnconfirmed: true }), true);
   assert.equal(shouldPreflightVendorEvidenceSubmission({ evidenceOnly: false, submissionUnconfirmed: true }), false);
+  const expectedContext = {
+    vendorId: "vendor-1",
+    effectiveStatus: "needs_information",
+    reviewRevision: 6,
+    evidenceRevision: 1,
+    informationRequestRevision: 2,
+    currentInformationRequest: { revision: 2 },
+  };
+  assert.equal(vendorEvidencePreflightIdentityMatches(expectedContext, { context: { ...expectedContext } }), true);
+  assert.equal(vendorEvidencePreflightIdentityMatches(expectedContext, { context: null }), false);
+  assert.equal(vendorEvidencePreflightIdentityMatches(expectedContext, {
+    context: { ...expectedContext, vendorId: "vendor-2" },
+  }), false);
+  assert.equal(vendorEvidencePreflightMatches({
+    expectedContext,
+    accessResult: { state: "complete", context: { ...expectedContext, reviewRevision: 7 } },
+    submissionUnconfirmed: true,
+  }), true);
+  assert.equal(vendorEvidencePreflightMatches({
+    expectedContext,
+    accessResult: { state: "revision", context: { ...expectedContext, vendorId: "vendor-2" } },
+    submissionUnconfirmed: true,
+  }), false);
+  assert.equal(vendorEvidencePreflightMatches({
+    expectedContext,
+    accessResult: { state: "revision", context: { ...expectedContext, reviewRevision: 7 } },
+  }), false);
 });

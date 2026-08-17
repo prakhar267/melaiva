@@ -1739,6 +1739,60 @@ test("vendor evidence onboarding is normalized, replay-safe, atomic, and fail-cl
   );
 });
 
+test("vendor onboarding evidence rechecks the active owner at the write boundary", async () => {
+  const db = new SqliteD1(STORE_SCHEMA_SQL);
+  const env = {
+    DB: db,
+    SESSION_SECRET,
+    PASSWORD_PEPPER: "active-owner-boundary-password-pepper-with-at-least-thirty-two-characters",
+    ENVIRONMENT: "production",
+    COOKIE_SECURE: "true",
+  };
+  const app = buildApp();
+  const owner = await register(app, env, {
+    name: "Active Owner Boundary",
+    email: "active-owner-boundary@example.com",
+    verifier: "x".repeat(43),
+  });
+  db.afterFirst = async (sql, args, row) => {
+    if (sql !== "SELECT id FROM vendors WHERE user_id = ? LIMIT 1"
+      || args[0] !== owner.user.id
+      || row !== null) return;
+    db.afterFirst = null;
+    db.sqlite.prepare("UPDATE users SET status = 'suspended' WHERE id = ?").run(owner.user.id);
+  };
+
+  const response = await requestJson(app, env, "/vendors/onboarding", {
+    cookie: owner.cookie,
+    headers: { "idempotency-key": "active-owner-boundary-onboarding-0001" },
+    body: {
+      businessName: "Boundary Studio",
+      legalName: "Boundary Studio Private Limited",
+      category: "photography",
+      categories: ["photography"],
+      city: "Jaipur",
+      serviceAreas: ["Jaipur"],
+      description: "A complete partner profile used to verify active ownership again at the atomic evidence write boundary.",
+      minBudget: 100000,
+      maxBudget: 500000,
+      currency: "INR",
+      phone: "+919999999999",
+      evidence: {
+        portfolioUrls: ["https://active-owner-boundary.example.com/work"],
+        referenceUrls: ["https://active-owner-reference.example.com/review"],
+        registrationType: "not_registered",
+        attested: true,
+      },
+    },
+  });
+  assert.equal(response.status, 409, await response.clone().text());
+  assert.equal((await response.json()).error.code, "vendor_evidence_conflict");
+  assert.equal(db.sqlite.prepare("SELECT COUNT(*) AS count FROM vendors WHERE user_id = ?").get(owner.user.id).count, 0);
+  assert.equal(db.sqlite.prepare("SELECT COUNT(*) AS count FROM vendor_application_evidence").get().count, 0);
+  assert.equal(db.sqlite.prepare("SELECT COUNT(*) AS count FROM vendor_application_evidence_revisions").get().count, 0);
+  assert.equal(db.sqlite.prepare("SELECT COUNT(*) AS count FROM idempotency_keys WHERE user_id = ?").get(owner.user.id).count, 0);
+});
+
 test("v0.10 onboarding stays additive while required evidence and admin review remain fail-closed", async () => {
   const db = new SqliteD1(STORE_SCHEMA_SQL);
   const env = {
@@ -1751,7 +1805,7 @@ test("v0.10 onboarding stays additive while required evidence and admin review r
   const app = buildApp();
   const config = await requestJson(app, env, "/auth/config");
   assert.equal(config.status, 200);
-  assert.equal((await config.json()).data.vendorApplicationEvidenceRevision, 2);
+  assert.equal((await config.json()).data.vendorApplicationEvidenceRevision, 3);
 
   const owner = await register(app, env, {
     name: "Old Client Vendor Owner",
@@ -1851,6 +1905,7 @@ test("v0.10 onboarding stays additive while required evidence and admin review r
     cookie: owner.cookie,
     headers: { "idempotency-key": "old-client-evidence-completion-0001" },
     body: {
+      expectedVendorId: createdData.id,
       expectedStatus: "pending",
       expectedRevision: 0,
       expectedEvidenceRevision: 0,
@@ -1911,6 +1966,7 @@ test("legacy vendors can complete evidence once and remain explicitly distinguis
   assert.equal(beforeVendor.evidenceComplete, false);
 
   const completionBody = {
+    expectedVendorId: "legacy-evidence-vendor",
     expectedStatus: "pending",
     expectedRevision: 0,
     expectedEvidenceRevision: 0,
@@ -1980,6 +2036,7 @@ test("legacy vendors can complete evidence once and remain explicitly distinguis
     cookie: cinOwner.cookie,
     headers: { "idempotency-key": "legacy-cin-evidence-completion-0001" },
     body: {
+      expectedVendorId: "legacy-cin-vendor",
       expectedStatus: "pending",
       expectedRevision: 0,
       expectedEvidenceRevision: 0,
@@ -2138,6 +2195,7 @@ test("legacy evidence completion loses an approval race atomically at the databa
     cookie: owner.cookie,
     headers: { "idempotency-key": "evidence-race-completion-0001" },
     body: {
+      expectedVendorId: "evidence-race-vendor",
       expectedStatus: "pending",
       expectedRevision: 0,
       expectedEvidenceRevision: 0,
@@ -2221,6 +2279,7 @@ test("legacy approval loses an evidence-completion race with a stable review con
       cookie: owner.cookie,
       headers: { "idempotency-key": "evidence-wins-completion-0001" },
       body: {
+        expectedVendorId: "evidence-wins-vendor",
         expectedStatus: "pending",
         expectedRevision: 0,
         expectedEvidenceRevision: 0,
@@ -2382,6 +2441,7 @@ test("evidence revisions and needs-information reviews are append-only, private,
     headers: { "idempotency-key": "revision-evidence-stale-0001" },
     body: {
       evidence: revisionEvidence,
+      expectedVendorId: vendor.id,
       expectedStatus: "needs_information",
       expectedRevision: 1,
       expectedEvidenceRevision: 1,
@@ -2393,6 +2453,7 @@ test("evidence revisions and needs-information reviews are append-only, private,
 
   const responseBody = {
     evidence: revisionEvidence,
+    expectedVendorId: vendor.id,
     expectedStatus: "needs_information",
     expectedRevision: 2,
     expectedEvidenceRevision: 1,
@@ -2411,6 +2472,61 @@ test("evidence revisions and needs-information reviews are append-only, private,
   assert.equal(respondedData.reviewRevision, 3);
   assert.equal(respondedData.evidenceSummary.revision, 2);
   assert.equal((await respond().then((response) => response.json())).meta.replayed, true);
+
+  const replaySwitchOwner = await register(app, env, {
+    name: "Replay Switch Owner",
+    email: "replay-switch-owner@example.com",
+    verifier: "w".repeat(43),
+  });
+  const replaySwitchVendor = await onboardVendor(
+    app,
+    env,
+    replaySwitchOwner.cookie,
+    "ReplaySwitch",
+  );
+  const replaySwitchRejected = await reviewVendor(
+    app,
+    env,
+    admin.cookie,
+    replaySwitchVendor.id,
+    "rejected",
+  );
+  assert.equal(replaySwitchRejected.status, 200, await replaySwitchRejected.clone().text());
+  const replaySwitchRequested = await requestJson(app, env, `/admin/vendors/${replaySwitchVendor.id}`, {
+    method: "PATCH",
+    cookie: admin.cookie,
+    headers: { "idempotency-key": "replay-switch-request-0001" },
+    body: {
+      status: "needs_information",
+      expectedStatus: "rejected",
+      expectedRevision: 1,
+      expectedEvidenceRevision: 1,
+      requestedFields: ["portfolio", "references"],
+      applicantMessage: "Please replace the portfolio and add a clearer professional reference.",
+      reason: "The current work samples and reference context are insufficient for verification.",
+    },
+  });
+  assert.equal(replaySwitchRequested.status, 200, await replaySwitchRequested.clone().text());
+  const crossAccountReplay = await requestJson(app, env, "/vendors/onboarding/evidence", {
+    method: "PUT",
+    cookie: replaySwitchOwner.cookie,
+    headers: { "idempotency-key": "revision-evidence-response-0001" },
+    body: responseBody,
+  });
+  assert.equal(crossAccountReplay.status, 409, await crossAccountReplay.clone().text());
+  assert.equal((await crossAccountReplay.json()).error.code, "vendor_evidence_conflict");
+  assert.deepEqual(
+    { ...db.sqlite.prepare(
+      `SELECT review_revision, evidence_latest_revision, information_request_revision, information_requested
+       FROM vendors WHERE id = ?`,
+    ).get(replaySwitchVendor.id) },
+    {
+      review_revision: 2,
+      evidence_latest_revision: 1,
+      information_request_revision: 1,
+      information_requested: 1,
+    },
+  );
   assert.equal(
     db.sqlite.prepare("SELECT COUNT(*) AS count FROM vendor_application_evidence WHERE vendor_id = ?").get(vendor.id).count,
     1,
@@ -2517,6 +2633,7 @@ test("evidence revisions and needs-information reviews are append-only, private,
         registrationType: "not_registered",
         attested: true,
       },
+      expectedVendorId: "canceled-request-vendor",
       expectedStatus: "pending",
       expectedRevision: 2,
       expectedEvidenceRevision: 0,
@@ -2562,6 +2679,7 @@ test("evidence revisions and needs-information reviews are append-only, private,
       registrationType: "not_registered",
       attested: true,
     },
+    expectedVendorId: "requested-initial-vendor",
     expectedStatus: "needs_information",
     expectedRevision: 1,
     expectedEvidenceRevision: 0,
@@ -2689,6 +2807,7 @@ test("evidence revisions and needs-information reviews are append-only, private,
         registrationType: "not_registered",
         attested: true,
       },
+      expectedVendorId: "rolling-evidence-vendor",
       expectedStatus: "needs_information",
       expectedRevision: 1,
       expectedEvidenceRevision: 0,

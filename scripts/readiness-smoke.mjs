@@ -27,7 +27,7 @@ if (health?.data?.status !== "ok" || health?.data?.database !== "ok" || health?.
 
 const authConfigResponse = await request("/api/v1/auth/config");
 const authConfig = JSON.parse(authConfigResponse.body);
-if (authConfig?.data?.vendorApplicationEvidenceRevision !== 2) {
+if (authConfig?.data?.vendorApplicationEvidenceRevision !== 3) {
   throw new Error("Vendor application evidence capability is unavailable or at the wrong revision.");
 }
 
@@ -53,7 +53,7 @@ console.log(JSON.stringify({
   services: {
     database: health.data.database,
     authentication: health.data.authentication,
-    vendorApplicationEvidence: "revision-2",
+    vendorApplicationEvidence: "revision-3",
     catalog: "ok",
     applicationShell: "ok",
   },

@@ -12,6 +12,16 @@ import { AuthPage, LegalPage, NotFoundPage } from "./pages/MiscPages.jsx";
 const AdminVendorsPage = lazy(() => import("./pages/AdminVendorsPage.jsx")
   .then((module) => ({ default: module.AdminVendorsPage })));
 
+const AUTH_CHANGE_STORAGE_KEY = "melaiva:auth-change";
+
+function announceAuthenticationChange() {
+  try {
+    globalThis.localStorage?.setItem(AUTH_CHANGE_STORAGE_KEY, crypto.randomUUID());
+  } catch {
+    // The focused-tab revalidation remains the privacy fallback when storage is unavailable.
+  }
+}
+
 function AdminRouteFallback() {
   return <div className="admin-page page-surface"><div className="shell admin-route-loading" role="status">Loading secure operations…</div></div>;
 }
@@ -56,6 +66,11 @@ function MelaivaApp() {
     if (toastTimer.current) window.clearTimeout(toastTimer.current);
   }, []);
 
+  const recordAuthentication = useCallback(() => {
+    setAuthRevision((value) => value + 1);
+    announceAuthenticationChange();
+  }, []);
+
   const notify = useCallback((nextToast) => {
     if (toastTimer.current) window.clearTimeout(toastTimer.current);
     setToast(nextToast);
@@ -66,8 +81,16 @@ function MelaivaApp() {
     if (toastTimer.current) window.clearTimeout(toastTimer.current);
   }, []);
 
+  useEffect(() => {
+    const handleAuthStorage = (event) => {
+      if (event.key === AUTH_CHANGE_STORAGE_KEY) setAuthRevision((value) => value + 1);
+    };
+    window.addEventListener("storage", handleAuthStorage);
+    return () => window.removeEventListener("storage", handleAuthStorage);
+  }, []);
+
   return (
-    <AppShell toast={toast} dismissToast={dismissToast} openAuth={openAuth} setOpenAuth={setOpenAuth} notify={notify} authRevision={authRevision} onAuthenticated={() => setAuthRevision((value) => value + 1)}>
+    <AppShell toast={toast} dismissToast={dismissToast} openAuth={openAuth} setOpenAuth={setOpenAuth} notify={notify} authRevision={authRevision} onAuthenticated={recordAuthentication}>
       <Routes>
         <Route path="/" element={<HomePage notify={notify} />} />
         <Route path="/marketplace" element={<MarketplacePage notify={notify} />} />
@@ -77,7 +100,7 @@ function MelaivaApp() {
         <Route path="/vendor" element={<VendorPage notify={notify} onOpenAuth={() => setOpenAuth(true)} authRevision={authRevision} />} />
         <Route path="/vendor/onboarding" element={<VendorOnboardingPage notify={notify} onOpenAuth={() => setOpenAuth(true)} authRevision={authRevision} />} />
         <Route path="/admin/vendors" element={<AdminRouteErrorBoundary key={authRevision}><Suspense fallback={<AdminRouteFallback />}><AdminVendorsPage notify={notify} onOpenAuth={() => setOpenAuth(true)} authRevision={authRevision} /></Suspense></AdminRouteErrorBoundary>} />
-        <Route path="/auth" element={<AuthPage notify={notify} onAuthenticated={() => setAuthRevision((value) => value + 1)} />} />
+        <Route path="/auth" element={<AuthPage notify={notify} onAuthenticated={recordAuthentication} />} />
         <Route path="/privacy" element={<LegalPage type="privacy" />} />
         <Route path="/terms" element={<LegalPage type="terms" />} />
         <Route path="*" element={<NotFoundPage />} />

@@ -53,6 +53,7 @@ test("Durable Object storage errors preserve only safe conflict classifications"
   const classifications = [
     ["UNIQUE constraint failed: users.email", "unique_constraint"],
     ["vendor application evidence requires a pending or rejected vendor", "vendor_evidence_state_conflict"],
+    ["vendor application evidence requires the active owner", "vendor_evidence_revision_conflict"],
     [
       "legacy vendor evidence cannot resolve an active information request",
       "vendor_evidence_revision_conflict",
@@ -1280,6 +1281,7 @@ test("schema v10 fresh install and interrupted v9-column restart converge withou
        ORDER BY name`,
     ).all().map((row) => row.name),
     [
+      "vendor_application_evidence_active_owner_insert_v10",
       "vendor_application_evidence_active_request_insert_v10",
       "vendor_application_evidence_immutable_delete",
       "vendor_application_evidence_immutable_update",
@@ -1716,6 +1718,68 @@ test("schema v10 migrates v9 evidence into revision one and replaces the old-wor
     ).run(),
     /revisions are immutable/,
   );
+});
+
+test("an existing schema v10 database installs newly added evidence guards on restart", async () => {
+  const sqlite = new DatabaseSync(":memory:");
+  sqlite.exec(`CREATE TABLE _sql_schema_migrations (
+    id INTEGER PRIMARY KEY,
+    applied_at TEXT NOT NULL DEFAULT (datetime('now'))
+  )`);
+  sqlite.exec(STORE_SCHEMA_SQL);
+  sqlite.prepare(
+    `INSERT INTO users
+      (id, name, email, password_hash, password_salt, password_iterations, password_scheme, role)
+     VALUES ('existing-v10-user', 'Existing V10 User', 'existing-v10@example.com',
+             'hash', 'salt', 100000, 'pbkdf2-server-v1', 'vendor')`,
+  ).run();
+  sqlite.exec("DROP TRIGGER vendor_application_evidence_active_owner_insert_v10");
+  assert.equal(sqlite.prepare("SELECT MAX(id) AS version FROM _sql_schema_migrations").get().version, 10);
+
+  const sql = {
+    exec(statement, ...args) {
+      const normalized = statement.trim().toUpperCase();
+      if (args.length > 0 || normalized.startsWith("SELECT") || normalized.startsWith("PRAGMA")) {
+        const rows = sqlite.prepare(statement).all(...args);
+        return { toArray: () => rows };
+      }
+      sqlite.exec(statement);
+      return { toArray: () => [] };
+    },
+  };
+  let initialized;
+  const ctx = {
+    storage: {
+      sql,
+      transactionSync(callback) {
+        sqlite.exec("BEGIN IMMEDIATE");
+        try {
+          const result = callback();
+          sqlite.exec("COMMIT");
+          return result;
+        } catch (error) {
+          sqlite.exec("ROLLBACK");
+          throw error;
+        }
+      },
+      async getAlarm() { return 1; },
+      async setAlarm() {},
+    },
+    blockConcurrencyWhile(callback) {
+      initialized = callback();
+    },
+  };
+
+  new MelaivaStore(ctx, { ENVIRONMENT: "production" });
+  await initialized;
+
+  assert.equal(sqlite.prepare("SELECT MAX(id) AS version FROM _sql_schema_migrations").get().version, 10);
+  assert.equal(sqlite.prepare("SELECT COUNT(*) AS count FROM users WHERE id = 'existing-v10-user'").get().count, 1);
+  const trigger = sqlite.prepare(
+    `SELECT sql FROM sqlite_master
+     WHERE type = 'trigger' AND name = 'vendor_application_evidence_active_owner_insert_v10'`,
+  ).get();
+  assert.match(trigger.sql, /owner\.status = 'active'/u);
 });
 
 test("schema v9-to-v10 finalize failures roll back atomically and preserve an approval guard", async () => {
